@@ -11,6 +11,8 @@ use std::process::Command;
 
 use serde::Deserialize;
 
+use crate::out::shell_quote;
+
 const BASE: &str = "https://aur.archlinux.org/rpc/v5";
 const TIMEOUT: &str = "10";
 
@@ -57,9 +59,10 @@ pub fn info_url(package: &str) -> String {
     format!("{BASE}/info?arg[]={}", encode(package))
 }
 
-/// The exact command a fetch runs, for display.
+/// The exact command a fetch runs, written so it can be pasted back into a
+/// shell — the URL carries `?`, `&` and `[]`, all of which a shell would eat.
 pub fn argv(url: &str) -> String {
-    format!("curl -fsS --max-time {TIMEOUT} '{url}'")
+    format!("curl -fsS --max-time {TIMEOUT} {}", shell_quote(url))
 }
 
 /// Search the AUR by name and description.

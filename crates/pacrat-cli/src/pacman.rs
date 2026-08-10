@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
+use crate::out::shell_quote;
+
 /// One result of `pacman -Ss`: a package as the sync databases see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncHit {
@@ -15,8 +17,14 @@ pub struct SyncHit {
     pub description: String,
 }
 
+/// The command a search runs, written so it can be pasted back into a shell.
 pub fn search_argv(term: &str) -> String {
-    format!("pacman -Ss -- {term}")
+    format!("pacman -Ss -- {}", shell_quote(term))
+}
+
+/// Ditto for the two record queries `info` runs.
+pub fn show_argv(flag: &str, package: &str) -> String {
+    format!("pacman {flag} -- {}", shell_quote(package))
 }
 
 /// Official-repo search. pacman exits 1 both for "no results" and for real

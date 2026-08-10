@@ -28,8 +28,8 @@ const LABEL: usize = 9;
 
 pub fn run(ctx: &Ctx, package: &str) -> Result<(), String> {
     let rpc_url = aur::info_url(package);
-    println!("  pacman -Si -- {package}");
-    println!("  pacman -Qi -- {package}");
+    println!("  {}", pacman::show_argv("-Si", package));
+    println!("  {}", pacman::show_argv("-Qi", package));
     println!("  {}", aur::argv(&rpc_url));
     println!();
 

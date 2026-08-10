@@ -14,6 +14,25 @@ pub fn list_preview(items: &[String], max: usize) -> String {
     }
 }
 
+/// Render one argument the way a shell would need it written.
+///
+/// pacrat prints every external command it runs so the user can rerun it
+/// (ADR-001's always-visible-calls rule). An unquoted `pacman -Ss -- foo bar`
+/// is a lie about what ran and breaks when pasted, so the *display* line gets
+/// shell quoting. The argv never does — it goes straight to exec, where a
+/// quote would become part of the search term.
+pub fn shell_quote(arg: &str) -> String {
+    // Conservative: anything outside this set gets quoted, whether or not
+    // the current shell would have minded.
+    let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c);
+    if !arg.is_empty() && arg.chars().all(bare) {
+        return arg.to_string();
+    }
+    // Single quotes protect everything except a single quote, which has to
+    // leave the quoted run, escape itself, and come back in.
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
 /// Clip a string to `max` characters, marking the cut. Counts chars, not
 /// bytes: descriptions carry accents and the odd emoji, and a byte slice
 /// would both panic and misalign the column.
@@ -51,6 +70,32 @@ pub fn epoch_date(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_quote_leaves_ordinary_terms_alone() {
+        assert_eq!(shell_quote("pacseek"), "pacseek");
+        assert_eq!(shell_quote("python-3.12_x"), "python-3.12_x");
+        // Not shell-special, so quoting would be noise. Both are real terms.
+        assert_eq!(shell_quote("c++"), "c++");
+        assert_eq!(shell_quote("gtk2.0/lib"), "gtk2.0/lib");
+    }
+
+    #[test]
+    fn shell_quote_wraps_anything_a_shell_would_read() {
+        assert_eq!(shell_quote("foo("), "'foo('");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("*"), "'*'");
+        assert_eq!(shell_quote("a;rm -rf b"), "'a;rm -rf b'");
+        assert_eq!(shell_quote("$HOME"), "'$HOME'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn shell_quote_escapes_an_embedded_single_quote() {
+        // Leave the quoted run, escape the quote, resume: don'\''t
+        assert_eq!(shell_quote("don't"), r"'don'\''t'");
+        assert_eq!(shell_quote("'"), r"''\'''");
+    }
 
     #[test]
     fn truncate_marks_the_cut_and_counts_chars() {
