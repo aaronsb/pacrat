@@ -59,11 +59,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pacrat_core::pkg::valid_name;
+
 use crate::ctx::Ctx;
 use crate::fstree;
 use crate::out::{list_preview, shell_quote, visible};
 use crate::setup;
-use crate::vendor::valid_name;
 
 /// Exit code for "ran fine, but deliberately did not do all of it" —
 /// ADR-001's 10, the same code `vendor` gives a declined review.

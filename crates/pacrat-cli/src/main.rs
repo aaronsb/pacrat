@@ -16,6 +16,7 @@ mod proc;
 mod search;
 mod setup;
 mod status;
+mod sync;
 mod updates;
 mod vendor;
 
@@ -98,8 +99,24 @@ enum Command {
     Build { packages: Vec<String> },
     /// Host-vs-manifest matrix
     Hosts,
-    /// Reconcile a host against the manifest
-    Sync { host: Option<String> },
+    /// Plan this host toward the manifest (prints commands, runs none)
+    ///
+    /// There is no <host> argument: sync transport — ssh to remote hosts, or
+    /// each host syncing itself — is ADR-001's open question 4 and is not
+    /// settled, so pacrat plans only for the machine it runs on. Close another
+    /// host's drift by running `pacrat sync` there.
+    ///
+    /// Exits 0 when this host matches the store, 10 when a plan was printed
+    /// (deliberately not acted on — the commands are yours to run), and 1 when
+    /// the check itself could not run.
+    Sync {
+        /// Also print the removals for installed-but-untracked packages
+        #[arg(long)]
+        prune: bool,
+        /// One JSON object instead of the report
+        #[arg(long)]
+        json: bool,
+    },
     /// Publish a maintained package to the AUR (queues while read-only)
     Push { package: String },
     /// Install the [dotfiles-aur] repo section and guard hooks
@@ -155,6 +172,7 @@ fn main() {
             refresh,
         ),
         Some(Command::Build { ref packages }) => build::run(&ctx, packages),
+        Some(Command::Sync { prune, json }) => sync::run(&ctx, prune, json),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {

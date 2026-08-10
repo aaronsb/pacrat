@@ -37,6 +37,30 @@ impl Source {
     }
 }
 
+/// Is this a package name pacrat is willing to handle?
+///
+/// pacman's own alphabet, as an allowlist: ASCII alphanumerics plus
+/// `@ . _ + -`, non-empty, and not starting with a hyphen or a dot. Anything
+/// outside it is refused rather than escaped, because the same name goes on
+/// to be a path component in the store, an argument to git, a key in the
+/// grade cache, and a word in a command pacrat prints for a human to run.
+/// Escaping is a promise made once per use site; an allowlist is made once.
+///
+/// It lives in core, next to the set math, because the grammar belongs to the
+/// *model* of a package and not to any one verb: `vendor` checks the name a
+/// human typed, `build` and `grade` re-check what they read out of the
+/// ledger, and the tracked lists are checked as they enter (`ctx.tracked`).
+/// One grammar, one home — four copies of "letters, digits and @._+-" would
+/// be four chances to write a fifth one slightly wider.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '+' | '-'))
+}
+
 /// Normalize raw command / file output into a sorted, de-duplicated list:
 /// split on lines, trim each, drop blanks.
 pub fn normalize(raw: &str) -> Vec<String> {
@@ -153,6 +177,44 @@ mod tests {
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn names_are_an_allowlist() {
+        for ok in ["mdcat", "python-a", "gtk+", "a.b_c@1", "0ad", "lib32-glibc"] {
+            assert!(valid_name(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            "-rf",
+            ".hidden",
+            "../escape",
+            "a/b",
+            "a b",
+            "a;rm -rf /",
+            "naïve",
+            "a\nb",
+            "$(id)",
+        ] {
+            assert!(!valid_name(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    /// The reason the allowlist is not "printable ASCII": a control byte is
+    /// printable *nowhere* and readable as anything. `ESC[8m` hides the rest
+    /// of a line in most terminals, and a name pacrat prints into a command
+    /// is read by a human who is deciding whether to run it.
+    #[test]
+    fn a_name_cannot_carry_a_control_byte() {
+        for hostile in [
+            "ripgrep\u{1b}[8m",
+            "a\u{7f}b",
+            "a\rb",
+            "a\u{202e}b",
+            "a\u{200b}b",
+        ] {
+            assert!(!valid_name(hostile), "{hostile:?} should be rejected");
+        }
     }
 
     #[test]

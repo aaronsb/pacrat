@@ -34,7 +34,7 @@ impl Index {
         let mut tracked: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for host in ctx.tracked_hosts() {
             for source in Source::ALL {
-                for pkg in ctx.tracked(&host, source) {
+                for pkg in ctx.tracked(&host, source)? {
                     let hosts = tracked.entry(pkg).or_default();
                     if !hosts.contains(&host) {
                         hosts.push(host.clone());

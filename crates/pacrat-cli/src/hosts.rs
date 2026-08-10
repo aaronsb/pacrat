@@ -18,8 +18,8 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
     for source in Source::ALL {
         let lists: Vec<(String, Vec<String>)> = hosts
             .iter()
-            .map(|h| (h.clone(), ctx.tracked(h, source)))
-            .collect();
+            .map(|h| Ok((h.clone(), ctx.tracked(h, source)?)))
+            .collect::<Result<_, String>>()?;
         let participating: Vec<&str> = lists
             .iter()
             .filter(|(_, l)| !l.is_empty())
