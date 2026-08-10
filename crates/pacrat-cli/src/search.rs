@@ -113,11 +113,16 @@ pub fn run(ctx: &Ctx, term: &str) -> Result<(), String> {
     }
     // Neither warning promises what survived — with both halves down, any
     // such promise would be wrong, and the table above already shows it.
-    if let Some(e) = repo_error {
+    if let Some(e) = &repo_error {
         println!("warning: the official-repo search failed ({e})");
     }
-    if let Some(e) = aur_error {
+    if let Some(e) = &aur_error {
         println!("warning: the AUR search failed ({e})");
+    }
+    // One half down is degradation; both halves down means the command could
+    // not answer the question at all, and a script deserves to know.
+    if repo_error.is_some() && aur_error.is_some() {
+        return Err(format!("could not search either world for {term}"));
     }
     Ok(())
 }
