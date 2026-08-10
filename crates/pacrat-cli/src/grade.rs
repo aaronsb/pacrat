@@ -57,7 +57,7 @@ use pacrat_core::{Thresholds, Verdict};
 
 use crate::ctx::{self, Ctx};
 use crate::fstree;
-use crate::out::{shell_quote, truncate, visible_line};
+use crate::out::{shell_quote, short_hash, truncate, visible_line};
 use crate::HELD;
 
 /// How often the runner asks whether the child has exited. Short enough that
@@ -307,19 +307,25 @@ fn run_graders(
         });
     }
 
-    for (name, report) in others {
+    for found in others {
         println!();
-        println!("grader    {name}");
-        println!("cache     {}", ok_path(&dir, commit, &name).display());
-        let standing = if name == MANUAL {
+        println!("grader    {}", found.grader);
+        println!("cache     {}", found.path.display());
+        if found.same_bytes_elsewhere(commit) {
+            println!("bytes     {}", same_bytes_line(&found.filed_under));
+        }
+        let standing = if found.grader == MANUAL {
             Standing::Manual
         } else {
             Standing::Retired
         };
-        let outcome = Outcome::Graded { report, took: None };
-        report_outcome(&dir, commit, &digest, &name, &outcome);
+        let outcome = Outcome::Graded {
+            report: found.report,
+            took: None,
+        };
+        report_outcome(&dir, commit, &digest, &found.grader, &outcome);
         answers.push(Answer {
-            name,
+            name: found.grader,
             standing,
             outcome,
         });
@@ -381,6 +387,13 @@ struct Subj<'a> {
 }
 
 fn grade_with(grader: &Grader, dir: &Path, subj: &Subj) -> Outcome {
+    // Keyed by commit, unlike the read-back door below, which finds a
+    // grading of these bytes under any commit. The asymmetry is deliberate
+    // and safe in this direction: missing a hit costs one grader run, and
+    // the fresh answer that comes back is never wrong. Missing one where a
+    // *verdict* is being decided would drop a BLOCK, which is why that path
+    // goes by digest ([`scan_cached`]). Widening this one is a cost
+    // optimisation, not a correctness fix (task #28).
     let cache = ok_path(dir, subj.commit, &grader.name);
     if subj.refresh {
         println!("refresh   ignoring any cached grading (--refresh)");
@@ -944,39 +957,106 @@ fn record_failure(
     write_cache(path, &format!("{record:#}\n"))
 }
 
-/// Every cached grading of this subject, by grader name. Unreadable and
-/// stale files are skipped: this is a scan, and a stray file here must not
-/// fail the run.
+/// One grading on file: who filed it, the commit it was filed under, and
+/// where it came from.
+pub struct Found {
+    pub grader: String,
+    /// The commit component of the filename — **not** necessarily the one
+    /// being asked about. See [`scan_cached`].
+    pub filed_under: String,
+    pub path: PathBuf,
+    pub report: GradeReport,
+}
+
+impl Found {
+    /// Was this filed under the commit being asked about, or found by its
+    /// bytes under another one?
+    pub fn same_bytes_elsewhere(&self, commit: &str) -> bool {
+        !commit_matches(&self.filed_under, commit)
+    }
+}
+
+/// Every cached grading **of these bytes**, whatever commit id it was filed
+/// under. Unreadable and stale files are skipped: this is a scan, and a
+/// stray file here must not fail the run.
+///
+/// The digest is the authority, and the filename is not. A commit id is a
+/// name upstream chose for a tree and can choose again at will:
+/// `git commit --amend` leaves every byte alone and renames them, and a
+/// lookup keyed on the name reports the freshly-renamed tree as ungraded —
+/// a BLOCK deleted by a command that changed nothing. ADR-001 already says
+/// a grading is about bytes rather than about a commit; this is that
+/// sentence written as a lookup instead of as a caveat.
+///
+/// Each record is still checked against the commit *it* was filed under, so
+/// only an internally consistent grading counts: it must say it is about
+/// this package at that commit, and [`read_cache`] refuses it unless the
+/// digest it recorded is the one being asked about. What the digest buys is
+/// that the *name* stops being load-bearing; it does not loosen anything
+/// else.
 ///
 /// `manual` first, then alphabetical — a human's reading leads.
-fn scan_cached(dir: &Path, commit: &str, tree: &str, package: &str) -> Vec<(String, GradeReport)> {
-    let prefix = format!("{commit}.");
-    let mut found: Vec<(String, GradeReport)> = fs::read_dir(dir)
+fn scan_cached(dir: &Path, commit: &str, tree: &str, package: &str) -> Vec<Found> {
+    let found: Vec<Found> = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let file = e.file_name().into_string().ok()?;
             // `<commit>.<grader>.failed.json` is a failure record, not a
-            // grading, and shares the prefix.
+            // grading, and shares the shape.
             if file.ends_with(".failed.json") {
                 return None;
             }
-            let name = file.strip_prefix(&prefix)?.strip_suffix(".json")?;
-            if name.is_empty() {
+            // `<commit>.<grader>.json`. The commit is the first component
+            // and has to look like one — which also keeps the scan from
+            // taking an interest in whatever else is in the directory.
+            let (filed_under, rest) = file.split_once('.')?;
+            check_commit(filed_under).ok()?;
+            let grader = rest.strip_suffix(".json")?;
+            if grader.is_empty() {
                 return None;
             }
-            match read_cache(&e.path(), package, commit, tree) {
-                CacheLook::Hit(report) => Some((name.to_string(), report)),
+            match read_cache(&e.path(), package, filed_under, tree) {
+                CacheLook::Hit(report) => Some(Found {
+                    grader: grader.to_string(),
+                    filed_under: filed_under.to_string(),
+                    path: e.path(),
+                    report,
+                }),
                 _ => None,
             }
         })
         .collect();
-    found.sort_by(|a, b| (a.0 != MANUAL, &a.0).cmp(&(b.0 != MANUAL, &b.0)));
+
+    let mut found = worst_per_grader(found, commit);
+    found.sort_by(|a, b| (a.grader != MANUAL, &a.grader).cmp(&(b.grader != MANUAL, &b.grader)));
     found
 }
 
-/// Cached gradings for this subject from graders that are not in the config
+/// One grading per grader: the worst it has on record for these bytes.
+///
+/// The same tree can be on file under several commit ids — an amend, a
+/// rebase, a tag moved — and listing one grader three times reads as three
+/// opinions where there is one. Keeping the *worst* is the only dedupe that
+/// cannot change a verdict: worst-wins already ignores the others. A tie
+/// goes to the record filed under the commit actually being adopted, so the
+/// common case names the commit the reader expects.
+fn worst_per_grader(mut found: Vec<Found>, commit: &str) -> Vec<Found> {
+    found.sort_by(|a, b| {
+        a.grader
+            .cmp(&b.grader)
+            .then(b.report.pacrat_grade().cmp(&a.report.pacrat_grade()))
+            .then(
+                a.same_bytes_elsewhere(commit)
+                    .cmp(&b.same_bytes_elsewhere(commit)),
+            )
+    });
+    found.dedup_by(|a, b| a.grader == b.grader);
+    found
+}
+
+/// Cached gradings for these bytes from graders that are not in the config
 /// — the built-in `manual` one, or a grader since removed.
 ///
 /// These are *evidence*, not answers. See `pacrat_core::grading`'s quorum
@@ -987,10 +1067,10 @@ fn other_cached(
     tree: &str,
     configured: &[Grader],
     package: &str,
-) -> Vec<(String, GradeReport)> {
+) -> Vec<Found> {
     scan_cached(dir, commit, tree, package)
         .into_iter()
-        .filter(|(name, _)| !configured.iter().any(|g| &g.name == name))
+        .filter(|f| !configured.iter().any(|g| g.name == f.grader))
         .collect()
 }
 
@@ -1001,12 +1081,26 @@ fn other_cached(
 // quietly spawned an LLM would be a surprise with a bill attached — so
 // everything below reads and nothing below runs or writes.
 
+/// The one line that explains a grading nobody filed under this commit.
+/// Written once, because `grade` and `review` must say it the same way.
+fn same_bytes_line(filed_under: &str) -> String {
+    format!(
+        "graded as {} — the same bytes under a different commit id \
+         (an amended or rebased upstream renames a tree; it does not change it)",
+        short_hash(filed_under)
+    )
+}
+
 /// One cached grading, and whether it is entitled to answer for this host.
 pub struct Cached {
     /// The grader's name as the cache filed it.
     pub grader: String,
     pub standing: Standing,
     pub report: GradeReport,
+    /// The commit the grading was filed under, when that is not the one
+    /// being decided about — the amend case, which the reader is told about
+    /// rather than left to infer from a verdict that appeared from nowhere.
+    pub filed_as: Option<String>,
 }
 
 impl Cached {
@@ -1015,22 +1109,27 @@ impl Cached {
     }
 }
 
-/// Every cached grading of `package` at `commit` whose recorded tree digest
-/// is `digest`.
+/// Every cached grading of `package` whose recorded tree digest is `digest`.
 ///
-/// The digest is not decoration: a candidate is graded as *bytes*, and these
-/// are the bytes about to be adopted. A grading of the same commit against a
-/// different tree is not a grading of this candidate and does not appear
-/// here — same rule the grade cache applies to itself.
+/// The digest is not decoration, and it is not a second key alongside the
+/// commit — it *is* the key. A candidate is graded as bytes, and these are
+/// the bytes about to be adopted: a grading of the same commit against a
+/// different tree does not appear here, and a grading of these bytes filed
+/// under another commit does. The second half is what survives an upstream
+/// `git commit --amend`, which renames a tree without touching it and would
+/// otherwise walk a BLOCK straight through this gate ([`scan_cached`]).
 pub fn cached(ctx: &Ctx, package: &str, commit: &str, digest: &str) -> Result<Vec<Cached>, String> {
     let commit = check_commit(commit)?;
     let dir = cache_dir(package)?;
     Ok(scan_cached(&dir, commit, digest, package)
         .into_iter()
-        .map(|(grader, report)| Cached {
-            standing: standing_of(&grader, &ctx.config.graders),
-            grader,
-            report,
+        .map(|found| Cached {
+            standing: standing_of(&found.grader, &ctx.config.graders),
+            filed_as: found
+                .same_bytes_elsewhere(commit)
+                .then(|| found.filed_under.clone()),
+            grader: found.grader,
+            report: found.report,
         })
         .collect())
 }
@@ -1078,6 +1177,9 @@ pub fn print_cached(c: &Cached) {
     let (name, _) = visible_line(&c.grader);
     println!("grader    {}", truncate(&name, 40));
     print_grading(&c.grader, &c.report, "cached");
+    if let Some(filed_as) = &c.filed_as {
+        println!("bytes     {}", same_bytes_line(filed_as));
+    }
     if c.standing == Standing::Retired {
         println!(
             "standing  {} is not in this host's config — its grade can make this \
@@ -1649,7 +1751,6 @@ mod tests {
         write(MANUAL, FULL, 1);
         write("retired", FULL, 3);
         write("configured", FULL, 0);
-        write("manual", "deadbeefcafe", 4); // another commit entirely
         record_failure(
             &failed_path(&f.dir, FULL, "flaky"),
             "flaky",
@@ -1669,12 +1770,115 @@ mod tests {
 
         let configured = vec![grader("configured", vec!["x".into()])];
         let found = other_cached(&f.dir, FULL, &tree, &configured, "mdcat");
-        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = found.iter().map(|f| f.grader.as_str()).collect();
         assert_eq!(names, [MANUAL, "retired"], "found {names:?}");
-        assert_eq!(found[0].1.grade, 1);
+        assert_eq!(found[0].report.grade, 1);
 
         // A directory that does not exist is an empty scan, not a failure.
         assert!(other_cached(Path::new("/nonexistent"), FULL, &tree, &[], "mdcat").is_empty());
+    }
+
+    /// THE finding: `git commit --amend` renames a tree without changing a
+    /// byte of it, and a lookup keyed on the name loses every grading of
+    /// those bytes — a BLOCK deleted by a command that changed nothing.
+    /// The reviewer adopted a `curl … | sh` tree at exit 0 this way.
+    #[test]
+    fn an_amended_commit_does_not_lose_the_grading_of_its_bytes() {
+        let f = Fixture::new("amend");
+        let tree = "d".repeat(64);
+        let before = FULL;
+        let after = "b61d7ea08f50885b8b915134b7d75fcf16f2b7ad";
+
+        // Graded BLOCK under the commit upstream first published.
+        write_grading(
+            &ok_path(&f.dir, before, MANUAL),
+            &tree,
+            &report_json("mdcat", before, 4),
+        )
+        .unwrap();
+
+        // Upstream amends: same bytes, new name. The grading still answers,
+        // and says which commit it was filed under.
+        let found = scan_cached(&f.dir, after, &tree, "mdcat");
+        assert_eq!(found.len(), 1, "the amend lost the grading");
+        assert_eq!(found[0].report.grade, 4);
+        assert!(found[0].same_bytes_elsewhere(after));
+        assert_eq!(found[0].filed_under, before);
+        assert!(same_bytes_line(&found[0].filed_under).contains("same bytes"));
+
+        // Filed under the commit being asked about: nothing to explain.
+        assert!(!scan_cached(&f.dir, before, &tree, "mdcat")[0].same_bytes_elsewhere(before));
+
+        // The digest is still the whole authority: other bytes, no answer,
+        // however many commits they are filed under.
+        assert!(scan_cached(&f.dir, after, &"e".repeat(64), "mdcat").is_empty());
+    }
+
+    /// The same tree can be on file under several commit ids. One grader is
+    /// one opinion, and the one that counts is its worst — the others could
+    /// not change worst-wins anyway.
+    #[test]
+    fn one_grader_answers_once_with_its_worst_reading() {
+        let f = Fixture::new("dupes");
+        let tree = "d".repeat(64);
+        let mild = FULL;
+        let severe = "b61d7ea08f50885b8b915134b7d75fcf16f2b7ad";
+        write_grading(
+            &ok_path(&f.dir, mild, "yay-friend"),
+            &tree,
+            &report_json("mdcat", mild, 1),
+        )
+        .unwrap();
+        write_grading(
+            &ok_path(&f.dir, severe, "yay-friend"),
+            &tree,
+            &report_json("mdcat", severe, 4),
+        )
+        .unwrap();
+
+        let found = scan_cached(&f.dir, mild, &tree, "mdcat");
+        assert_eq!(found.len(), 1, "one grader listed twice");
+        assert_eq!(found[0].report.grade, 4, "the milder reading won");
+        assert_eq!(found[0].filed_under, severe);
+
+        // A tie goes to the commit actually being decided about, so the
+        // common case names the commit the reader expects to see.
+        write_grading(
+            &ok_path(&f.dir, severe, "tie"),
+            &tree,
+            &report_json("mdcat", severe, 2),
+        )
+        .unwrap();
+        write_grading(
+            &ok_path(&f.dir, mild, "tie"),
+            &tree,
+            &report_json("mdcat", mild, 2),
+        )
+        .unwrap();
+        let found = scan_cached(&f.dir, mild, &tree, "mdcat");
+        let tie = found.iter().find(|f| f.grader == "tie").unwrap();
+        assert_eq!(tie.filed_under, mild);
+        assert!(!tie.same_bytes_elsewhere(mild));
+    }
+
+    /// The scan reads a directory anyone can drop a file into, so a name
+    /// that is not `<object id>.<grader>.json` is not a grading.
+    #[test]
+    fn the_scan_only_takes_an_interest_in_cache_filenames() {
+        let f = Fixture::new("junk");
+        let tree = "d".repeat(64);
+        write_grading(
+            &ok_path(&f.dir, FULL, MANUAL),
+            &tree,
+            &report_json("mdcat", FULL, 0),
+        )
+        .unwrap();
+        for junk in ["notes.json", ".manual.json", "HEAD.manual.json", "x.json"] {
+            fs::write(f.dir.join(junk), "{}").unwrap();
+        }
+        let found = scan_cached(&f.dir, FULL, &tree, "mdcat");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].grader, MANUAL);
     }
 
     /// The end of the loop: run, cache, hit. The grader here abbreviates the
@@ -1770,6 +1974,7 @@ mod tests {
             grader: "x".into(),
             standing,
             report: GradeReport::from_json(&report_json("mdcat", FULL, grade)).unwrap(),
+            filed_as: None,
         }
     }
 

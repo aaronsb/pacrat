@@ -109,15 +109,19 @@ impl Held {
                  through the review gate (`pacrat review {package}`), not by \
                  re-vendoring; pass --force to replace the tree and ledger entry"
             ),
+            // These two are reached from `review` and `adopt-update` as
+            // well, where a bare "--force" names a flag the reader did not
+            // type on a command they did not run. Spell the command out.
             Held::LedgerOnly => format!(
-                "{package} is in aur/sources.toml but has no tree at {} — \
-                 the store is inconsistent; --force re-vendors it from upstream",
+                "{package} is in aur/sources.toml but has no tree at {} — the store is \
+                 inconsistent; `pacrat vendor {package} --force` re-vendors it from \
+                 upstream",
                 tree.display()
             ),
             Held::TreeOnly => format!(
-                "{package} has a tree at {} but no ledger entry — an earlier \
-                 vendoring did not finish, so there is nothing to review \
-                 against; --force replaces the tree and writes the entry",
+                "{package} has a tree at {} but no ledger entry — an earlier vendoring \
+                 did not finish, so there is nothing to review against; \
+                 `pacrat vendor {package} --force` replaces the tree and writes the entry",
                 tree.display()
             ),
         }

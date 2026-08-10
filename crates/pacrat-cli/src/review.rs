@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use pacrat_core::grading::commit_matches;
 use pacrat_core::pkg::valid_name;
-use pacrat_core::sources::{valid_commit, SourceEntry};
+use pacrat_core::sources::{valid_commit, SourceEntry, NOTE_MAX};
 use pacrat_core::Verdict;
 
 use crate::ctx::Ctx;
@@ -107,21 +107,8 @@ pub fn run(ctx: &Ctx, package: &str) -> Result<(), String> {
 /// Returns whether the scratch trees are worth keeping — true when the diff
 /// was too long to print, since the reader now needs the trees themselves.
 fn show(ctx: &Ctx, package: &str, curated: &Curated, cand: &Candidate) -> Result<bool, String> {
-    let reviewed_files = fstree::files(&curated.tree)?;
     header(curated, cand);
-
-    let changes = changes(&reviewed_files, &cand.files, |rel| {
-        // Unreadable either side counts as changed: the diff below will say
-        // what it can, and calling a file we could not read "unchanged" is
-        // the one answer that would be a lie.
-        match (
-            fs::read(curated.tree.join(rel)),
-            fs::read(cand.tree.join(rel)),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        }
-    });
+    let changes = changes_between(curated, cand)?;
     changes.render();
 
     println!();
@@ -188,6 +175,29 @@ fn execute_adopt(
 ) -> Result<Adoption, String> {
     header(curated, cand);
 
+    // `--commit` is answered first, before any question about drift.
+    //
+    // It has to be: the human named a commit, and every answer other than
+    // "that one is what HEAD is" is a refusal. Asked in the other order, an
+    // upstream that *reverted* to the reviewed commit turns `--commit X`
+    // into "nothing to adopt" and exit 0 — a script reading that zero
+    // believes X landed, and X is the one thing that did not.
+    if let Some(want) = want {
+        if !commit_matches(want, &cand.commit) {
+            // A hold rather than a failure: nothing is broken, there is
+            // simply a commit at the other end that nobody has read — which
+            // is exactly the state exit 10 exists to name.
+            println!();
+            println!(
+                "not adopted — you asked for {} and upstream HEAD is {}. Review what \
+                 is actually there (`pacrat review {package}`)",
+                short_hash(want),
+                short_hash(&cand.commit)
+            );
+            return Ok(Adoption::Held);
+        }
+    }
+
     if !updates::drifted(&curated.entry.reviewed, &cand.commit) {
         println!();
         println!(
@@ -197,24 +207,14 @@ fn execute_adopt(
         return Ok(Adoption::Adopted);
     }
 
-    // The candidate a human read, versus the candidate upstream is offering
-    // now. Substituting one for the other is precisely the move this verb
-    // exists to prevent.
-    if let Some(want) = want {
-        if !commit_matches(want, &cand.commit) {
-            // A hold rather than a failure: nothing is broken, there is
-            // simply a newer candidate that nobody has read yet — which is
-            // exactly the state exit 10 exists to name.
-            println!();
-            println!(
-                "not adopted — upstream moved again: HEAD is {} and you asked for \
-                 {}. Review the new candidate (`pacrat review {package}`)",
-                short_hash(&cand.commit),
-                short_hash(want)
-            );
-            return Ok(Adoption::Held);
-        }
-    }
+    // What adopting would do to the store tree. A prompt that asks "adopt
+    // this?" while showing nothing about it is a prompt that trains people
+    // to type y — `vendor` sets the bar by dumping the PKGBUILD and every
+    // `.install` before it asks, and the least this can do is name what
+    // moved. The full diff stays `review`'s job, and the line below says so.
+    changes_between(curated, cand)?.render();
+    println!();
+    println!("diff      pacrat review {package} — the line-by-line, before you answer");
 
     let verdict = show_gradings(ctx, package, cand)?;
     println!();
@@ -293,8 +293,13 @@ fn install(ctx: &Ctx, package: &str, curated: &Curated, cand: &Candidate) -> Res
         .get_mut(package)
         .ok_or_else(|| stale.clone())?;
     entry.reviewed = cand.commit.clone();
-    // Any refusal on this row is spent: the ledger's reviewed commit has
-    // moved to (or past) the commit that was refused.
+    // Any adoption clears the row's refusal. Not because the new commit is
+    // known to descend from the refused one — nothing here checks ancestry,
+    // and upstream can move sideways — but because the refusal was recorded
+    // to stop `updates` re-raising *that* candidate, and a human has now
+    // answered a later question about this package with their eyes open. A
+    // refusal that outlived the review it came from would be a permanent
+    // silence nobody remembers switching on.
     entry.rejected = None;
     entry.rejected_note = None;
 
@@ -328,10 +333,26 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
         if note.trim().is_empty() {
             return Err("--note is empty".into());
         }
+        // Refused here rather than at the next parse: writing it and then
+        // discovering the ledger no longer loads would break the file for
+        // every host, over a note.
+        let length = note.chars().count();
+        if length > NOTE_MAX {
+            return Err(format!(
+                "--note is {length} characters — the cap is {NOTE_MAX}. The ledger is \
+                 synced to every host; put the long version in the commit message"
+            ));
+        }
     }
 
     preamble(package, &curated);
     let candidate = updates::ls_remote(&curated.entry.upstream, |line| println!("{line}"))?;
+    // An error (exit 1), where the same shape of nothing-to-do is exit 0 in
+    // `adopt-update`. The asymmetry is real, not an oversight: adopt is
+    // convergent — asked to make the store hold HEAD, and it already does,
+    // so the caller got what it wanted. Reject is an instruction about a
+    // specific thing, and that thing does not exist. Nothing was recorded,
+    // and a zero here would tell a script a refusal is on file when none is.
     if !updates::drifted(&curated.entry.reviewed, &candidate) {
         return Err(format!(
             "nothing to reject — upstream HEAD is {}, the commit the ledger already \
@@ -628,6 +649,26 @@ struct Changes {
     unchanged: Vec<String>,
 }
 
+/// What adopting this candidate would do to the store tree.
+///
+/// Shared by `review` and `adopt-update` so the summary a human is shown
+/// before the prompt is the same summary the viewer showed them.
+fn changes_between(curated: &Curated, cand: &Candidate) -> Result<Changes, String> {
+    let reviewed_files = fstree::files(&curated.tree)?;
+    Ok(changes(&reviewed_files, &cand.files, |rel| {
+        // Unreadable either side counts as changed: the diff will say what
+        // it can, and calling a file we could not read "unchanged" is the
+        // one answer that would be a lie.
+        match (
+            fs::read(curated.tree.join(rel)),
+            fs::read(cand.tree.join(rel)),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }))
+}
+
 /// Compare two file lists. Pure: `same` answers the question about bytes, so
 /// the set arithmetic can be tested without a filesystem.
 fn changes(reviewed: &[String], candidate: &[String], same: impl Fn(&str) -> bool) -> Changes {
@@ -718,7 +759,26 @@ fn names_of(names: &[String]) -> String {
 /// decide.
 fn diff(scratch: &Path) -> Result<Diff, String> {
     let dir = scratch.to_string_lossy().into_owned();
-    let argv = ["-C", &dir, "diff", "--no-index", "--", REVIEWED, CANDIDATE];
+    let argv = [
+        "-C",
+        &dir,
+        // The one view this module exists to make trustworthy must not be
+        // rewritable by config this module never read. `diff.external`
+        // replaces the diff body outright — a reviewer demonstrated a
+        // gitconfig that answered "PKGBUILD: no changes worth reading" —
+        // and a `diff` attribute with a `textconv` does the same per path,
+        // from a `.gitattributes` the *upstream* controls. Both doors are
+        // shut here rather than trusted to be unused.
+        "-c",
+        "core.attributesFile=/dev/null",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-index",
+        "--",
+        REVIEWED,
+        CANDIDATE,
+    ];
     println!("run       git {}", shown(&argv));
 
     let mut cmd = Command::new("git");
@@ -730,23 +790,44 @@ fn diff(scratch: &Path) -> Result<Diff, String> {
             DIFF_TIMEOUT.as_secs()
         ));
     }
-    // 1 is "there are differences", which is the whole point of asking.
+    // The reader is bounded, so a tree with a gigabyte of "data" in it
+    // cannot make pacrat hold a gigabyte. Output at the bound is output that
+    // was probably cut, and saying so is the difference between a short diff
+    // and a lie.
+    let cut = ran.stdout.len() as u64 >= proc::PIPE_LIMIT;
+    let text = || String::from_utf8_lossy(&ran.stdout).into_owned();
+
     match ran.status.code() {
-        Some(0 | 1) => Ok(Diff {
-            // The reader is bounded, so a tree with a gigabyte of "data" in
-            // it cannot make pacrat hold a gigabyte. Output that lands
-            // exactly on the bound is output that was probably cut, and
-            // saying so is the difference between a short diff and a lie.
-            cut: ran.stdout.len() as u64 >= proc::PIPE_LIMIT,
-            text: String::from_utf8_lossy(&ran.stdout).into_owned(),
-        }),
+        // 1 is "there are differences", which is the whole point of asking.
+        Some(0 | 1) => Ok(Diff { text: text(), cut }),
+        // No exit code means a signal, and the signal we cause ourselves is
+        // SIGPIPE: capping the read closes the pipe under a git that is
+        // still writing. That is a diff we cut off, not a diff that failed,
+        // and reporting it as a failure is how a reviewer ends up with no
+        // diff at all for the largest change in the set — the one most
+        // worth reading.
+        None if cut => Ok(Diff { text: text(), cut }),
         _ => Err(format!(
             "git diff --no-index failed: {}",
-            truncate(
-                visible_line(&String::from_utf8_lossy(&ran.stderr)).0.trim(),
-                200
-            )
+            diff_failure(&ran)
         )),
+    }
+}
+
+/// Why the diff failed, in one line that is never empty.
+///
+/// git writes nothing to stderr when it dies of a signal, and an error whose
+/// text is the empty string tells the reader only that something is wrong
+/// with pacrat. The status is always something we can name.
+fn diff_failure(ran: &proc::Ran) -> String {
+    let (stderr, _) = visible_line(&String::from_utf8_lossy(&ran.stderr));
+    let stderr = truncate(stderr.trim(), 200);
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    match ran.status.code() {
+        Some(code) => format!("exited {code} without saying why"),
+        None => format!("{} — no output to go on", ran.status),
     }
 }
 
@@ -969,6 +1050,35 @@ mod tests {
         let shown = pkgver(t.path()).unwrap();
         assert!(!shown.contains('\x1b'), "{shown:?}");
         assert!(!shown.contains('\n'), "{shown:?}");
+    }
+
+    /// A diff that fails must say something. git writes nothing to stderr
+    /// when it dies of a signal, and "git diff --no-index failed: " with
+    /// nothing after the colon tells the reader only that pacrat is broken.
+    #[test]
+    fn a_silent_failure_still_names_itself() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "kill -9 $$"]);
+        let ran = proc::run_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert!(ran.stderr.is_empty(), "the fixture was supposed to be mute");
+        let reason = diff_failure(&ran);
+        assert!(!reason.is_empty(), "an empty reason is not a reason");
+        assert!(reason.contains("no output to go on"), "{reason}");
+
+        // A plain non-zero exit with nothing said is also named.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 3"]);
+        let ran = proc::run_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert_eq!(diff_failure(&ran), "exited 3 without saying why");
+
+        // When git does explain itself, that is what the reader gets —
+        // neutered, because it is a message about someone else's file.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf 'fatal: \\033[2Kbad\\n' >&2; exit 128"]);
+        let ran = proc::run_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        let reason = diff_failure(&ran);
+        assert!(reason.contains("fatal:"), "{reason}");
+        assert!(!reason.contains('\x1b'), "{reason}");
     }
 
     /// The argv line is pacrat's own output about someone else's string. It

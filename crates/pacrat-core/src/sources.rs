@@ -72,6 +72,16 @@ pub fn valid_commit(commit: &str) -> bool {
     (7..=64).contains(&commit.len()) && commit.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// How long a rejection note may be.
+///
+/// The ledger is a file every host in the fleet reads, and an unbounded
+/// free-text field in a synced file grows legs: it lands in tables, in a
+/// TUI cell, in whatever reads this next. Five hundred characters is more
+/// than a reason needs and far less than a payload wants. Enforced at
+/// parse, so no consumer has to remember to be careful — the same argument
+/// `valid_commit` makes about shape, made about size.
+pub const NOTE_MAX: usize = 500;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sources {
     #[serde(default)]
@@ -102,6 +112,20 @@ impl Sources {
                     return Err(format!(
                         "packages.{package}.{field} is {value:?}, which is not a commit hash — \
                          expected 7-64 hex characters as `git rev-parse` prints them"
+                    ));
+                }
+            }
+            for (field, note) in [
+                ("note", entry.note.as_ref()),
+                ("rejected_note", entry.rejected_note.as_ref()),
+            ] {
+                let Some(note) = note else { continue };
+                if note.chars().count() > NOTE_MAX {
+                    return Err(format!(
+                        "packages.{package}.{field} is {} characters — the cap is {NOTE_MAX}; \
+                         the ledger is synced to every host, and a reason that long is \
+                         something other than a reason",
+                        note.chars().count()
                     ));
                 }
             }
@@ -204,6 +228,37 @@ rejected_note = "post_install gained curl … | sh"
                 "unhelpful error for {rejected:?}: {err}"
             );
         }
+    }
+
+    /// The ledger is synced to every host, so a free-text field is a field
+    /// somebody else's machine has to render. Bounded at parse, where no
+    /// consumer can forget to check.
+    #[test]
+    fn a_note_longer_than_the_cap_fails_to_parse() {
+        for field in ["note", "rejected_note"] {
+            let toml = format!(
+                "[packages.mdcat]\n\
+                 upstream = \"u\"\n\
+                 reviewed = \"3f9c21ab\"\n\
+                 role = \"vendored\"\n\
+                 rejected = \"7d02e4c1\"\n\
+                 {field} = {:?}\n",
+                "x".repeat(NOTE_MAX + 1)
+            );
+            let err = match Sources::from_toml(&toml) {
+                Ok(_) => panic!("an oversized {field} should have been rejected"),
+                Err(e) => e,
+            };
+            assert!(err.contains(field) && err.contains("mdcat"), "{err}");
+        }
+        // Exactly at the cap is fine, and multi-byte characters are counted
+        // as characters — a note in Greek is not half a note.
+        let ok = format!(
+            "[packages.mdcat]\nupstream = \"u\"\nreviewed = \"3f9c21ab\"\n\
+             role = \"vendored\"\nnote = {:?}\n",
+            "é".repeat(NOTE_MAX)
+        );
+        assert!(Sources::from_toml(&ok).is_ok());
     }
 
     #[test]
