@@ -53,7 +53,7 @@ use crate::ctx::Ctx;
 use crate::out;
 use crate::status;
 use childlock::Hold;
-use joblog::Log;
+use joblog::{Handle, Log};
 use keymap::{action_for, Action, Local};
 use prompt::{Prompt, Typed};
 use screens::browse::{Browse, Rung};
@@ -194,11 +194,26 @@ fn turn(
         // keyboard that does nothing.
         app.settled();
         if ready {
-            // Key *presses*. Terminals that report releases and repeats
-            // (kitty's protocol, Windows) would otherwise act twice on one
-            // keystroke.
             if let Event::Key(key) = event::read().map_err(|e| format!("reading input: {e}"))? {
-                if key.kind == KeyEventKind::Press {
+                // Presses everywhere; repeats only where a repeat is the
+                // point.
+                //
+                // Terminals that report the full set (kitty's protocol,
+                // Windows consoles) send `Repeat` for auto-repeat, and
+                // acting on those would act twice — or forty times — on one
+                // keystroke held a moment too long. So they are dropped,
+                // with exactly one exception: auto-repeat *is* the
+                // childlock's designed input, and on a terminal that reports
+                // it as `Repeat` the bar would otherwise take a single
+                // press and then sit there while the reader holds a key that
+                // has stopped meaning anything. A lock with no key on some
+                // terminals is worse than no lock.
+                let wanted = match key.kind {
+                    KeyEventKind::Press => true,
+                    KeyEventKind::Repeat => app.wants_repeats(),
+                    KeyEventKind::Release => false,
+                };
+                if wanted {
                     // Is there already more input behind this keystroke?
                     // Only the childlock cares, and for it this is half the
                     // answer to "was this typed or pasted": a person holding
@@ -417,7 +432,7 @@ struct App {
     /// Work to do after the next frame is drawn, and the log entry already
     /// pushed for it. Two-phase because the frame that shows a job running
     /// has to be drawn before the job blocks the thread that would draw it.
-    pending: Option<(usize, Work)>,
+    pending: Option<(Handle, Work)>,
     reload_pending: bool,
     quit: bool,
 }
@@ -503,6 +518,14 @@ impl App {
     /// this is the clock.
     fn settled(&mut self) {
         self.jobs.settled();
+    }
+
+    /// Does anything on screen want auto-repeat events?
+    ///
+    /// Only the childlock, and only while it is up. See the event loop for
+    /// why repeats are dropped everywhere else.
+    fn wants_repeats(&self) -> bool {
+        matches!(self.overlay, Overlay::Childlock(_))
     }
 
     fn needs_load(&self) -> bool {
