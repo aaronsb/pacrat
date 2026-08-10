@@ -16,7 +16,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use pacrat_core::config::{Config, Mode, Ui, SETTABLE};
+use pacrat_core::config::{Cmd, Config, Mode, Ui, SETTABLE};
 
 use crate::ctx::Ctx;
 use crate::out::visible_line;
@@ -106,7 +106,7 @@ fn list(ctx: &Ctx) -> Result<(), String> {
                 "  {:<12} timeout {}s   {}",
                 visible_line(&g.name).0,
                 g.timeout_s,
-                visible_line(&g.cmd.join(" ")).0
+                visible_line(&g.cmd.to_string()).0
             );
         }
     }
@@ -237,14 +237,16 @@ pub fn render(config: &Config, written_at: &str) -> String {
     for g in &config.graders {
         s.push_str("\n[[graders]]\n");
         s.push_str(&format!("name = {}\n", toml_str(&g.name)));
-        s.push_str(&format!(
-            "cmd = [{}]\n",
-            g.cmd
-                .iter()
-                .map(|a| toml_str(a))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        match &g.cmd {
+            Cmd::Line(line) => s.push_str(&format!("cmd = {}\n", toml_str(line))),
+            Cmd::Argv(argv) => s.push_str(&format!(
+                "cmd = [{}]\n",
+                argv.iter()
+                    .map(|a| toml_str(a))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
         s.push_str(&format!("timeout_s = {}\n", g.timeout_s));
         if let Some(scale) = g.scale {
             s.push_str(&format!(
@@ -322,7 +324,7 @@ mod tests {
         config.repo.server = Some("https://example.invalid/repo".into());
         config.graders.push(Grader {
             name: "yay-friend".into(),
-            cmd: vec![
+            cmd: Cmd::Argv(vec![
                 "/opt/pacrat/contrib/graders/yay-friend-grade".into(),
                 "--package".into(),
                 "{package}".into(),
@@ -330,9 +332,16 @@ mod tests {
                 "{tree}".into(),
                 "--commit".into(),
                 "{commit}".into(),
-            ],
+            ]),
             timeout_s: 600,
             scale: Some(Scale { min: 0, max: 4 }),
+        });
+        // A string cmd beside it: both forms must survive the same file.
+        config.graders.push(Grader {
+            name: "one-liner".into(),
+            cmd: Cmd::Line("mytool --tree \"$PACRAT_TREE\" | jq '.'".into()),
+            timeout_s: 300,
+            scale: None,
         });
 
         let text = render(&config, "2026-08-10T12:00:00Z");
@@ -348,17 +357,44 @@ mod tests {
         let mut config = Config::default();
         config.graders.push(Grader {
             name: "awkward".into(),
-            cmd: vec![
+            cmd: Cmd::Argv(vec![
                 "/bin/grader".into(),
                 "a \"quoted\" thing".into(),
                 "back\\slash".into(),
                 "{package}".into(),
-            ],
+            ]),
             timeout_s: 30,
             scale: None,
         });
         let read_back = Config::from_toml(&render(&config, "now")).unwrap();
         assert_eq!(read_back.graders, config.graders);
+    }
+
+    /// The string form holds a whole shell line, so it can legally carry
+    /// TOML's own quotes and backslashes; the renderer must keep every byte,
+    /// and the reader must give the same bytes back.
+    #[test]
+    fn hostile_string_cmds_survive_the_round_trip() {
+        for line in [
+            "mytool --tree \"$PACRAT_TREE\" | jq '{contract: \"pacrat-grade/v1\"}'",
+            r#"grep -q 'x\\y' "$PACRAT_TREE/PKGBUILD" && echo '{"a": "b"}'"#,
+            "awk '{print}' <\"$PACRAT_TREE/.SRCINFO\"",
+        ] {
+            let mut config = Config::default();
+            config.graders.push(Grader {
+                name: "one-liner".into(),
+                cmd: Cmd::Line(line.into()),
+                timeout_s: 30,
+                scale: None,
+            });
+            let text = render(&config, "now");
+            let read_back = Config::from_toml(&text)
+                .unwrap_or_else(|e| panic!("{line:?} did not read back: {e}\n{text}"));
+            assert_eq!(read_back.graders, config.graders, "bytes moved:\n{text}");
+            // And a second trip is byte-identical: rendering what was read
+            // back produces the same file.
+            assert_eq!(render(&read_back, "now"), text);
+        }
     }
 
     // ---- get / set ----

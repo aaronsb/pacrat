@@ -175,26 +175,74 @@ impl Repo {
 /// error message lists them.
 pub const PLACEHOLDERS: [&str; 3] = ["package", "tree", "commit"];
 
+/// The subject, as environment variables, exported to every grader pacrat
+/// spawns — both cmd forms, every run (ADR-004).
+///
+/// These names are contract surface: renaming one is a breaking change for
+/// every grader that reads it, and gets the same care as a change to the
+/// report shape. The values are the same three the placeholders carry —
+/// the package name, the tree's absolute path, the commit the grading will
+/// be filed under.
+pub const ENV_PACKAGE: &str = "PACRAT_PACKAGE";
+pub const ENV_TREE: &str = "PACRAT_TREE";
+pub const ENV_COMMIT: &str = "PACRAT_COMMIT";
+
 /// The grader name pacrat keeps for itself: a human's own judgement,
 /// recorded by `pacrat grade --grade N --note …`.
 pub const MANUAL: &str = "manual";
 
+/// How a grader is invoked: an argv template, or one line of shell.
+///
+/// The two forms differ in exactly one place — what pacrat puts into them.
+/// An argv template gets the subject substituted into its arguments, element
+/// by element, with no shell anywhere on that path. A string is run as
+/// `sh -c <string>`, **verbatim**: pacrat substitutes nothing into it, ever,
+/// and the subject arrives through the `PACRAT_*` environment instead
+/// (ADR-004). That nothing is the string form's whole security argument —
+/// `sh` enters the grader path deliberately here and only here, running a
+/// line authored wholly by the config's owner and edited by nobody, so
+/// there is still no injection surface. A placeholder in a string cmd is
+/// therefore a config error, not a substitution site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Cmd {
+    /// `cmd = ["prog", "--tree", "{tree}"]` — exec-exact argument
+    /// boundaries; the placeholders are substituted per element.
+    Argv(Vec<String>),
+    /// `cmd = "prog --tree \"$PACRAT_TREE\" | jq …"` — one line, handed to
+    /// `sh -c` exactly as written.
+    Line(String),
+}
+
+/// One line describing the invocation, for `config list` and the TUI. The
+/// argv form joins with spaces — readable, not re-runnable — and the string
+/// form is shown as itself, because it is the invocation.
+impl std::fmt::Display for Cmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Cmd::Argv(argv) => f.write_str(&argv.join(" ")),
+            Cmd::Line(line) => f.write_str(line),
+        }
+    }
+}
+
 /// An external grader: a program pacrat runs to get a `pacrat-grade/v1`
 /// report on stdout.
 ///
-/// `cmd` is an **argv template**, never a command line. Each element is
-/// substituted independently and handed straight to exec, so a value
-/// containing spaces, quotes or `;` stays exactly one argument — there is no
-/// shell anywhere on this path and therefore nothing to escape for. The
+/// In the argv form, `cmd` is an **argv template**, never a command line.
+/// Each element is substituted independently and handed straight to exec,
+/// so a value containing spaces, quotes or `;` stays exactly one argument —
+/// there is no shell on that path and therefore nothing to escape for. The
 /// placeholders are checked here rather than at substitution time so a typo
 /// in the config is an error at load, not a grader that silently receives
-/// the literal text `{treee}`.
+/// the literal text `{treee}`. The string form is [`Cmd::Line`]'s story:
+/// verbatim to `sh`, subject in the environment, placeholders refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grader {
     /// Names the grader in output and in the cache file. Restricted to a
     /// filename-safe alphabet because it becomes a path component.
     pub name: String,
-    pub cmd: Vec<String>,
+    pub cmd: Cmd,
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
     /// The scale this grader is expected to answer on.
@@ -257,23 +305,49 @@ impl Grader {
             ));
         }
 
-        let Some(program) = self.cmd.first() else {
-            return Err(format!("grader {:?} has an empty cmd", self.name));
-        };
-        if program.is_empty() {
-            return Err(format!("grader {:?} has an empty program name", self.name));
-        }
-        // The program is the grader. Taking it from the subject would let a
-        // package name choose what runs.
-        if program.contains('{') {
-            return Err(format!(
-                "grader {:?}: the program {program:?} may not contain a placeholder — \
-                 pacrat substitutes into arguments, not into what it executes",
-                self.name
-            ));
-        }
-        for arg in &self.cmd {
-            check_placeholders(arg).map_err(|e| format!("grader {:?}: {e}", self.name))?;
+        match &self.cmd {
+            Cmd::Argv(argv) => {
+                let Some(program) = argv.first() else {
+                    return Err(format!("grader {:?} has an empty cmd", self.name));
+                };
+                if program.is_empty() {
+                    return Err(format!("grader {:?} has an empty program name", self.name));
+                }
+                // The program is the grader. Taking it from the subject would
+                // let a package name choose what runs.
+                if program.contains('{') {
+                    return Err(format!(
+                        "grader {:?}: the program {program:?} may not contain a placeholder — \
+                         pacrat substitutes into arguments, not into what it executes",
+                        self.name
+                    ));
+                }
+                for arg in argv {
+                    check_placeholders(arg).map_err(|e| format!("grader {:?}: {e}", self.name))?;
+                }
+            }
+            Cmd::Line(line) => {
+                if line.trim().is_empty() {
+                    return Err(format!("grader {:?} has an empty cmd", self.name));
+                }
+                // Only the three known placeholders are refused, spelled
+                // exactly. Other braces are the shell's and jq's own syntax
+                // and pass untouched — this check exists so nobody carries
+                // the argv form's ceremony into a string and silently greps
+                // a literal `{package}`.
+                for p in PLACEHOLDERS {
+                    if line.contains(&format!("{{{p}}}")) {
+                        return Err(format!(
+                            "grader {:?}: a string cmd is run by sh exactly as written — \
+                             pacrat substitutes nothing into it. Remove {{{p}}} and read \
+                             the subject from the environment instead: {ENV_PACKAGE}, \
+                             {ENV_TREE}, {ENV_COMMIT}. (Placeholders belong to the \
+                             argv-array form.)",
+                            self.name
+                        ));
+                    }
+                }
+            }
         }
 
         if self.timeout_s == 0 {
@@ -306,11 +380,22 @@ impl Grader {
         }
     }
 
-    /// The argv for one subject. Single-pass: a substituted value that
+    /// The argv for one subject.
+    ///
+    /// Argv form: single-pass substitution — a substituted value that
     /// happens to read like a placeholder is never substituted again.
+    /// String form: `["sh", "-c", <line>]`, the line **verbatim** — the
+    /// subject arguments are deliberately unused, because the subject
+    /// reaches a string cmd through the environment and nothing else
+    /// (ADR-004). No code path interpolates into a string cmd.
     pub fn argv(&self, package: &str, tree: &str, commit: &str) -> Vec<String> {
-        let values = [("package", package), ("tree", tree), ("commit", commit)];
-        self.cmd.iter().map(|a| substitute(a, &values)).collect()
+        match &self.cmd {
+            Cmd::Argv(argv) => {
+                let values = [("package", package), ("tree", tree), ("commit", commit)];
+                argv.iter().map(|a| substitute(a, &values)).collect()
+            }
+            Cmd::Line(line) => vec!["sh".into(), "-c".into(), line.clone()],
+        }
     }
 }
 
@@ -613,14 +698,14 @@ path = "/somewhere/else"
     fn grader() -> Grader {
         Grader {
             name: "yay-friend".into(),
-            cmd: vec![
+            cmd: Cmd::Argv(vec![
                 "yay-friend".into(),
                 "--format".into(),
                 "pacrat".into(),
                 "--tree".into(),
                 "{tree}".into(),
                 "{package}".into(),
-            ],
+            ]),
             timeout_s: 300,
             scale: None,
         }
@@ -755,7 +840,10 @@ cmd = ["b"]
     #[test]
     fn an_empty_or_placeholder_program_is_rejected() {
         for cmd in [vec![], vec!["".into()], vec!["{package}".into()]] {
-            let g = Grader { cmd, ..grader() };
+            let g = Grader {
+                cmd: Cmd::Argv(cmd),
+                ..grader()
+            };
             assert!(g.validate().is_err(), "cmd {:?} should be rejected", g.cmd);
         }
     }
@@ -764,7 +852,7 @@ cmd = ["b"]
     fn unknown_placeholders_are_a_config_error() {
         for arg in ["{treee}", "{}", "{Package}", "--x={sha}", "{tree", "tree}"] {
             let g = Grader {
-                cmd: vec!["yf".into(), arg.into()],
+                cmd: Cmd::Argv(vec!["yf".into(), arg.into()]),
                 ..grader()
             };
             let err = g
@@ -777,14 +865,126 @@ cmd = ["b"]
         }
         // The known three, in every position, are fine.
         let g = Grader {
-            cmd: vec![
+            cmd: Cmd::Argv(vec![
                 "yf".into(),
                 "{package}@{commit}".into(),
                 "{tree}/PKGBUILD".into(),
-            ],
+            ]),
             ..grader()
         };
         assert_eq!(g.validate(), Ok(()));
+    }
+
+    // ---- the string cmd form (ADR-004) ----
+
+    #[test]
+    fn a_string_cmd_is_read_beside_the_array_form() {
+        let c = Config::from_toml(
+            r#"
+[[graders]]
+name = "one-liner"
+cmd = "mytool --tree \"$PACRAT_TREE\" | jq '{contract: \"pacrat-grade/v1\"}'"
+
+[[graders]]
+name = "exec-exact"
+cmd = ["/usr/bin/grader", "--tree", "{tree}"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.graders.len(), 2);
+        assert!(matches!(c.graders[0].cmd, Cmd::Line(_)));
+        assert!(matches!(c.graders[1].cmd, Cmd::Argv(_)));
+        // The default timeout is the same whichever form carried the cmd.
+        assert_eq!(c.graders[0].timeout_s, 300);
+    }
+
+    /// THE invariant: nothing is ever substituted into a string cmd. The
+    /// line reaches sh exactly as the config's owner wrote it — a `$PACRAT_*`
+    /// reference, a `{treee}` typo, braces that belong to jq or awk — and the
+    /// subject arguments to `argv` are ignored entirely.
+    #[test]
+    fn a_string_cmd_reaches_sh_verbatim() {
+        let line = "mytool --tree \"$PACRAT_TREE\" | awk '{print}' | jq '{package: .name}'";
+        let g = Grader {
+            cmd: Cmd::Line(line.into()),
+            ..grader()
+        };
+        assert_eq!(g.validate(), Ok(()));
+        let argv = g.argv("mdcat", "/store/aur/packages/mdcat", "3f9c21ab");
+        assert_eq!(argv, ["sh", "-c", line]);
+
+        // Even text that reads like an unknown placeholder stays literal.
+        let g = Grader {
+            cmd: Cmd::Line("echo {treee} {sha}".into()),
+            ..grader()
+        };
+        assert_eq!(g.validate(), Ok(()));
+        assert_eq!(g.argv("a", "/b", "3f9c21ab")[2], "echo {treee} {sha}");
+
+        // And even the *known* placeholders, fed straight to `argv` past the
+        // validator that refuses them: the no-substitution property is the
+        // runner's own, not something that rests on validation alone.
+        let g = Grader {
+            cmd: Cmd::Line("echo '{tree} {package} {commit}'".into()),
+            ..grader()
+        };
+        assert_eq!(
+            g.argv("a", "/b", "3f9c21ab")[2],
+            "echo '{tree} {package} {commit}'"
+        );
+    }
+
+    /// A `{package}`-style placeholder in a string cmd is the old ceremony
+    /// carried into the new form: it would reach the shell as a literal
+    /// brace, so it is a config error that names the env convention instead.
+    #[test]
+    fn a_placeholder_in_a_string_cmd_is_a_config_error() {
+        for line in [
+            "grade --package {package}",
+            "grade --tree {tree}",
+            "grade --commit {commit}",
+        ] {
+            let g = Grader {
+                cmd: Cmd::Line(line.into()),
+                ..grader()
+            };
+            let err = g
+                .validate()
+                .unwrap_err_or_else(|| panic!("{line:?} should be rejected"));
+            assert!(
+                err.contains("PACRAT_PACKAGE")
+                    && err.contains("PACRAT_TREE")
+                    && err.contains("PACRAT_COMMIT"),
+                "the error must name the env convention: {err}"
+            );
+        }
+        // And the same rejection through the load path.
+        let err =
+            Config::from_toml("[[graders]]\nname = \"x\"\ncmd = \"grade --package {package}\"\n")
+                .unwrap_err();
+        assert!(err.contains("PACRAT_PACKAGE"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_empty_string_cmd_is_rejected() {
+        for line in ["", "   "] {
+            let g = Grader {
+                cmd: Cmd::Line(line.into()),
+                ..grader()
+            };
+            assert!(g.validate().is_err(), "cmd {line:?} should be rejected");
+        }
+    }
+
+    /// `config list` and the TUI show a cmd as one line; the string form is
+    /// shown as itself, because it is the invocation.
+    #[test]
+    fn a_cmd_displays_as_one_line() {
+        assert_eq!(
+            Cmd::Argv(vec!["yf".into(), "--tree".into(), "{tree}".into()]).to_string(),
+            "yf --tree {tree}"
+        );
+        assert_eq!(Cmd::Line("yf | jq '.x'".into()).to_string(), "yf | jq '.x'");
     }
 
     #[test]
@@ -818,7 +1018,11 @@ cmd = ["b"]
     #[test]
     fn a_hostile_value_stays_one_argument() {
         let g = Grader {
-            cmd: vec!["yf".into(), "{package}".into(), "--tree={tree}".into()],
+            cmd: Cmd::Argv(vec![
+                "yf".into(),
+                "{package}".into(),
+                "--tree={tree}".into(),
+            ]),
             ..grader()
         };
         let hostile = "a; rm -rf ~ #'\"$(id)`id`\n";
@@ -837,7 +1041,7 @@ cmd = ["b"]
     #[test]
     fn a_substituted_value_is_not_substituted_again() {
         let g = Grader {
-            cmd: vec!["yf".into(), "{tree}".into(), "{package}".into()],
+            cmd: Cmd::Argv(vec!["yf".into(), "{tree}".into(), "{package}".into()]),
             ..grader()
         };
         let argv = g.argv("{tree}", "/store/{commit}/x", "3f9c21ab");
@@ -848,7 +1052,7 @@ cmd = ["b"]
     #[test]
     fn an_unvalidated_template_keeps_its_unknown_placeholders_literal() {
         let g = Grader {
-            cmd: vec!["yf".into(), "{sha}-{package}".into(), "{tree".into()],
+            cmd: Cmd::Argv(vec!["yf".into(), "{sha}-{package}".into(), "{tree".into()]),
             ..grader()
         };
         let argv = g.argv("mdcat", "/t", "3f9c21ab");

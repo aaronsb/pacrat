@@ -30,7 +30,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pacrat_core::config::{Config, Grader, Mode, Repo, Ui};
+use pacrat_core::config::{Cmd, Config, Grader, Mode, Repo, Ui};
 use pacrat_core::grading::Scale;
 
 use crate::ctx::Ctx;
@@ -284,7 +284,7 @@ fn register(config: &mut Config, adapter: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", adapter.display()))?;
     config.graders.push(Grader {
         name: "yay-friend".into(),
-        cmd: vec![
+        cmd: Cmd::Argv(vec![
             adapter.to_string_lossy().into_owned(),
             "--package".into(),
             "{package}".into(),
@@ -292,7 +292,7 @@ fn register(config: &mut Config, adapter: &Path) -> Result<(), String> {
             "{tree}".into(),
             "--commit".into(),
             "{commit}".into(),
-        ],
+        ]),
         timeout_s: 600,
         scale: Some(Scale { min: 0, max: 4 }),
     });
