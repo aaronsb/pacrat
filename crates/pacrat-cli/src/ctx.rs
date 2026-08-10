@@ -67,7 +67,17 @@ impl Ctx {
             Ok(text) => {
                 Config::from_toml(&text).map_err(|e| format!("{}: {e}", config_path.display()))?
             }
-            Err(_) => Config::default(),
+            Err(_) => {
+                // Root mode runs on the strength of the operator's config,
+                // so its absence is worth one plain line — defaults may be
+                // exactly right, but silently assuming so is how a repo
+                // gets assembled under the wrong name.
+                println!(
+                    "no config at {} — using pacrat's defaults",
+                    config_path.display()
+                );
+                Config::default()
+            }
         };
         let store = env::var_os("DOTFILES_DIR")
             .map(PathBuf::from)
@@ -312,12 +322,21 @@ pub fn state_dir() -> Result<PathBuf, String> {
 fn home_of(user: &str) -> Result<PathBuf, String> {
     let passwd = fs::read_to_string("/etc/passwd").map_err(|e| format!("/etc/passwd: {e}"))?;
     passwd_home(&passwd, user).ok_or_else(|| {
-        format!("{user} has no /etc/passwd entry with a home directory — cannot find their config")
+        // The name came from SUDO_USER — environment, not pacrat's data —
+        // so the report de-escapes it like every other printed name.
+        format!(
+            "{} has no /etc/passwd entry with an absolute home directory — \
+             cannot find their config",
+            visible_line(user).0
+        )
     })
 }
 
-/// The parse itself, pure: `name:pw:uid:gid:gecos:home:shell`, first match
-/// wins, an empty home field is no answer.
+/// The parse itself, pure: `name:pw:uid:gid:gecos:home:shell`. The first
+/// entry for the name that carries a usable home wins — an entry whose home
+/// field is missing, empty, or relative is passed over, because a relative
+/// home would resolve against root's cwd and decide which config drives
+/// what lands in /etc/pacman.conf.
 fn passwd_home(passwd: &str, user: &str) -> Option<PathBuf> {
     passwd.lines().find_map(|line| {
         let mut fields = line.split(':');
@@ -326,8 +345,9 @@ fn passwd_home(passwd: &str, user: &str) -> Option<PathBuf> {
         }
         fields
             .nth(4)
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
+            .map(Path::new)
+            .filter(|home| home.is_absolute())
+            .map(Path::to_path_buf)
     })
 }
 
@@ -464,15 +484,17 @@ mod tests {
     }
 
     /// The passwd parse root mode leans on: exact-name match, the sixth
-    /// field, first entry wins — and no answer beats a wrong answer for a
-    /// name that is missing, malformed, or a prefix of the one asked for.
+    /// field, the first entry with a *usable* home wins — and no answer
+    /// beats a wrong answer for a name that is missing, malformed, or a
+    /// prefix of the one asked for.
     #[test]
     fn passwd_home_reads_the_sixth_field_of_the_exact_user() {
         let passwd = "root:x:0:0::/root:/bin/bash\n\
                       aaron:x:1000:1000:Aaron:/home/aaron:/bin/zsh\n\
                       aaronb:x:1001:1001::/home/aaronb:/bin/sh\n\
                       broken:x:1002\n\
-                      homeless:x:1003:1003:::/bin/sh\n";
+                      homeless:x:1003:1003:::/bin/sh\n\
+                      wanderer:x:1004:1004::home/wanderer:/bin/sh\n";
         assert_eq!(
             passwd_home(passwd, "aaron"),
             Some(PathBuf::from("/home/aaron"))
@@ -486,7 +508,32 @@ mod tests {
         assert_eq!(passwd_home(passwd, "nobody-here"), None);
         assert_eq!(passwd_home(passwd, "broken"), None, "too few fields");
         assert_eq!(passwd_home(passwd, "homeless"), None, "empty home field");
+        assert_eq!(
+            passwd_home(passwd, "wanderer"),
+            None,
+            "a relative home would resolve against root's cwd"
+        );
         assert_eq!(passwd_home("", "aaron"), None);
+    }
+
+    /// Duplicate names: an unusable first entry is passed over, a usable
+    /// first entry answers — the file's own resolution order, with the
+    /// usability filter applied per entry rather than ending the search.
+    #[test]
+    fn passwd_home_duplicate_names_first_usable_entry_wins() {
+        let skipped_first = "twin:x:1000:1000:::/bin/sh\n\
+                             twin:x:1001:1001::/home/twin:/bin/sh\n";
+        assert_eq!(
+            passwd_home(skipped_first, "twin"),
+            Some(PathBuf::from("/home/twin")),
+            "an entry with no home must not end the search for the name"
+        );
+        let both_usable = "twin:x:1000:1000::/home/first:/bin/sh\n\
+                           twin:x:1001:1001::/home/second:/bin/sh\n";
+        assert_eq!(
+            passwd_home(both_usable, "twin"),
+            Some(PathBuf::from("/home/first"))
+        );
     }
 
     /// A host name is printed into commands and into a padded column, so it

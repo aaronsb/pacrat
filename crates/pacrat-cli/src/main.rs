@@ -234,6 +234,10 @@ enum Command {
     /// with the interview left to your own user. Headless, the interview
     /// is skipped unless the answer flags are given, and the commands are
     /// printed for you to run.
+    ///
+    /// Exits 0 when nothing was refused, 10 when any confirmed step was
+    /// declined (the walked steps ran fine, you deliberately kept some),
+    /// and 1 when a step or a confirmed command failed.
     Setup {
         /// Accepted for compatibility — the guided flow is the default at
         /// a terminal now, so this changes nothing there. Headless it
