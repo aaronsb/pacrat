@@ -40,9 +40,13 @@ pub struct Cmd {
 }
 
 impl Cmd {
-    /// `sudo <args…>`. The one constructor for elevated commands, so `sudo`
-    /// is spelled into the argv — and therefore into the printed line — by
-    /// exactly one place.
+    /// `sudo <args…>` — the constructor for elevated commands pacrat
+    /// composes itself. Not the only place the word appears: sync's plan
+    /// carries `sudo` in its argv as data, built where the plan is built.
+    /// The invariant that does hold is one exec path — every elevated
+    /// command reaches the terminal through [`Session::run`], printed and
+    /// confirmed, argv as data, no shell. To enumerate what pacrat can run
+    /// as root, grep for `"sudo"`, not for this constructor.
     pub fn sudo(args: &[&str]) -> Self {
         let mut argv = Vec::with_capacity(args.len() + 1);
         argv.push("sudo".to_string());

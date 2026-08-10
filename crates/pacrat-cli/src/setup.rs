@@ -68,9 +68,9 @@ pub fn run(ctx: &Ctx, apply: bool, answers: &Interview) -> Result<(), String> {
     println!(
         "mode    {}",
         if apply {
-            "--apply (user-writable steps run here; root steps still printed)"
+            "--apply (user-owned steps run now; each root-owned step asks before sudo runs it)"
         } else {
-            "print only (nothing is written; add --apply to do the user-owned steps)"
+            "print only (system steps are printed, not run; interview answers are still saved to config.toml)"
         }
     );
     println!();
