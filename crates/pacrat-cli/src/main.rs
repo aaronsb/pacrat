@@ -1,10 +1,15 @@
 use clap::{Parser, Subcommand};
 
 mod add;
+mod aur;
 mod ctx;
+mod custody;
 mod hosts;
+mod info;
 mod live;
 mod out;
+mod pacman;
+mod search;
 mod status;
 
 /// pacrat — store-backed package curation for Arch.
@@ -25,6 +30,8 @@ enum Command {
     Status,
     /// Search official repos and the AUR (with custody state)
     Search { term: String },
+    /// Everything pacrat knows about one package
+    Info { package: String },
     /// Adopt installed packages into the manifest (unmanaged → tracked)
     Add {
         packages: Vec<String>,
@@ -62,6 +69,8 @@ fn main() {
         // Bare `pacrat`: the TUI once it exists; the overview meanwhile.
         None | Some(Command::Status) => status::run(&ctx),
         Some(Command::Hosts) => hosts::run(&ctx),
+        Some(Command::Search { ref term }) => search::run(&ctx, term),
+        Some(Command::Info { ref package }) => info::run(&ctx, package),
         Some(Command::Add {
             ref packages,
             ref host,
