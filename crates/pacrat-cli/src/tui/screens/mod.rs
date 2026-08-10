@@ -5,6 +5,18 @@
 //! the same way: draw a frame, then do the work the frame said was
 //! happening. [`overview`] is the worked example; the rest follow it.
 //!
+//! ## The focus policy
+//!
+//! Focus jumps only to where the reader's next keystrokes must land. A
+//! search puts it on the results; the jobs screen's answers put it on the
+//! queue, which is the list itself. A pane that merely shows an answer —
+//! a command block, a refusal, a recorded override — never steals it: the
+//! reader is mid-walk on the rows, and the arrows must keep walking. The
+//! one exception is the updates screen's review, which focuses the diff,
+//! because a diff is a long read the reader explicitly asked to scroll.
+//! Tab reaches everything else. The focused pane's title renders as an
+//! inverse-video chip, so a jump is always visible when one happens.
+//!
 //! ## What a screen may do
 //!
 //! Read anything; run almost nothing. Every screen here reads live state

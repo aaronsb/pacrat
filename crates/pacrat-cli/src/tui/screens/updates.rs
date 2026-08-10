@@ -493,7 +493,8 @@ impl Updates {
             lines.push(note(chunk));
         }
         self.set(GRADING, lines);
-        self.panes.focus_on(GRADING);
+        // Focus stays where it was: this is an answer to read, and the next
+        // keystroke belongs to the rows (the focus policy in screens/mod.rs).
     }
 
     /// What the reader has looked at, if the cursor is still on it.
@@ -809,7 +810,6 @@ impl Updates {
         if let Some(region) = self.panes.region_mut(DIFF) {
             region.set_title(format!("{package} — the {what} command"));
         }
-        self.panes.focus_on(DIFF);
     }
 
     /// Whether `o` has anything to offer, and what to say if it does not.
@@ -886,7 +886,6 @@ impl Updates {
         if let Some(region) = self.panes.region_mut(GRADING) {
             region.set_title(format!("{package} — override recorded"));
         }
-        self.panes.focus_on(GRADING);
         Ok(format!(
             "override-block recorded for {package} @ {}",
             short_hash(&commit)

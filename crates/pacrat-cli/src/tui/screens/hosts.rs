@@ -608,7 +608,9 @@ impl Hosts {
         if let Some(region) = self.panes.region_mut(DETAIL) {
             region.set_title(what);
         }
-        self.panes.focus_on(DETAIL);
+        // Focus stays on the matrix: an answer is read, and the next
+        // keystroke adjusts the marks or confirms — both live on the rows
+        // (the focus policy in screens/mod.rs).
     }
 
     fn set(&mut self, index: usize, lines: Vec<Line<'static>>) {
