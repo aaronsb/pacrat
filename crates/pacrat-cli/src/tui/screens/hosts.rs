@@ -542,10 +542,12 @@ impl Hosts {
         let changes = match changes {
             Ok(changes) => changes,
             Err(e) => {
-                self.answer(
-                    vec![Line::default(), bad(e.clone())],
-                    "nothing applied".to_string(),
-                );
+                // Wrapped like `refuse_apply` wraps: the writer's refusal
+                // can run long, and a clipped reason is a refusal the
+                // reader cannot act on.
+                let mut lines = vec![Line::default()];
+                lines.extend(super::wrap(&e, 76).into_iter().map(bad));
+                self.answer(lines, "nothing applied".to_string());
                 return Err(e);
             }
         };

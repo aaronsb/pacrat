@@ -10,10 +10,11 @@
 
 use std::path::PathBuf;
 
-use pacrat_core::pkg::Source;
+use pacrat_core::pkg::{valid_name, Source};
 
 use crate::ctx::Ctx;
 use crate::live;
+use crate::out::visible_line;
 
 /// One tracked list edited: which source, which names, and the counts a
 /// reader checks the edit by. Shared with `untrack`, whose changes are the
@@ -60,6 +61,7 @@ pub fn adopt(ctx: &Ctx, host: &str, packages: &[String]) -> Result<Vec<Change>, 
     if packages.is_empty() {
         return Err("nothing to add".into());
     }
+    check_names(packages)?;
 
     // Where is each package actually installed? Source is detected, not
     // guessed: a package must be present in exactly one live set.
@@ -125,4 +127,39 @@ pub fn adopt(ctx: &Ctx, host: &str, packages: &[String]) -> Result<Vec<Change>, 
         });
     }
     Ok(changes)
+}
+
+/// The grammar, checked at the door: these names are compared against
+/// lists and printed back in refusals, and the report of a hostile name
+/// must not itself be hostile. Shared with `untrack` — the two directions
+/// of the ladder guard the same door.
+pub fn check_names(packages: &[String]) -> Result<(), String> {
+    if let Some(bad) = packages.iter().find(|p| !valid_name(p)) {
+        let (shown, _) = visible_line(bad);
+        return Err(format!(
+            "{shown:?} is not a package name — expected letters, digits and \
+             @._+- (no leading hyphen or dot)"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hostile_name_is_refused_and_neutered_on_the_way_out() {
+        let err = check_names(&["fd\x1b[31mred".to_string()]).unwrap_err();
+        assert!(err.contains("is not a package name"), "{err}");
+        assert!(!err.contains('\x1b'), "raw escape survived: {err:?}");
+        assert!(err.contains('␛'), "{err}");
+    }
+
+    #[test]
+    fn ordinary_names_pass_the_door() {
+        let names = ["fd", "ripgrep", "lib32-glibc", "python-pip"];
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        assert_eq!(check_names(&names), Ok(()));
+    }
 }

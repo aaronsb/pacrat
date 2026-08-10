@@ -14,11 +14,10 @@
 //! typed. Both surfaces edit the file through [`Ctx::save_tracked`] — one
 //! writer, so the two directions of the ladder cannot disagree about it.
 
-use pacrat_core::pkg::{valid_name, Source};
+use pacrat_core::pkg::Source;
 
 use crate::add::Change;
 use crate::ctx::Ctx;
-use crate::out::visible_line;
 
 pub fn run(ctx: &Ctx, packages: &[String]) -> Result<(), String> {
     let changes = untrack(ctx, &ctx.host, packages)?;
@@ -48,16 +47,9 @@ pub fn untrack(ctx: &Ctx, host: &str, packages: &[String]) -> Result<Vec<Change>
     if packages.is_empty() {
         return Err("nothing to untrack".into());
     }
-    // The grammar, checked at the door as everywhere else: these names are
-    // compared against lists and printed back in the report, and the report
-    // of a hostile name must not itself be hostile.
-    if let Some(bad) = packages.iter().find(|p| !valid_name(p)) {
-        let (shown, _) = visible_line(bad);
-        return Err(format!(
-            "{shown:?} is not a package name — expected letters, digits and \
-             @._+- (no leading hyphen or dot)"
-        ));
-    }
+    // The same grammar door `add` checks — shared, so the two directions
+    // of the ladder cannot disagree about what a name is.
+    crate::add::check_names(packages)?;
 
     let lists: Vec<(Source, Vec<String>)> = Source::ALL
         .iter()

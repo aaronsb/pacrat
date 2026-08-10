@@ -482,11 +482,11 @@ enum Overlay {
 /// A manifest apply waiting for its answer.
 ///
 /// Its own overlay rather than a [`Prompt`], because the two collect
-/// different things: a prompt collects text, this collects a decision. It
-/// names every package, not a preview — ADR-002's guard for an
-/// *accumulated* selection is a confirm the reader can check against what
-/// they think they marked, and a truncated list is exactly the check
-/// removed.
+/// different things: a prompt collects text, this collects a decision.
+/// It names every package the screen has room for and owns up to the
+/// rest ("… and N more") — ADR-002's guard for an *accumulated*
+/// selection is a confirm the reader can check against what they think
+/// they marked, and a silent clip is exactly the check removed.
 struct Confirm {
     direction: Reconcile,
     names: Vec<String>,
@@ -1077,9 +1077,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt) {
 ///
 /// The guard the amendment keeps for a selection that was *accumulated*
 /// rather than typed: before anything is written, the reader sees the
-/// count and the complete list, and can check it against what they think
-/// they marked. Both applies are manifest-only edits — the sentence under
-/// the question says what is and is not about to happen to the machine.
+/// count, the list as far as the screen holds it, and a last line owning
+/// up to whatever did not fit. Both applies are manifest-only edits — the
+/// sentence under the question says what is and is not about to happen to
+/// the machine.
 fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
     let n = confirm.names.len();
     let plural = if n == 1 { "" } else { "s" };
@@ -1107,17 +1108,27 @@ fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
     lines.push(Line::default());
     // Every name, neutered on the way to the screen: these came out of
     // tracked lists and pacman queries, not out of pacrat.
-    let list = confirm
-        .names
-        .iter()
-        .map(|name| out::visible_line(name).0)
-        .collect::<Vec<_>>()
-        .join(", ");
+    //
+    // The overlay is clamped to the frame, so past a screenful the list
+    // would clip silently — and a silent clip is exactly the check this
+    // overlay exists to be. The last line owns up instead: the reader sees
+    // how many names they are answering for without reading them.
+    let chrome = lines.len() + 4;
+    let budget = (area.height as usize).saturating_sub(chrome).max(3);
+    let (shown, hidden) = name_lines(&confirm.names, 70, budget);
     lines.extend(
-        screens::wrap(&list, 70)
+        shown
             .into_iter()
             .map(|chunk| Line::from(vec![theme::plain("  "), theme::tinted(theme::INFO, chunk)])),
     );
+    if hidden > 0 {
+        lines.push(Line::from(vec![
+            theme::plain("  "),
+            theme::dim(format!(
+                "… and {hidden} more — the count above is the whole selection"
+            )),
+        ]));
+    }
     lines.push(Line::default());
 
     let rect = centred(area, 76, lines.len() as u16 + 2);
@@ -1132,6 +1143,30 @@ fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
         Line::from(vec![theme::dim("─ enter or y applies · esc cancels ")]),
         lines,
     );
+}
+
+/// The marked names as comma-joined lines: at most `budget` lines of at
+/// most `width` characters, each name neutered, and the count of names
+/// that did not fit. Pure, so the no-silent-clip rule is a test rather
+/// than a screenshot.
+fn name_lines(names: &[String], width: usize, budget: usize) -> (Vec<String>, usize) {
+    let mut lines: Vec<String> = Vec::new();
+    for (shown, name) in names.iter().enumerate() {
+        let safe = out::visible_line(name).0;
+        match lines.last_mut() {
+            Some(last) if last.chars().count() + 2 + safe.chars().count() <= width => {
+                last.push_str(", ");
+                last.push_str(&safe);
+            }
+            _ => {
+                if lines.len() == budget {
+                    return (lines, names.len() - shown);
+                }
+                lines.push(safe);
+            }
+        }
+    }
+    (lines, 0)
 }
 
 /// The hold-to-confirm bar (ADR-001 decision 2).
@@ -1196,6 +1231,38 @@ fn render_childlock(frame: &mut Frame, area: Rect, hold: &Hold) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_list_that_fits_shows_every_name_and_hides_none() {
+        let (lines, hidden) = name_lines(&names(&["fd", "ripgrep", "bat"]), 70, 5);
+        assert_eq!(lines, ["fd, ripgrep, bat"]);
+        assert_eq!(hidden, 0);
+    }
+
+    /// The no-silent-clip rule: past the budget, the hidden count is the
+    /// names not shown — every marked package is either on screen or in
+    /// that number.
+    #[test]
+    fn an_overflowing_list_owns_up_to_exactly_what_it_hid() {
+        let many: Vec<String> = (0..40).map(|i| format!("package-{i:02}")).collect();
+        let (lines, hidden) = name_lines(&many, 24, 3);
+        assert_eq!(lines.len(), 3);
+        let shown: usize = lines.iter().map(|l| l.matches("package-").count()).sum();
+        assert_eq!(shown + hidden, many.len());
+        assert!(hidden > 0);
+        assert!(lines.iter().all(|l| l.chars().count() <= 24));
+    }
+
+    #[test]
+    fn a_hostile_name_is_neutered_before_the_overlay_draws_it() {
+        let (lines, _) = name_lines(&names(&["fd\x1b[31mred"]), 70, 5);
+        assert!(!lines[0].contains('\x1b'), "{:?}", lines[0]);
+        assert!(lines[0].contains('␛'));
+    }
 
     /// The number keys, the tab titles and the screen list are three views
     /// of one set; a tab that lost its digit would be unreachable.
