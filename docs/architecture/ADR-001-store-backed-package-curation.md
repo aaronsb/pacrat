@@ -1,6 +1,8 @@
 # ADR-001: pacrat — store-backed package curation with graded updates
 
-**Status:** Draft
+**Status:** Accepted (2026-08-10 — the custody ladder, serving model, guard,
+grading contract, and review flow are implemented and adversarially reviewed;
+the once-open questions are decided below)
 **Date:** 2026-08-09
 **Design mockup:** `docs/design/mockup-rev3.html` (screen-by-screen TUI mockup; treat it as this ADR's appendix)
 
@@ -239,15 +241,61 @@ deliberately.
 - Migration is incremental: adopt/vendor packages as their updates come due,
   not big-bang.
 
-## Open questions
+## Decisions on the once-open questions
 
-1. **Bulk adopt ergonomics** — first-run "adopt everything, then prune" mode?
-2. **Block override** — CLI-only `--override-block --reason` recorded in
-   sources.toml, or no override at all?
-3. **Jobs runtime** — TUI-process-only, or a user service owning the queue?
-4. **Sync transport** — remote sync over ssh, or each host syncs itself?
-5. **Multi-grader aggregation** — *settled as worst-wins plus the quorum
-   rule; see the grading contract above.* Still open: whether manual should
-   additionally **outrank** tools rather than merely counting among them —
-   today a human's grade 0 does not override a tool's grade 4, it only joins
-   the worst-wins pool. Weights and vetoes remain unbuilt.
+Settled with Aaron, 2026-08-10, after the first three implementation waves —
+each answer below was made against working code, not speculation.
+
+1. **Bulk adopt: `pacrat add --all-installed`.** An explicit first-run flag
+   that adopts everything currently installed into this host's lists, to be
+   pruned at leisure. Deliberate, one command, reversible by editing the
+   lists. (The TUI's multi-select adopt remains for batches thereafter.)
+
+2. **Block override exists, in both surfaces, behind friction that cannot be
+   piped.** The CLI form is `--override-block --reason "…"` — its friction
+   is authoring the justification. The TUI form requires *holding* a key
+   until a progress bar fills (a single keypress does nothing, so no script
+   or paste can trip it) and then a typed justification. Both record the
+   override in the decision ledger (below). The TUI affordance appears only
+   after the friction, never as a plain keybinding.
+
+3. **Jobs run in-process only.** Background gradings and builds live only as
+   long as a pacrat process does; headless warmth is `pacrat update` on a
+   systemd timer. No daemon, no IPC surface. Revisit only if the TUI feels
+   starved.
+
+4. **Sync is self-only.** Each host runs pacrat for itself; the hosts matrix
+   is read-only awareness of the others; the store syncs via git. pacrat
+   gains no remote-execution surface.
+
+5. **Aggregation stays worst-wins with the quorum rule; manual does not
+   outrank tools.** A human grading is one voice — it can give quorum and
+   raise, never suppress a tool's BLOCK. Suppressing a BLOCK is exactly what
+   the override path is for, and two doors would blur the audit trail.
+   Weights and vetoes remain unbuilt.
+
+6. **Served mirrors require signatures — with a recorded, per-package trust
+   escape.** `SigLevel = Required DatabaseOptional` stands for any repo with
+   `repo.server` set; package signing (makepkg --sign + key distribution) is
+   phase-2 work that gates fleet serving. A user may still choose to trust a
+   specific unsigned package, but that choice goes through the same friction
+   mechanism as a block override and is recorded in the decision ledger.
+   Local-only repos keep `Optional TrustAll` — nothing crosses a network.
+
+7. **Guard marker semantics confirmed as implemented:** pid+timestamp,
+   honored only while the pid is alive and under an hour, every use and
+   every stale-ignore announced, forgeable by design — a rail against
+   mistakes, not access control. Surfacing marker state in `pacrat status`
+   arrives with the TUI work.
+
+### The decision ledger
+
+Decisions 2 and 6 share a shape and therefore a mechanism: a human accepting
+a named risk — overriding a BLOCK, trusting an unsigned package — passes
+through deliberate friction and leaves a record: what was accepted, for
+which package and commit/artifact, when, and the stated reason. The record
+lives with the store (synced, reviewable, greppable), because a risk one
+host accepted is a fact the fleet should be able to read. The exact file
+shape lands with the first implementer (the one-shot update loop's override
+path); what is decided here is that both flows write to the same ledger
+rather than growing parallel bookkeeping.
