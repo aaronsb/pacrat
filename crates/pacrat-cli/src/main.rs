@@ -9,6 +9,7 @@ mod config;
 mod ctx;
 mod custody;
 mod decisions;
+mod elevate;
 mod fstree;
 mod gate;
 mod git;

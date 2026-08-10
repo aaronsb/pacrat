@@ -1,11 +1,23 @@
-//! `pacrat setup` — put this host on the serving model: the pacman.conf
-//! section for the local repo, the repo directory and its (empty) database,
-//! and the PreTransaction guard that aborts installs going around curation.
+//! `pacrat setup` — put this host on the serving model: the first-run
+//! interview that writes the config, then the pacman.conf section for the
+//! local repo, the repo directory and its (empty) database, and the
+//! PreTransaction guard that aborts installs going around curation. It is
+//! the only verb that can open the setup gate (`gate.rs`), which is why it
+//! and `about` are the two commands a fresh machine can run.
 //!
-//! pacrat never elevates. Everything root-owned is *printed* for the user to
-//! run; `--apply` performs only the steps this user can already do without
-//! sudo, and stages the root-owned files somewhere user-writable so the
-//! printed `sudo install` lines work verbatim.
+//! The interview comes first (ADR-003): UI preference, update mode, grader
+//! registration — asked at a terminal with the current values as defaults,
+//! answered by flags for scripts, skipped with a note when there is neither.
+//! It writes `~/.config/pacrat/config.toml` through `config::save`, so a
+//! full setup is one command on one terminal.
+//!
+//! pacrat never elevates *unasked* (ADR-003, amending ADR-001). Everything
+//! root-owned is printed; headless, `--apply` performs only the steps this
+//! user can already do without sudo, and stages the root-owned files
+//! somewhere user-writable so the printed `sudo install` lines work
+//! verbatim. At a terminal, `--apply` walks those same root-owned steps
+//! through `elevate::Session` — argv shown, y/n asked, sudo authenticating
+//! on the terminal itself — and reports anything declined at the end.
 //!
 //! Repo values are substituted into pacman.conf and into a script that runs
 //! as root out of a pacman hook. They are safe to substitute because
@@ -82,9 +94,34 @@ pub fn run(ctx: &Ctx, apply: bool, answers: &Interview) -> Result<(), String> {
         println!();
     }
 
-    step_pacman_conf(repo, &staged, &st, apply);
-    step_repo(&repo_path, &db, &st, apply)?;
-    step_guard(repo, &staged, &st, apply);
+    // On a terminal, `--apply` walks the root-owned steps through the
+    // confirmed sudo flow (ADR-003) after the user-doable work; headless,
+    // `flow` is `None` and every step prints its sudo lines exactly as
+    // before, so a script sees what it always saw.
+    let mut flow = if apply {
+        crate::elevate::Session::open()
+    } else {
+        None
+    };
+
+    step_pacman_conf(repo, &staged, &st, apply, &mut flow);
+    step_repo(&repo_path, &db, &st, apply, &mut flow)?;
+    step_guard(repo, &staged, &st, apply, &mut flow);
+
+    if let Some(flow) = &flow {
+        flow.report();
+        if flow.any_failed() {
+            return Err(
+                "a confirmed command failed — see above; re-run `pacrat setup --apply` \
+                        once it is sorted"
+                    .into(),
+            );
+        }
+        if !st.complete() && state(repo).complete() {
+            println!();
+            println!("done      this host is on the serving model — the setup gate is open.");
+        }
+    }
 
     Ok(())
 }
@@ -382,7 +419,13 @@ fn yn(present: bool) -> &'static str {
 
 // ---------------------------------------------------------------- step 1
 
-fn step_pacman_conf(repo: &Repo, staged: &Path, st: &State, apply: bool) {
+fn step_pacman_conf(
+    repo: &Repo,
+    staged: &Path,
+    st: &State,
+    apply: bool,
+    flow: &mut Option<crate::elevate::Session>,
+) {
     println!("1. pacman.conf section — teach pacman about the repo");
     println!();
     if st.conf_section {
@@ -395,13 +438,26 @@ fn step_pacman_conf(repo: &Repo, staged: &Path, st: &State, apply: bool) {
     }
     block(&pacman_conf_section(repo));
     println!();
-    println!("   append it to {PACMAN_CONF} (root):");
-    println!(
-        "     sudo tee -a {PACMAN_CONF} <{} >/dev/null",
-        sh(&staged.join("pacman.conf.section").to_string_lossy())
-    );
-    if !apply {
-        println!("     (`pacrat setup --apply` writes that staged file first)");
+    if let Some(flow) = flow {
+        // The confirmed flow (ADR-003): the staged section, appended by a
+        // sudo tee whose stdin is the file just shown. tee echoes what it
+        // appended — the receipt of exactly what landed in pacman.conf.
+        let ran = flow.run(
+            crate::elevate::Cmd::sudo(&["tee", "-a", PACMAN_CONF])
+                .reading(staged.join("pacman.conf.section")),
+        ) == crate::elevate::Verdict::Ran;
+        if !ran {
+            println!("   still to do: the command above appends the staged section.");
+        }
+    } else {
+        println!("   append it to {PACMAN_CONF} (root):");
+        println!(
+            "     sudo tee -a {PACMAN_CONF} <{} >/dev/null",
+            sh(&staged.join("pacman.conf.section").to_string_lossy())
+        );
+        if !apply {
+            println!("     (`pacrat setup --apply` writes that staged file first)");
+        }
     }
     println!("   appending puts the section last, so official repos win any name");
     println!("   collision — the safe default. Move it above [core] by hand if you");
@@ -447,7 +503,13 @@ fn pacman_conf_section(repo: &Repo) -> String {
 
 // ---------------------------------------------------------------- step 2
 
-fn step_repo(repo_path: &Path, db: &Path, st: &State, apply: bool) -> Result<(), String> {
+fn step_repo(
+    repo_path: &Path,
+    db: &Path,
+    st: &State,
+    apply: bool,
+    flow: &mut Option<crate::elevate::Session>,
+) -> Result<(), String> {
     let user = env::var("USER").unwrap_or_else(|_| "$USER".into());
     println!("2. repo directory and empty database");
     println!();
@@ -477,13 +539,31 @@ fn step_repo(repo_path: &Path, db: &Path, st: &State, apply: bool) -> Result<(),
     match ensure_dir(repo_path) {
         Ok(()) => {}
         Err(Denied) => {
-            println!(
-                "   {} needs root — run the two lines above, then",
-                repo_path.display()
-            );
-            println!("   re-run `pacrat setup --apply`.");
-            println!();
-            return Ok(());
+            // A root-owned location. On a terminal the confirmed flow makes
+            // the directory (owned by this user, so repo-add stays a plain
+            // unprivileged call below); otherwise the two printed lines are
+            // the answer, as they always were.
+            let recovered = match flow {
+                Some(flow) => {
+                    flow.run(crate::elevate::Cmd::sudo(&[
+                        "install",
+                        "-d",
+                        "-o",
+                        &user,
+                        &repo_path.to_string_lossy(),
+                    ])) == crate::elevate::Verdict::Ran
+                }
+                None => false,
+            };
+            if !recovered {
+                println!(
+                    "   {} needs root — run the two lines above, then",
+                    repo_path.display()
+                );
+                println!("   re-run `pacrat setup --apply`.");
+                println!();
+                return Ok(());
+            }
         }
         Err(Failed(e)) => return Err(e),
     }
@@ -547,7 +627,13 @@ fn ensure_dir(dir: &Path) -> Result<(), DirErr> {
 
 // ---------------------------------------------------------------- step 3
 
-fn step_guard(repo: &Repo, staged: &Path, st: &State, apply: bool) {
+fn step_guard(
+    repo: &Repo,
+    staged: &Path,
+    st: &State,
+    apply: bool,
+    flow: &mut Option<crate::elevate::Session>,
+) {
     println!("3. guard hook — abort installs that went around curation");
     println!();
     if st.hook && st.script {
@@ -564,17 +650,36 @@ fn step_guard(repo: &Repo, staged: &Path, st: &State, apply: bool) {
     println!("   {SCRIPT_DEST}");
     block(&guard_script(repo));
     println!();
-    println!("   install both (root):");
-    println!(
-        "     sudo install -Dm755 {} {SCRIPT_DEST}",
-        sh(&staged.join("pacrat-guard.sh").to_string_lossy())
-    );
-    println!(
-        "     sudo install -Dm644 {} {HOOK_DEST}",
-        sh(&staged.join("pacrat-guard.hook").to_string_lossy())
-    );
-    if !apply {
-        println!("     (`pacrat setup --apply` writes those staged files first)");
+    if let Some(flow) = flow {
+        // Script before hook, deliberately: a hook whose Exec target is not
+        // there yet would fail every transaction in the window between the
+        // two confirms.
+        println!("   install both (root, one confirm each):");
+        flow.run(crate::elevate::Cmd::sudo(&[
+            "install",
+            "-Dm755",
+            &staged.join("pacrat-guard.sh").to_string_lossy(),
+            SCRIPT_DEST,
+        ]));
+        flow.run(crate::elevate::Cmd::sudo(&[
+            "install",
+            "-Dm644",
+            &staged.join("pacrat-guard.hook").to_string_lossy(),
+            HOOK_DEST,
+        ]));
+    } else {
+        println!("   install both (root):");
+        println!(
+            "     sudo install -Dm755 {} {SCRIPT_DEST}",
+            sh(&staged.join("pacrat-guard.sh").to_string_lossy())
+        );
+        println!(
+            "     sudo install -Dm644 {} {HOOK_DEST}",
+            sh(&staged.join("pacrat-guard.hook").to_string_lossy())
+        );
+        if !apply {
+            println!("     (`pacrat setup --apply` writes those staged files first)");
+        }
     }
     println!();
     println!("   the guard stands aside for pacrat's own transactions via a marker");
