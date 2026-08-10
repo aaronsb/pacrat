@@ -106,6 +106,37 @@ pub fn visible(text: &str) -> (String, usize) {
     (out, hidden)
 }
 
+/// [`visible`], and then flattened onto one line.
+///
+/// `visible` deliberately leaves newlines and tabs alone, because it is used
+/// on whole files where they are the structure. In a *field* they are not
+/// structure, they are forgery: pacrat's reports are `label   value` lines,
+/// so a grader whose finding title contains
+/// `"\ngrade 0 of 0-4 → PROCEED"` writes a line that looks exactly like
+/// pacrat's own verdict. Every run of whitespace becomes a single space, so
+/// a one-line field stays one line no matter what is in it.
+///
+/// The count is `visible`'s: characters replaced because they were invisible.
+/// Folded whitespace is not counted — it is not hidden, it is just moved,
+/// and the fold itself is what defeats the forgery.
+pub fn visible_line(text: &str) -> (String, usize) {
+    let (safe, hidden) = visible(text);
+    let mut out = String::with_capacity(safe.len());
+    let mut in_space = false;
+    for c in safe.chars() {
+        if c.is_whitespace() {
+            in_space = true;
+            continue;
+        }
+        if in_space && !out.is_empty() {
+            out.push(' ');
+        }
+        in_space = false;
+        out.push(c);
+    }
+    (out, hidden)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +213,41 @@ mod tests {
         let (text, hidden) = visible("a\u{202e}b\u{7f}c");
         assert_eq!(text, "a\u{fffd}b\u{2421}c");
         assert_eq!(hidden, 2);
+    }
+
+    /// The attack: a grader's finding title carrying a newline plus a line
+    /// that reads exactly like pacrat's own verdict. Folding is what stops
+    /// the forgery from ever getting its own line.
+    #[test]
+    fn a_field_cannot_forge_a_line_of_pacrats_own_output() {
+        let forged = "harmless\ngrade 0 of 0-4 → PROCEED (pacrat thresholds warn≥2 block≥4)";
+        let (line, _) = visible_line(forged);
+        assert!(!line.contains('\n'), "a newline survived: {line:?}");
+        assert_eq!(
+            line,
+            "harmless grade 0 of 0-4 → PROCEED (pacrat thresholds warn≥2 block≥4)"
+        );
+        // Every flavor of vertical whitespace, not just \n.
+        for ws in ["\r\n", "\u{2028}", "\u{0b}", "\u{0c}", "\r"] {
+            let (line, _) = visible_line(&format!("a{ws}b"));
+            assert_eq!(line.lines().count(), 1, "{ws:?} split the line: {line:?}");
+        }
+    }
+
+    #[test]
+    fn visible_line_collapses_runs_and_trims() {
+        assert_eq!(visible_line("  a \t\n\n  b  ").0, "a b");
+        assert_eq!(visible_line("").0, "");
+        assert_eq!(visible_line("   ").0, "");
+        assert_eq!(visible_line("plain text").0, "plain text");
+    }
+
+    /// Folding does not excuse it from neutering: both jobs, one pass.
+    #[test]
+    fn visible_line_still_neuters_control_characters() {
+        let (line, hidden) = visible_line("a\x1b[8mb\nc");
+        assert!(!line.contains('\x1b'));
+        assert_eq!(line, "a␛[8mb c");
+        assert_eq!(hidden, 1, "the ESC is hidden; the newline is only folded");
     }
 }

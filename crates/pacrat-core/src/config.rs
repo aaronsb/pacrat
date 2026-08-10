@@ -12,6 +12,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::grading::Scale;
 use crate::Thresholds;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -135,6 +136,15 @@ pub struct Grader {
     pub cmd: Vec<String>,
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
+    /// The scale this grader is expected to answer on.
+    ///
+    /// Optional, and worth setting for anything whose output format could
+    /// change under you. pacrat maps a foreign scale onto its own 0-4, so a
+    /// grader that silently switched from 0-4 to 0-100 would keep producing
+    /// plausible verdicts — every grade would just quietly become four times
+    /// less alarming. Pinning turns that into an UNGRADED with a reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Scale>,
 }
 
 /// Five minutes: an LLM-backed grader reading a PKGBUILD is slow, and a
@@ -160,6 +170,17 @@ impl Grader {
         if self.name.starts_with('.') || self.name.starts_with('-') {
             return Err(format!(
                 "grader name {:?} may not begin with '.' or '-'",
+                self.name
+            ));
+        }
+        // A failure record is `<commit>.<name>.failed.json`. A grader
+        // actually named `x.failed` would write its *gradings* to the path
+        // that holds grader `x`'s *failures* — two different kinds of file
+        // at one name, which the reader cannot tell apart.
+        if self.name == "failed" || self.name.ends_with(".failed") {
+            return Err(format!(
+                "grader name {:?} collides with the grade cache's failure records \
+                 (`<commit>.<grader>.failed.json`)",
                 self.name
             ));
         }
@@ -200,7 +221,28 @@ impl Grader {
                 self.name
             ));
         }
+        if let Some(scale) = self.scale {
+            if scale.min >= scale.max {
+                return Err(format!(
+                    "grader {:?} pins scale {}-{}, which spans nothing",
+                    self.name, scale.min, scale.max
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Check a report's declared scale against the pin, if there is one.
+    /// The error is the message a reviewer sees instead of a grade.
+    pub fn check_scale(&self, declared: Scale) -> Result<(), String> {
+        match self.scale {
+            Some(pinned) if pinned != declared => Err(format!(
+                "declared scale {}-{}, pinned {}-{} — a grader whose scale moved is \
+                 not one whose grades can be compared to the old ones",
+                declared.min, declared.max, pinned.min, pinned.max
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// The argv for one subject. Single-pass: a substituted value that
@@ -442,6 +484,7 @@ server = "https://codeberg.org/aaronsb/fleet-repo/releases/latest/download"
                 "{package}".into(),
             ],
             timeout_s: 300,
+            scale: None,
         }
     }
 
@@ -483,6 +526,65 @@ timeout_s = 30
             };
             assert_eq!(g.validate(), Ok(()), "name {name:?} should be accepted");
         }
+    }
+
+    /// A grading and a failure record are different kinds of file; a name
+    /// that makes one look like the other is a config error.
+    #[test]
+    fn grader_names_may_not_collide_with_failure_records() {
+        for name in ["failed", "yay-friend.failed", "x.failed"] {
+            let g = Grader {
+                name: name.into(),
+                ..grader()
+            };
+            let err = g
+                .validate()
+                .unwrap_err_or_else(|| panic!("name {name:?} should be rejected"));
+            assert!(err.contains("failure records"), "unhelpful error: {err}");
+        }
+        // Not a collision: the suffix has to be the whole trailing segment.
+        for name in ["failedx", "x-failed", "failure"] {
+            let g = Grader {
+                name: name.into(),
+                ..grader()
+            };
+            assert_eq!(g.validate(), Ok(()), "name {name:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_pinned_scale_is_read_and_enforced() {
+        let c = Config::from_toml(
+            r#"
+[[graders]]
+name = "yf"
+cmd = ["yf"]
+scale = { min = 0, max = 4 }
+"#,
+        )
+        .unwrap();
+        let g = &c.graders[0];
+        assert_eq!(g.scale, Some(Scale { min: 0, max: 4 }));
+        assert_eq!(g.check_scale(Scale { min: 0, max: 4 }), Ok(()));
+
+        let err = g.check_scale(Scale { min: 0, max: 100 }).unwrap_err();
+        assert!(err.contains("declared scale 0-100"), "unhelpful: {err}");
+        assert!(err.contains("pinned 0-4"), "unhelpful: {err}");
+
+        // No pin means no opinion — the default, and what every grader that
+        // predates this option keeps doing.
+        let unpinned = grader();
+        assert_eq!(unpinned.scale, None);
+        assert_eq!(unpinned.check_scale(Scale { min: 0, max: 100 }), Ok(()));
+    }
+
+    #[test]
+    fn a_pinned_scale_that_spans_nothing_is_rejected() {
+        let g = Grader {
+            scale: Some(Scale { min: 4, max: 4 }),
+            ..grader()
+        };
+        assert!(g.validate().is_err());
     }
 
     #[test]

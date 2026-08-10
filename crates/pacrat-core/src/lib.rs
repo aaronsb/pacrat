@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod grading;
+pub mod hash;
 pub mod pkg;
 pub mod sources;
 
@@ -78,11 +79,9 @@ impl Thresholds {
         }
     }
 
-    /// Aggregate multiple gradings for one candidate: worst grade wins
-    /// (ADR-001 open question 5 — revisit if graders grow weights/vetoes).
-    pub fn verdict_all<I: IntoIterator<Item = u8>>(&self, grades: I) -> Verdict {
-        self.verdict(grades.into_iter().max())
-    }
+    // Aggregating *several* gradings is `verdict_of` in `grading`, next to
+    // the quorum rule it depends on. It is not here because "worst grade
+    // wins" is only half of that rule, and half of it is the unsafe half.
 }
 
 #[cfg(test)]
@@ -106,13 +105,5 @@ mod tests {
         assert_eq!(Verdict::Warn.to_string(), "WARN");
         assert_eq!(Verdict::Block.to_string(), "BLOCK");
         assert_eq!(Verdict::Ungraded.to_string(), "UNGRADED");
-    }
-
-    #[test]
-    fn worst_grade_wins() {
-        let t = Thresholds::default();
-        assert_eq!(t.verdict_all([0, 0, 4]), Verdict::Block);
-        assert_eq!(t.verdict_all([0, 1]), Verdict::Proceed);
-        assert_eq!(t.verdict_all([]), Verdict::Ungraded);
     }
 }

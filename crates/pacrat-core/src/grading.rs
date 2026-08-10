@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::{Thresholds, Verdict};
+
 /// The only contract string this pacrat reads.
 pub const CONTRACT: &str = "pacrat-grade/v1";
 
@@ -57,12 +59,18 @@ impl Scale {
     /// between two pacrat grades takes the worse of the two, because the
     /// cost of a missed warning is not the cost of a spurious one.
     pub fn to_pacrat(self, grade: u8) -> u8 {
+        // A grade this scale cannot express saturates to the *worst* pacrat
+        // grade, not the best. `validate` rejects out-of-scale grades before
+        // they reach here, so this is unreachable through `from_json` — but
+        // it is a public function, and the failure it must not have is the
+        // one where a nonsense number reads as PROCEED.
+        if self.min >= self.max || !self.contains(grade) {
+            return PACRAT_SCALE.max;
+        }
         if self == PACRAT_SCALE {
             return grade;
         }
-        let grade = grade.clamp(self.min, self.max);
-        // `validate` rejects min >= max, so the span is never zero.
-        let span = u32::from(self.max.saturating_sub(self.min)).max(1);
+        let span = u32::from(self.max - self.min);
         let offset = u32::from(grade - self.min);
         (offset * u32::from(PACRAT_SCALE.max)).div_ceil(span) as u8
     }
@@ -117,6 +125,16 @@ impl GradeReport {
     /// there is no constructor that yields an unvalidated report from text.
     pub fn from_json(text: &str) -> Result<Self, String> {
         let report: Self = serde_json::from_str(text).map_err(|e| format!("not a grading: {e}"))?;
+        report.validate()?;
+        Ok(report)
+    }
+
+    /// The same, from already-parsed JSON — the grade cache stores the
+    /// grader's object verbatim inside an envelope, so reading it back is a
+    /// `Value` and not a string.
+    pub fn from_json_value(value: Value) -> Result<Self, String> {
+        let report: Self =
+            serde_json::from_value(value).map_err(|e| format!("not a grading: {e}"))?;
         report.validate()?;
         Ok(report)
     }
@@ -193,6 +211,83 @@ impl GradeReport {
         ranked.sort_by_key(|f| std::cmp::Reverse(f.level));
         ranked.truncate(max);
         ranked
+    }
+}
+
+// ------------------------------------------------------------ aggregation
+
+/// Whether a grading is entitled to answer for this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// From a grader this host currently has configured — it was asked, and
+    /// it replied.
+    Configured,
+    /// A human's own reading. ADR-001 names the human as a grader, and a
+    /// human is always trusted to have answered.
+    Manual,
+    /// A cached grading from a grader that is no longer configured.
+    Retired,
+}
+
+/// One grader's contribution to a subject's verdict. `grade` is `None` when
+/// that grader produced nothing — it failed, or timed out, or lied about the
+/// subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contribution {
+    pub grade: Option<u8>,
+    pub standing: Standing,
+}
+
+impl Contribution {
+    pub fn new(standing: Standing, grade: Option<u8>) -> Self {
+        Self { grade, standing }
+    }
+}
+
+/// Did anybody with standing actually answer?
+///
+/// Only a configured grader or a human can. A cached grading from a retired
+/// grader is *evidence*, not an answer: this host has since decided not to
+/// run that tool, and letting its leftover file stand in for the graders
+/// that were asked would mean deleting a grader from the config makes every
+/// package it ever touched look permanently graded.
+pub fn has_quorum(contributions: &[Contribution]) -> bool {
+    contributions
+        .iter()
+        .any(|c| c.grade.is_some() && matches!(c.standing, Standing::Configured | Standing::Manual))
+}
+
+/// The worst grade on record, from every contribution regardless of
+/// standing. See [`Thresholds::verdict_of`] for why retired gradings count
+/// here but not in [`has_quorum`].
+pub fn worst_grade(contributions: &[Contribution]) -> Option<u8> {
+    contributions.iter().filter_map(|c| c.grade).max()
+}
+
+impl Thresholds {
+    /// Aggregate one subject's gradings into one verdict.
+    ///
+    /// **The quorum rule.** Two questions, deliberately answered by
+    /// different sets of gradings:
+    ///
+    /// 1. *Did anybody answer?* — [`has_quorum`]: a configured grader or a
+    ///    human, and nothing else. Without one, the verdict is `Ungraded`
+    ///    however many stale gradings are lying around, because `Ungraded`
+    ///    is what holds.
+    /// 2. *How bad is it?* — [`worst_grade`] over **every** contribution,
+    ///    including retired ones.
+    ///
+    /// The asymmetry is the whole rule: evidence that is not allowed to
+    /// reassure is still allowed to alarm. A retired grader's cached file
+    /// can make a verdict worse and can never make one exist. (ADR-001 open
+    /// question 5 settles the worst-wins half; the quorum half is the answer
+    /// to "all configured graders failed but there is an old file on disk",
+    /// which is otherwise a hold that silently becomes a go.)
+    pub fn verdict_of(&self, contributions: &[Contribution]) -> Verdict {
+        if !has_quorum(contributions) {
+            return Verdict::Ungraded;
+        }
+        self.verdict(worst_grade(contributions))
     }
 }
 
@@ -423,6 +518,122 @@ mod tests {
     fn roundtrip_through_json() {
         let r = GradeReport::from_json(ADR_EXAMPLE).unwrap();
         assert_eq!(GradeReport::from_json(&r.to_json()).unwrap(), r);
+    }
+
+    // ---- the quorum rule ----
+
+    fn cfg(grade: Option<u8>) -> Contribution {
+        Contribution::new(Standing::Configured, grade)
+    }
+    fn manual(grade: u8) -> Contribution {
+        Contribution::new(Standing::Manual, Some(grade))
+    }
+    fn retired(grade: u8) -> Contribution {
+        Contribution::new(Standing::Retired, Some(grade))
+    }
+
+    #[test]
+    fn worst_grade_wins_among_graders_that_answered() {
+        let t = Thresholds::default();
+        assert_eq!(
+            t.verdict_of(&[cfg(Some(0)), cfg(Some(0)), cfg(Some(4))]),
+            Verdict::Block
+        );
+        assert_eq!(
+            t.verdict_of(&[cfg(Some(0)), cfg(Some(1))]),
+            Verdict::Proceed
+        );
+        assert_eq!(t.verdict_of(&[cfg(Some(0)), cfg(Some(2))]), Verdict::Warn);
+        // A failure alongside a success does not change the grade, only the
+        // story around it (which the CLI prints).
+        assert_eq!(t.verdict_of(&[cfg(None), cfg(Some(1))]), Verdict::Proceed);
+    }
+
+    #[test]
+    fn nothing_at_all_is_ungraded() {
+        let t = Thresholds::default();
+        assert_eq!(t.verdict_of(&[]), Verdict::Ungraded);
+        assert_eq!(t.verdict_of(&[cfg(None)]), Verdict::Ungraded);
+        assert_eq!(t.verdict_of(&[cfg(None), cfg(None)]), Verdict::Ungraded);
+    }
+
+    /// The finding this rule exists for: every configured grader fails, an
+    /// old file from a since-removed grader is still on disk, and the run
+    /// must still hold. Otherwise deleting a grader from the config would
+    /// make its leftovers answer forever.
+    #[test]
+    fn a_retired_grading_cannot_answer_for_the_run() {
+        let t = Thresholds::default();
+        assert_eq!(t.verdict_of(&[cfg(None), retired(0)]), Verdict::Ungraded);
+        assert_eq!(t.verdict_of(&[retired(0)]), Verdict::Ungraded);
+        // Not even several of them.
+        assert_eq!(t.verdict_of(&[retired(0), retired(1)]), Verdict::Ungraded);
+        assert!(!has_quorum(&[cfg(None), retired(0)]));
+    }
+
+    /// The other half of the asymmetry: the same retired grading that could
+    /// not create a verdict can still make one worse.
+    #[test]
+    fn a_retired_grading_can_still_make_things_worse() {
+        let t = Thresholds::default();
+        // Configured says fine, retired says block. Block wins.
+        assert_eq!(t.verdict_of(&[cfg(Some(0)), retired(4)]), Verdict::Block);
+        assert_eq!(t.verdict_of(&[cfg(Some(0)), retired(2)]), Verdict::Warn);
+        // And it never improves one.
+        assert_eq!(t.verdict_of(&[cfg(Some(3)), retired(0)]), Verdict::Warn);
+    }
+
+    /// A human always answers — this is what makes a recorded manual grade
+    /// readable back on a host with no external graders configured.
+    #[test]
+    fn a_manual_grading_answers_on_its_own() {
+        let t = Thresholds::default();
+        assert_eq!(t.verdict_of(&[manual(0)]), Verdict::Proceed);
+        assert_eq!(t.verdict_of(&[manual(4)]), Verdict::Block);
+        assert!(has_quorum(&[manual(1)]));
+        // Even when every configured grader failed around it.
+        assert_eq!(
+            t.verdict_of(&[cfg(None), cfg(None), manual(1)]),
+            Verdict::Proceed
+        );
+        // And a retired grading still outvotes it upward.
+        assert_eq!(t.verdict_of(&[manual(0), retired(4)]), Verdict::Block);
+    }
+
+    #[test]
+    fn worst_grade_reports_across_every_standing() {
+        assert_eq!(worst_grade(&[cfg(Some(1)), retired(3), manual(0)]), Some(3));
+        assert_eq!(worst_grade(&[cfg(None)]), None);
+        assert_eq!(worst_grade(&[]), None);
+    }
+
+    /// Thresholds are host config, so the same gradings are a different
+    /// verdict elsewhere.
+    #[test]
+    fn the_hosts_thresholds_decide_not_the_grades() {
+        let strict = Thresholds {
+            warn_at: 1,
+            block_at: 2,
+        };
+        assert_eq!(strict.verdict_of(&[cfg(Some(1))]), Verdict::Warn);
+        assert_eq!(strict.verdict_of(&[cfg(Some(2))]), Verdict::Block);
+        assert_eq!(
+            Thresholds::default().verdict_of(&[cfg(Some(2))]),
+            Verdict::Warn
+        );
+    }
+
+    /// A number this scale cannot express must not read as the best grade.
+    /// Unreachable through `from_json`, which is exactly why it is pinned:
+    /// the next caller may not go through `from_json`.
+    #[test]
+    fn an_impossible_grade_saturates_toward_risk() {
+        assert_eq!(PACRAT_SCALE.to_pacrat(9), 4);
+        assert_eq!(Scale { min: 2, max: 6 }.to_pacrat(0), 4);
+        assert_eq!(Scale { min: 0, max: 10 }.to_pacrat(11), 4);
+        // A scale that spans nothing cannot place anything.
+        assert_eq!(Scale { min: 3, max: 3 }.to_pacrat(3), 4);
+        assert_eq!(Scale { min: 5, max: 1 }.to_pacrat(3), 4);
     }
 
     /// `Result::unwrap_err` needs `T: Debug` and a message; this says which

@@ -117,10 +117,51 @@ or a human via `pacrat grade --grade N --note …` — return only:
 Rules: pacrat maps grade→verdict with its own thresholds (default warn≥2,
 block≥4); cache key is (grader, package, commit) and a moved AUR HEAD
 invalidates the grading; grader failure/timeout/bad JSON = **ungraded, which
-holds in auto mode** — failure is never Proceed; multiple graders aggregate
-worst-wins (open question 5); every invocation is logged argv-verbatim in the
-jobs view. yay-friend needs only an output-format adapter — its commit-hash
-cache already matches the contract's idempotency model.
+holds in auto mode** — failure is never Proceed; every invocation is logged
+argv-verbatim in the jobs view. yay-friend needs only an output-format
+adapter — its commit-hash cache already matches the contract's idempotency
+model.
+
+**A grading is about bytes, not about a commit.** The cache key above is
+necessary and not sufficient: a commit says what upstream published, not what
+is in the store now, and the store tree can be edited by a hand, a sync, or a
+half-finished `git` operation without any of the three key parts changing. So
+every cached grading also records a **tree digest** — SHA-256 over the sorted,
+length-prefixed (relative path, contents) pairs of the tree — and a read whose
+digest does not match the tree on disk is a **miss**, not a hit and not an
+error. Without this, editing a PKGBUILD after grading serves the old PROCEED
+forever, which is the whole gate defeated by one text editor. This applies to
+a human's `--grade` exactly as it does to a tool's: a reading is about the
+bytes that were read.
+
+**Aggregation: worst-wins, but only among gradings entitled to answer.**
+Splitting the two halves of the question is what makes the rule safe:
+
+1. *Did anybody answer?* Only a **configured** grader or a **human** can. A
+   cached grading from a grader this host no longer has configured is
+   evidence, not an answer — otherwise deleting a grader from the config
+   makes every package it ever touched look permanently graded. With no
+   answer the verdict is Ungraded, which holds.
+2. *How bad is it?* **Worst-wins over every grading**, including the retired
+   one (settles open question 5).
+
+The asymmetry is deliberate: evidence that is not allowed to reassure is
+still allowed to alarm. A retired grader's leftover file can make a verdict
+worse and can never make one exist. Manual is a human's own reading and
+always answers, which is also what lets a recorded `--grade` be read back on
+a host with no external graders configured at all.
+
+Grader output is untrusted twice over — malformed by accident, or steered by
+the PKGBUILD it was asked to judge. Three bounds follow, none of them
+optional: its **size** is capped (4 MB of stdout; the grader picks that
+number otherwise, and `cat /dev/zero` is a request for all the memory on the
+machine), its **text** is neutered *and* flattened to one line before display
+(a newline in a finding title otherwise forges a line of pacrat's own report,
+verdict included), and its **subject** is checked — a valid grading of some
+other package is not a grading of this one. A grader may also **pin its
+scale** in config; a report declaring a different one is ungraded rather than
+rescaled, because a tool that silently moved from 0-4 to 0-100 would
+otherwise have every grade quietly become four times less alarming.
 
 ### Update loop and gates
 
@@ -194,5 +235,8 @@ with argv logging — the dotfiles-tui split, kept deliberately.
    sources.toml, or no override at all?
 3. **Jobs runtime** — TUI-process-only, or a user service owning the queue?
 4. **Sync transport** — remote sync over ssh, or each host syncs itself?
-5. **Multi-grader aggregation** — worst-wins, or weights/vetoes (does manual
-   outrank tools)?
+5. **Multi-grader aggregation** — *settled as worst-wins plus the quorum
+   rule; see the grading contract above.* Still open: whether manual should
+   additionally **outrank** tools rather than merely counting among them —
+   today a human's grade 0 does not override a tool's grade 4, it only joins
+   the worst-wins pool. Weights and vetoes remain unbuilt.

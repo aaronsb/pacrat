@@ -43,6 +43,22 @@ pub struct SourceEntry {
     pub note: Option<String>,
 }
 
+/// Is this the shape of a git object id?
+///
+/// The ledger is a synced file that any host can edit, and `reviewed` flows
+/// outward from it into places where its *shape* is load-bearing: it becomes
+/// a path component of the grade cache, and an argument to git. A value like
+/// `../../../../PWNED` is a perfectly good TOML string and a perfectly good
+/// path traversal. Validating here rather than at each use site means every
+/// future consumer of a `Sources` gets the guarantee without knowing to ask
+/// for it — the same argument `Config::from_toml` makes for `[repo]`.
+///
+/// Seven is git's own shortest abbreviation; sixty-four admits SHA-256
+/// object ids, which git is migrating toward.
+pub fn valid_commit(commit: &str) -> bool {
+    (7..=64).contains(&commit.len()) && commit.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sources {
     #[serde(default)]
@@ -50,8 +66,25 @@ pub struct Sources {
 }
 
 impl Sources {
-    pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(s)
+    /// Parse and validate. As with `Config::from_toml`, there is no path
+    /// through this type that yields an unvalidated ledger.
+    pub fn from_toml(s: &str) -> Result<Self, String> {
+        let sources: Self = toml::from_str(s).map_err(|e| e.to_string())?;
+        sources.validate()?;
+        Ok(sources)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (package, entry) in &self.packages {
+            if !valid_commit(&entry.reviewed) {
+                return Err(format!(
+                    "packages.{package}.reviewed is {:?}, which is not a commit hash — \
+                     expected 7-64 hex characters as `git rev-parse` prints them",
+                    entry.reviewed
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn to_toml(&self) -> String {
@@ -99,5 +132,54 @@ note = "ours"
     #[test]
     fn empty_and_missing_table() {
         assert_eq!(Sources::from_toml("").unwrap(), Sources::default());
+    }
+
+    /// The ledger is synced between hosts, so a hostile entry is a hostile
+    /// *file*, and it must not parse. `reviewed` reaches a cache path and a
+    /// git argument; the traversal below is the one a reviewer demonstrated
+    /// writing outside the state directory.
+    #[test]
+    fn a_reviewed_commit_that_is_not_a_commit_fails_to_parse() {
+        let hostile = [
+            "../../../../PWNED",
+            "/etc/passwd",
+            "..",
+            "",
+            "abc",    // shorter than git will abbreviate
+            "HEAD~1", // a revision, not an object id
+            "3f9c21ab/../../x",
+            "3f9c21ab.manual", // would collide with a grade-cache filename
+            "3f9c21ab\nSigLevel = Never",
+            "z9c21abz",
+            &"a".repeat(65),
+        ];
+        for reviewed in hostile {
+            let toml = format!(
+                "[packages.mdcat]\n\
+                 upstream = \"https://aur.archlinux.org/mdcat.git\"\n\
+                 reviewed = {reviewed:?}\n\
+                 role = \"vendored\"\n"
+            );
+            let err = match Sources::from_toml(&toml) {
+                Ok(_) => panic!("reviewed {reviewed:?} should have been rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("reviewed") && err.contains("mdcat"),
+                "unhelpful error for {reviewed:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_object_ids_are_accepted_at_both_lengths() {
+        for commit in ["3f9c21ab", &"a".repeat(40), &"F".repeat(64)] {
+            assert!(valid_commit(commit), "{commit} should be valid");
+        }
+        let toml = format!(
+            "[packages.mdcat]\nupstream = \"u\"\nreviewed = {:?}\nrole = \"vendored\"\n",
+            "a".repeat(40)
+        );
+        assert!(Sources::from_toml(&toml).is_ok());
     }
 }
