@@ -1,0 +1,24 @@
+┌─ pacrat ── [1]overview [2]browse [3]updates [4]hosts [5]jobs [6]config [7]abo┐
+├ matrix — 6 packages across 2 hosts · 2 marked ───────────────────────────────┤
+│  package                      north    slab     state                        │
+│   apple                       +        —        installed                    │
+│   bat                         +        —        installed                    │
+│  •cowsay                      ✗        —        tracked                      │
+│   fd                          ✓        —        tracked                      │
+│▸  ripgrep                     ✓        ·        tracked                      │
+│  •zoxide                      +        ·        tracked                      │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+├─ legend ─────────────────────────────────────────────────────────────────────┤
+│  ✓ installed   ✗ tracked here, not installed   + installed, unmanaged   — not│
+│  the north column is the manifest against this machine; every other column is│
+│  sync is self-only (ADR-001 q4) — pacrat cannot see what another host has ins│
+├─ ripgrep ────────────────────────────────────────────────────────────── 5/6 ─┤
+│  package   ripgrep                                                          █│
+│  state     tracked                                                          █│
+│  tracked onnorth, slab                                                      █│
+│  here      installed                                                        █│
+│                                                                             █│
+└─ space · * / - / ! · A / x · s · ? help · q quit ───────── tab · region 1/3 ─┘

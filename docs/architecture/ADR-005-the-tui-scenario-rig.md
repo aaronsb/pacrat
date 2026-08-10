@@ -103,6 +103,22 @@ what the screen advertises" is the rig's.
 A regression that reached a human first becomes a scenario the same day;
 that is the rig's maintenance rule.
 
+## Known limits (recorded at the first adversarial review)
+
+- **The overview and config screens are outside the goldens' reach** for
+  now: `setup::state()` reads the real `/etc/pacman.conf` and guard
+  paths, and the fixture root's pid-bearing path is printed on both — a
+  golden of either would bless the blessing machine. Snapshotting them
+  needs fixture doors beside `PACRAT_HOSTNAME`; until then, no scenario
+  may golden screens `[1]` or `[6]`.
+- **The childlock is structurally out of the rig's reach**: it is defined
+  by wall-clock timing, and the rig refuses to offer a sleep. Its guard
+  is its own unit tests and the pty attacks of adversarial reviews.
+- **`wait_for` returns immediately when the text is already on screen**,
+  so a step asserting a state the screen was already in asserts nothing —
+  the snapshot after it does the real work. A scenario author who needs
+  "this *changed*" needs a change-detecting primitive, not `wait_for`.
+
 ## Consequences
 
 - Two dev-dependencies (`portable-pty`, `vt100`), both maintained, both

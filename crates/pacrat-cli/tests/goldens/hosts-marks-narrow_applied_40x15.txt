@@ -1,0 +1,15 @@
+┌─ pacrat ── [1]overview [2]browse [3]u┐
+├ matrix — 6 packages across 2 h─ 4/6 ─┤
+│  package                      north █│
+│   apple                       +     █│
+│▸  bat                         ✓     █│
+│   cowsay                      ✗     █│
+│   fd                          ✓     ║│
+├─ legend ─────────────────────────────┤
+│  ✓ installed   ✗ tracked here, not in│
+│  the north column is the manifest aga│
+│  sync is self-only (ADR-001 q4) — pac│
+├─ added 2 package(s) ─────────── 2/4 ─┤
+│                                     █│
+│  native    tracked bat, zoxide (3 → ║│
+└─ space · * / - / ─ tab · region 1/3 ─┘

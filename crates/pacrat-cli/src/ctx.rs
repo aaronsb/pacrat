@@ -352,6 +352,19 @@ fn passwd_home(passwd: &str, user: &str) -> Option<PathBuf> {
 }
 
 fn hostname() -> String {
+    // The fixture door, and `PACRAT_SETUP_GATE`'s sibling: a hermetic
+    // sandbox (the demo, the scenario rig) has to say which machine it is
+    // pretending to be, and `/etc/hostname` is the one input an `env -i`
+    // cannot fence off — without this, every golden the rig commits would
+    // carry the hostname of whichever machine blessed it. Guarded by the
+    // same grammar host directories pass, because a host name is printed
+    // into columns and commands; a variable carrying something hostile
+    // does not get to use this door.
+    if let Ok(name) = env::var("PACRAT_HOSTNAME") {
+        if valid_name(&name) {
+            return name;
+        }
+    }
     if let Ok(name) = fs::read_to_string("/etc/hostname") {
         let name = name.trim();
         if !name.is_empty() {
@@ -534,6 +547,20 @@ mod tests {
             passwd_home(both_usable, "twin"),
             Some(PathBuf::from("/home/first"))
         );
+    }
+
+    /// The fixture door decides the host, and refuses the same names the
+    /// host directories refuse — a name that can hide text in a column must
+    /// not arrive through an environment variable either. Touching the
+    /// process environment is safe here because no other test in this
+    /// binary reads it; a second such test would need the two serialized.
+    #[test]
+    fn the_fixture_door_names_the_host_and_refuses_a_hostile_name() {
+        std::env::set_var("PACRAT_HOSTNAME", "north");
+        assert_eq!(hostname(), "north");
+        std::env::set_var("PACRAT_HOSTNAME", "bad\u{1b}[8m");
+        assert_ne!(hostname(), "bad\u{1b}[8m", "a hostile name used the door");
+        std::env::remove_var("PACRAT_HOSTNAME");
     }
 
     /// A host name is printed into commands and into a padded column, so it
