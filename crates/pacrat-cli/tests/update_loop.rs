@@ -24,6 +24,26 @@ use std::process::{Command, Stdio};
 /// it has to be a name pacman would accept.
 const PKG: &str = "pacrat-test-pkg";
 
+/// The three build-exercising tests need a real `makepkg`, which is Arch's.
+/// Same contract as publish_flow.rs's `can_publish`: skip where it cannot
+/// run, and let `PACRAT_REQUIRE_MAKEPKG=1` (set by CI's Arch job) turn a
+/// skip into a failure so the build path can never go quietly untested.
+fn can_build() -> bool {
+    let have = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join("makepkg").is_file()))
+        .unwrap_or(false);
+    if have {
+        return true;
+    }
+    assert!(
+        std::env::var_os("PACRAT_REQUIRE_MAKEPKG").is_none(),
+        "PACRAT_REQUIRE_MAKEPKG is set but makepkg is not on PATH — this run was \
+         supposed to exercise the build path and would otherwise have skipped it"
+    );
+    eprintln!("skipping: makepkg is not on PATH (building is Arch-only)");
+    false
+}
+
 /// The exit code ADR-001 gives "ran fine, deliberately did not act".
 const HELD: i32 = 10;
 
@@ -385,6 +405,9 @@ fn pkgbuild(version: &str) -> String {
 /// per scenario would make this suite too slow to run often.
 #[test]
 fn auto_adopts_a_clean_verdict_and_serves_it() {
+    if !can_build() {
+        return;
+    }
     let sb = Sandbox::new("auto-proceed");
     let candidate = sb.publish("2.0");
 
@@ -858,6 +881,9 @@ fn the_json_report_is_the_whole_of_stdout_and_says_what_happened() {
 /// timer, and nowhere a pipe-based test would ever see it.
 #[test]
 fn journald_style_socket_stderr_does_not_leak_the_build_into_the_json() {
+    if !can_build() {
+        return;
+    }
     let sb = Sandbox::new("json-socket");
     sb.publish("2.0");
 
@@ -879,6 +905,9 @@ fn journald_style_socket_stderr_does_not_leak_the_build_into_the_json() {
 /// stray write would corrupt the object.
 #[test]
 fn a_building_run_still_answers_with_one_json_object() {
+    if !can_build() {
+        return;
+    }
     let sb = Sandbox::new("json-build");
     let candidate = sb.publish("2.0");
 
