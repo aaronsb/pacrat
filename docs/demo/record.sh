@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The demo driver: pacrat's whole loop — vendor, grade, build, serve, update
-# — played once through, at reading speed, for asciinema to record.
+# The demo driver: an introduction from the mascot, then pacrat's whole loop
+# — vendor, grade, build, serve, update — played once through, at reading
+# speed, for asciinema to record.
 #
 # EVERYTHING HAPPENS IN A SANDBOX. The store is a throwaway tree under
 # /tmp, the "AUR" is a local bare-less git repo reached over file://, the
@@ -86,6 +87,7 @@ pacrat() {
     PATH="$SB/bin:/usr/bin:/bin" \
     HOME="$SB" \
     TERM="${TERM:-xterm-256color}" \
+    COLORTERM=truecolor \
     LANG=C.UTF-8 \
     DOTFILES_DIR="$SB/store" \
     XDG_CONFIG_HOME="$SB/config" \
@@ -206,6 +208,12 @@ timeout_s = 60
 EOF
 
 # ── the demo ───────────────────────────────────────────────────────────────
+# COLORTERM is pinned to truecolor in the wrapper above so this opening
+# renders the art in full colour inside the recording pty; asciinema and agg
+# both carry 24-bit colour through to the gif.
+act "first, introductions"
+BEAT=3.5 run "pacrat about"
+
 act "a throwaway store, a local 'AUR', and one package to curate"
 BEAT=4.5 run "pacrat status"
 
