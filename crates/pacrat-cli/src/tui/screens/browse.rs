@@ -195,10 +195,8 @@ impl Browse {
     fn set_query(&mut self) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if self.term.is_empty() {
-            lines.push(note("nothing searched for yet — / to type a term"));
-            lines.push(note(
-                "both worlds are asked: the sync databases and the AUR RPC",
-            ));
+            lines.push(note("nothing searched for yet — press / to type a term"));
+            lines.push(note("searches both the sync databases and the AUR RPC"));
         } else {
             lines.push(Line::from(vec![
                 theme::plain("  "),
@@ -225,9 +223,9 @@ impl Browse {
                 true => vec![
                     Line::default(),
                     note("/ searches the official repos and the AUR at once."),
-                    note("Every rung of the ladder shows the same rows here, with an"),
-                    note("em dash where an answer does not exist — so comparing two"),
-                    note("packages is never comparing two shapes."),
+                    note("Every source fills in the same columns, with an em dash"),
+                    note("where it has no answer — so any two packages can be"),
+                    note("compared like for like."),
                     Line::default(),
                     note("enter  everything pacrat knows about the selected package"),
                     note("v · t · i  vendor · track · install"),

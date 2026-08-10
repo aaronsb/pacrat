@@ -333,17 +333,17 @@ impl Updates {
                 vec![
                     Line::default(),
                     note("enter — fetch the selected candidate and diff it against the"),
-                    note("store's reviewed tree. Nothing is graded by looking; the"),
-                    note("gradings shown are the ones already on file for those bytes."),
+                    note("store's reviewed tree. Viewing runs no graders; the gradings"),
+                    note("shown are the ones already on file for those bytes."),
                 ],
             );
             self.set(
                 GRADING,
                 vec![
                     Line::default(),
-                    note("a grading is of a tree digest, not of a commit — so there is"),
+                    note("gradings are keyed by tree digest, not by commit — there is"),
                     note("no verdict to show until the candidate has been fetched."),
-                    note("Until then every row is ungraded, and ungraded holds."),
+                    note("Until then every row is UNGRADED, which holds."),
                 ],
             );
         }
@@ -437,7 +437,7 @@ impl Updates {
                 lines.extend(wrap(&visible_line(why).0, 76).into_iter().map(note));
                 lines.push(Line::default());
                 lines.push(note(
-                    "not the same as no update, and never counted as one — `r` asks again",
+                    "unreachable does not mean up to date — press `r` to probe again",
                 ));
                 lines
             }
@@ -463,8 +463,8 @@ impl Updates {
                 );
                 lines.push(Line::default());
                 lines.push(note(
-                    "the refusal names this commit — the moment upstream moves, the \
-                     question is new and unanswered again",
+                    "the refusal applies to this commit only — once upstream moves, \
+                     the new candidate will be raised again",
                 ));
                 lines
             }
@@ -520,7 +520,7 @@ impl Updates {
                 Probe::Current => "is at its reviewed commit — there is no candidate to look at",
                 Probe::Unreachable(_) => {
                     "could not be probed, so there is no candidate to fetch. \
-                     `r` asks again"
+                     Press `r` to retry"
                 }
                 _ => "has no candidate",
             };
@@ -608,14 +608,14 @@ impl Updates {
         lines.push(note(format!("end diff  {}", changes.summary_line())));
         if cut {
             lines.push(bad(
-                "the diff hit pacrat's 1 MB ceiling and is not all of it — read the \
-                 trees themselves before deciding",
+                "the diff hit pacrat's 1 MB limit and is incomplete — run `pacrat \
+                 review` in a shell, which keeps both trees for inspection",
             ));
         }
         if hidden > 0 {
             lines.push(bad(format!(
-                "{hidden} control character{} in the diff shown as ␛-style stand-ins \
-                 — text that tries to hide from a reviewer",
+                "{hidden} control character{} in the diff replaced with ␛-style \
+                 stand-ins — control characters can hide text from a reviewer",
                 if hidden == 1 { "" } else { "s" }
             )));
         }
@@ -647,9 +647,9 @@ impl Updates {
         if gradings.is_empty() {
             g.push(note("no gradings on file for these bytes"));
             g.push(note(
-                "`pacrat grade` reads the store tree, so this candidate can be graded \
-                 after it is adopted — or before, by `pacrat update`, which grades the \
-                 staged candidate and is the only verb that does",
+                "`pacrat grade` only grades the store tree, so this candidate can be \
+                 graded after adoption — or beforehand with `pacrat update`, the only \
+                 verb that grades a staged candidate",
             ));
         }
         for c in &gradings {
@@ -706,7 +706,7 @@ impl Updates {
                     "standing",
                     format!(
                         "{} is not in this host's config — its grade can make this \
-                         verdict worse, and can never make one exist",
+                         verdict worse, but cannot supply one on its own",
                         truncate(&visible_line(&c.grader).0, 40)
                     ),
                 ));
@@ -723,7 +723,7 @@ impl Updates {
             g.push(field(
                 "result",
                 match grade::cached_failure(package, &cand.commit, &cand.digest, &grader.name) {
-                    Some(reason) => format!("no grading — it failed: {reason}"),
+                    Some(reason) => format!("no grading — the grader failed: {reason}"),
                     None => "no grading on file for this candidate".to_string(),
                 },
             ));
@@ -737,7 +737,7 @@ impl Updates {
             g.push(Line::from(vec![
                 theme::plain("  "),
                 theme::tinted(theme::BAD, "BLOCK holds. "),
-                theme::dim("`o` opens the override — a key held, then a reason."),
+                theme::dim("`o` opens the override — hold the key, then give a reason."),
             ]));
         }
         self.set(GRADING, g);
@@ -776,9 +776,9 @@ impl Updates {
             ),
             (Some(candidate), _) => command(
                 "adopting installs the candidate's tree into the store and advances \
-                 the ledger, after showing you the diff and asking. `--commit` is not \
-                 optional here: upstream having moved past what you read is a refusal, \
-                 never a substitution.",
+                 the ledger, after showing the diff and asking. `--commit` is \
+                 required: if upstream has moved past the commit you read, the adopt \
+                 is refused rather than silently taking the newer one.",
                 &[
                     format!("pacrat adopt-update {package} --commit {candidate}"),
                     format!("pacrat build {package}"),
@@ -792,9 +792,9 @@ impl Updates {
         let Some(row) = self.selected() else { return };
         let package = shell_quote(&row.package);
         let lines = command(
-            "a refusal is about one commit: it stops `pacrat updates` re-raising \
-             this candidate, and the moment upstream moves the question is new and \
-             unanswered again.",
+            "a rejection applies to one commit: `pacrat updates` stops raising this \
+             candidate, and once upstream moves on, the new candidate is raised \
+             again.",
             &[format!("pacrat reject {package} --note \"…\"")],
         );
         self.answer(lines, "reject");
@@ -873,9 +873,9 @@ impl Updates {
             Line::default(),
         ];
         lines.extend(command(
-            "the decision is on the record; the adoption is not. This is the command \
-             that lands the tree — the same reason, because the ledger records one \
-             decision and the verb re-states it rather than inventing a second.",
+            "the override is recorded; the adoption has not happened yet. Run this \
+             command to install the tree — it re-uses the same reason, so the ledger \
+             keeps a single decision.",
             &[format!(
                 "pacrat adopt-update {} --commit {commit} --override-block --reason {}",
                 shell_quote(&package),

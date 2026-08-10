@@ -232,8 +232,8 @@ fn execute_adopt(
             // is exactly the state exit 10 exists to name.
             say!();
             say!(
-                "not adopted — you asked for {} and upstream HEAD is {}. Review what \
-                 is actually there (`pacrat review {package}`)",
+                "not adopted — you asked for {} but upstream HEAD is now {}. Run \
+                 `pacrat review {package}` to see the current candidate",
                 short_hash(want),
                 short_hash(&cand.commit)
             );
@@ -244,7 +244,7 @@ fn execute_adopt(
     if !updates::drifted(&curated.entry.reviewed, &cand.commit) {
         say!();
         say!(
-            "nothing to adopt — upstream HEAD is the commit the ledger already \
+            "nothing to adopt — upstream HEAD is already the commit the ledger \
              records as reviewed"
         );
         return Ok(Adoption::Adopted);
@@ -257,7 +257,7 @@ fn execute_adopt(
     // moved. The full diff stays `review`'s job, and the line below says so.
     changes_between(curated, cand)?.render();
     say!();
-    say!("diff      pacrat review {package} — the line-by-line, before you answer");
+    say!("diff      run `pacrat review {package}` for the full line-by-line diff before answering");
 
     let (verdict, grade) = show_gradings(ctx, package, cand)?;
     say!();
@@ -266,9 +266,9 @@ fn execute_adopt(
     let overriding = match (verdict, opts.override_block) {
         (Verdict::Block, None) => {
             say!(
-                "not adopted — BLOCK holds. The ways past it: change what the graders \
-                 see, record your own reading (`pacrat grade {package} --grade N \
-                 --note …`), or accept the risk on the record with `pacrat \
+                "not adopted — the BLOCK verdict holds. Your options: fix what the \
+                 graders flagged, record your own grade (`pacrat grade {package} \
+                 --grade N --note …`), or accept the risk on the record with `pacrat \
                  adopt-update {package} --commit {} --override-block --reason \"…\"`",
                 short_hash(&cand.commit)
             );
@@ -276,7 +276,7 @@ fn execute_adopt(
         }
         (Verdict::Block, Some(reason)) => {
             say!(
-                "OVERRIDE  adopting past a {} verdict, by hand",
+                "OVERRIDE  adopting past a {} verdict by hand",
                 Verdict::Block
             );
             say!("reason    {}", truncate(&visible_line(reason).0, 200));
@@ -284,8 +284,8 @@ fn execute_adopt(
             // prompt is answered, and a line that said "recorded" before a
             // human declined would be pacrat lying about its own ledger.
             say!(
-                "ledger    going through with this records it in {} — permanently, \
-                 and synced to every host",
+                "ledger    if you confirm, this override is recorded in {} — \
+                 permanently, and synced to every host",
                 store_rel(ctx, &ctx.decisions_path())
             );
             say!();
@@ -302,9 +302,9 @@ fn execute_adopt(
             // the human believed a record was being written. The plain verb
             // is right there.
             return Err(format!(
-                "nothing to override — the verdict is {verdict}, not {}. Plain \
-                 `pacrat adopt-update {package} --commit {}` handles it, and \
-                 nothing was recorded in the decision ledger",
+                "nothing to override — the verdict is {verdict}, not {}. Use plain \
+                 `pacrat adopt-update {package} --commit {}` instead; nothing was \
+                 recorded in the decision ledger",
                 Verdict::Block,
                 short_hash(&cand.commit)
             ));
@@ -315,8 +315,9 @@ fn execute_adopt(
         // Ungraded holds the *automatic* loop. Here there is a human, and
         // they have just been shown the diff.
         say!(
-            "note      nothing has graded this candidate — ungraded holds the headless \
-             loop, and is not a BLOCK; `pacrat review {package}` is where the diff is"
+            "note      no grading exists for this candidate. UNGRADED stops unattended \
+             runs but is not a BLOCK — you can still adopt after reading the diff \
+             (`pacrat review {package}`)"
         );
     }
 
@@ -334,7 +335,7 @@ fn execute_adopt(
             });
         say!("rejected  {} was refused: {note}", short_hash(&cand.commit));
         if !opts.yes {
-            say!("not adopted — re-adopting a candidate that was rejected takes --yes");
+            say!("not adopted — this candidate was rejected before; pass --yes to adopt it anyway");
             return Ok(Adoption::Held);
         }
         say!("proceeding anyway on --yes");
@@ -367,8 +368,8 @@ fn execute_adopt(
     install(ctx, package, curated, cand).map_err(|e| match overriding {
         None => e,
         Some(_) => format!(
-            "{e}\n       the decision is on the record; the adoption is not — \
-             {} holds an override-block entry for {package} @ {}, and the store \
+            "{e}\n       the override was recorded but the adoption failed — \
+             {} now holds an override-block entry for {package} @ {}, and the store \
              was not changed",
             store_rel(ctx, &ctx.decisions_path()),
             short_hash(&cand.commit)
@@ -479,8 +480,8 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
     // and a zero here would tell a script a refusal is on file when none is.
     if !updates::drifted(&curated.entry.reviewed, &candidate) {
         return Err(format!(
-            "nothing to reject — upstream HEAD is {}, the commit the ledger already \
-             records as reviewed",
+            "nothing to reject — upstream HEAD is {}, which is already the commit \
+             the ledger records as reviewed",
             short_hash(&candidate)
         ));
     }
@@ -665,8 +666,8 @@ pub fn finish(cand: &Candidate, remove: bool) {
     } else {
         say!();
         say!(
-            "trees     {} — `{REVIEWED}` and `{CANDIDATE}` are the two sides of the \
-             diff, yours to read with anything you like",
+            "trees     kept at {} — `{REVIEWED}` and `{CANDIDATE}` are the two sides \
+             of the diff; inspect them with any tool you like",
             cand.scratch.display()
         );
     }
@@ -701,7 +702,7 @@ pub fn header(curated: &Curated, cand: &Candidate) {
     if !valid_commit(curated.entry.reviewed.trim()) {
         say!(
             "warning   the ledger's reviewed commit is not an object id — the diff \
-             below is against the store tree, which is the truth about what is there"
+             below compares against the store tree as it is on disk"
         );
     }
 }
@@ -971,22 +972,22 @@ fn render_diff(diff: &Diff, changes: &Changes) -> bool {
     let over = total.saturating_sub(DIFF_LINES);
     if over > 0 {
         say!(
-            "…         {over} further line{} not shown — a diff this long is itself \
-             worth a second look",
+            "…         {over} more line{} not shown — a diff this long is worth \
+             extra scrutiny",
             if over == 1 { "" } else { "s" }
         );
     }
     if diff.cut {
         say!(
-            "warning   the diff hit pacrat's {} MB ceiling and is not all of it — \
-             read the trees themselves before deciding",
+            "warning   the diff hit pacrat's {} MB limit and is incomplete — \
+             inspect the kept trees before deciding",
             proc::PIPE_LIMIT / (1024 * 1024)
         );
     }
     if hidden > 0 {
         say!(
-            "warning   {hidden} control character{} in the diff shown as ␛-style \
-             stand-ins — text that tries to hide from a reviewer",
+            "warning   {hidden} control character{} in the diff replaced with ␛-style \
+             stand-ins — control characters can hide text from a reviewer",
             if hidden == 1 { "" } else { "s" }
         );
     }
@@ -1013,9 +1014,9 @@ fn show_gradings(
     if gradings.is_empty() {
         say!("gradings  none on file for these bytes");
         say!(
-            "reason    `pacrat grade` reads the *store* tree, so this candidate can be \
-             graded after it is adopted — or before it is, by `pacrat update`, which \
-             grades the staged candidate and is the only verb that does"
+            "reason    `pacrat grade` only grades the store tree, so you can grade \
+             this candidate after adopting it — or beforehand with `pacrat update`, \
+             the only verb that grades a staged candidate"
         );
     } else {
         say!("gradings  {} on file for these bytes", gradings.len());
@@ -1034,7 +1035,7 @@ fn show_gradings(
         say!();
         say!("grader    {}", truncate(&grader.name, 40));
         match grade::cached_failure(package, &cand.commit, &cand.digest, &grader.name) {
-            Some(reason) => say!("result    no grading — it failed: {reason}"),
+            Some(reason) => say!("result    no grading — the grader failed: {reason}"),
             None => say!("result    no grading on file for this candidate"),
         }
     }
