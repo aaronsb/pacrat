@@ -137,7 +137,11 @@ pub fn bad(text: impl Into<String>) -> Line<'static> {
 /// somebody to read and paste, which is precisely when it must not be able
 /// to hide half of itself.
 pub fn command(why: &str, argv: &[String]) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::default(), note(why.to_string()), Line::default()];
+    // Wrapped, because the regions do not wrap: an explanation longer than
+    // the pane was running off the terminal's edge mid-sentence.
+    let mut lines = vec![Line::default()];
+    lines.extend(wrap(why, 76).into_iter().map(note));
+    lines.push(Line::default());
     lines.extend(argv.iter().map(|line| {
         Line::from(vec![
             theme::plain("    "),
@@ -145,10 +149,15 @@ pub fn command(why: &str, argv: &[String]) -> Vec<Line<'static>> {
         ])
     }));
     lines.push(Line::default());
-    lines.push(note(
-        "pacrat prints every command it runs before running it — behind this \
-         screen there is nowhere for that line to land, so the command is yours",
-    ));
+    lines.extend(
+        wrap(
+            "pacrat prints every command it runs before running it — behind this \
+             screen there is nowhere for that line to land, so the command is yours",
+            76,
+        )
+        .into_iter()
+        .map(note),
+    );
     lines
 }
 
