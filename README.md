@@ -15,10 +15,28 @@ The rat curates the pantry; the little chef does the tasting.
   about screen renders as half-blocks
 
 Status: the CLI works. `status`, `hosts`, `add`, `setup`, `vendor`, `search`,
-`info`, `build`, `updates`, `grade`, `review`/`adopt-update`/`reject`, and
-`sync` are implemented and tested; the one-shot update loop (`pacrat update`)
-waits on ADR-001's open questions, and the TUI is next. The mockup shows
-where it's all headed.
+`info`, `build`, `updates`, `grade`, `review`/`adopt-update`/`reject`, `sync`
+and `push` are implemented and tested; the one-shot update loop (`pacrat
+update`) waits on ADR-001's open questions, and the TUI is next. The mockup
+shows where it's all headed.
+
+## Publishing
+
+`pacrat push <package>` publishes a **maintained** package's store tree to its
+upstream — clone, mirror the store over it, regenerate `.SRCINFO`, show the
+diff, ask, commit, push. Never a force-push, and never a `vendored` package:
+that role is pull-only.
+
+Two things it will not do quietly. If the upstream is the AUR it asks first
+whether the AUR is accepting publishes (`ssh aur@aur.archlinux.org help`,
+read-only) and, when the answer is no, records the errand in a publish queue
+instead — `pacrat push` with no arguments probes again and works the queue,
+and `pacrat status` carries a line while anything is waiting. And if a
+checksum has changed for a source of an **already-published version**, it
+stops: an immutable tag whose tarball changed is an incident, not a re-sum.
+
+Exit codes: 0 published (or already current), 10 queued/blocked/declined, 1
+the alarm or a failure.
 
 ## Graders
 

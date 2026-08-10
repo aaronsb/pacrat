@@ -154,6 +154,48 @@ pub fn install(from: &Path, files: &[String], dest: &Path) -> Result<(), String>
     Ok(())
 }
 
+/// Make `dest`'s tree match `from`'s, in place, leaving everything [`SKIP`]
+/// hides alone.
+///
+/// The difference from [`install`] is `.git`, and it is the whole reason this
+/// exists: `push` copies the store's tree over a *clone*, whose history is
+/// how the publish happens. `install` would rename a fresh directory into
+/// place and take the repository with it.
+///
+/// In place means not atomic, and that is deliberate rather than overlooked:
+/// the destination here is a scratch clone, thrown away either way. Nothing a
+/// half-finished mirror could damage is anything anyone will read again. Use
+/// [`install`] for anything under the store.
+///
+/// Returns the files it removed, which is the half of "what changed" that a
+/// copy alone cannot report.
+pub fn mirror(from: &Path, files: &[String], dest: &Path) -> Result<Vec<String>, String> {
+    // Validates the destination the same way the source was validated: a
+    // clone carrying a symlink is a tree pacrat will not walk.
+    let existing = self::files(dest)?;
+    let mut removed = Vec::new();
+    for rel in &existing {
+        if files.contains(rel) {
+            continue;
+        }
+        let path = dest.join(rel);
+        fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        removed.push(rel.clone());
+    }
+    copy_into(from, files, dest)?;
+    // A directory emptied by the removals above is not part of the tree any
+    // more; git would not notice it, and a later walk would.
+    for rel in &removed {
+        let mut dir = dest.join(rel);
+        while dir.pop() && dir != dest {
+            if fs::remove_dir(&dir).is_err() {
+                break;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn copy_into(from: &Path, files: &[String], staging: &Path) -> Result<(), String> {
     fs::create_dir_all(staging).map_err(|e| format!("{}: {e}", staging.display()))?;
     for rel in files {

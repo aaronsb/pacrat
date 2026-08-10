@@ -41,6 +41,15 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
         }
     );
 
+    // Host state, not store state, so a broken or unreadable queue costs its
+    // own line and not the overview: `status` is the verb people run when
+    // something is already wrong.
+    match crate::push::status_line() {
+        Ok(Some(line)) => println!("queue  {line}"),
+        Ok(None) => {}
+        Err(e) => println!("queue  unreadable — {e}"),
+    }
+
     let hosts = ctx.tracked_hosts();
     if hosts.is_empty() {
         println!("hosts  none tracked under {}", ctx.packages_dir().display());

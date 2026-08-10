@@ -385,9 +385,12 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
 
 /// A package these verbs can work on: in the ledger, with a tree.
 ///
-struct Curated {
-    entry: SourceEntry,
-    tree: PathBuf,
+/// Shared with `push`, which needs exactly the same four-state answer — and
+/// must give it in the same words, since "not vendored" and "tree but no
+/// ledger entry" are the same two problems whichever verb ran into them.
+pub struct Curated {
+    pub entry: SourceEntry,
+    pub tree: PathBuf,
 }
 
 /// Resolve the package, or say which of the four states it is in instead.
@@ -396,7 +399,7 @@ struct Curated {
 /// seen from the other side — vendoring refuses the one thing reviewing
 /// requires — and describing them twice, differently, would leave a reader
 /// wondering whether they are the same problem.
-fn curated(ctx: &Ctx, package: &str) -> Result<Curated, String> {
+pub fn curated(ctx: &Ctx, package: &str) -> Result<Curated, String> {
     if !valid_name(package) {
         return Err(format!(
             "{package:?} is not a package name — expected letters, digits, \

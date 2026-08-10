@@ -69,9 +69,31 @@ where
     hex(&h.finalize())
 }
 
+/// Is this the shape [`tree_digest`] writes?
+///
+/// The same argument `sources::valid_commit` makes about a commit, made about
+/// a digest: it is written into files that are read back later, and a value
+/// that is not a digest at all should be caught where it is parsed rather
+/// than compared. Lowercase because [`hex`] only ever emits lowercase, so an
+/// uppercase value did not come from here.
+pub fn valid_digest(s: &str) -> bool {
+    s.len() == 64
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_digest_is_recognised_by_its_shape() {
+        assert!(valid_digest(&sha256_hex(b"x")));
+        assert!(valid_digest(&tree_digest([("PKGBUILD", &b"x"[..])])));
+        for bad in ["", "abc", &"A".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            assert!(!valid_digest(bad), "{bad:?}");
+        }
+    }
 
     /// Digests of two fixed trees, pinned by value.
     ///

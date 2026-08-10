@@ -14,6 +14,7 @@ mod live;
 mod out;
 mod pacman;
 mod proc;
+mod push;
 mod review;
 mod search;
 mod setup;
@@ -146,8 +147,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Publish a maintained package to the AUR (queues while read-only)
-    Push { package: String },
+    /// Publish a maintained package to its upstream (queues while the AUR is
+    /// read-only).
+    ///
+    /// With no package, works the publish queue: one write probe, then every
+    /// queued package whose store tree is still the tree that was queued.
+    /// Exits 0 published (or already current), 10 queued/blocked/declined, and
+    /// 1 on the tamper alarm — a checksum that changed for a source of an
+    /// already-published version.
+    Push {
+        /// Package to publish; omit to work the publish queue
+        package: Option<String>,
+        /// Work the publish queue (the same as passing no package)
+        #[arg(long)]
+        retry: bool,
+        /// Skip the confirmation prompt (scripting)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Install the [dotfiles-aur] repo section and guard hooks
     Setup {
         /// Do the steps that need no root (repo dir, empty db, staging the
@@ -212,6 +229,11 @@ fn main() {
         }) => review::reject(&ctx, package, note.as_deref()),
         Some(Command::Build { ref packages }) => build::run(&ctx, packages),
         Some(Command::Sync { prune, json }) => sync::run(&ctx, prune, json),
+        Some(Command::Push {
+            ref package,
+            retry,
+            yes,
+        }) => push::run(&ctx, package.as_deref(), retry, yes),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {

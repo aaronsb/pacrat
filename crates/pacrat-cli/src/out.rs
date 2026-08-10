@@ -80,6 +80,22 @@ pub fn epoch_date(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// A unix timestamp as `YYYY-MM-DD HH:MM UTC`.
+///
+/// [`epoch_date`] with the time of day, for the publish queue: "queued
+/// 2026-08-10" and "probed 2026-08-10" are the same line twice, and the pair
+/// of facts a maintainer wants is how long an errand has waited and how
+/// recently it was asked about.
+pub fn epoch_stamp(secs: i64) -> String {
+    let day = secs.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02} UTC",
+        epoch_date(secs),
+        day / 3_600,
+        (day % 3_600) / 60
+    )
+}
+
 /// Make untrusted text safe to show a reviewer, and say how much was hidden.
 ///
 /// A PKGBUILD is an attacker's text. Printed raw it can lie to the eye it is
