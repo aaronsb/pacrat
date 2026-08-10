@@ -201,6 +201,44 @@ fn a_valid_grading_becomes_a_verdict() {
     assert_eq!(argv[5], COMMIT);
 }
 
+/// ADR-004's string form, across the real process boundary: `cmd` is one
+/// line, run by sh, and the subject arrives only through the `PACRAT_*`
+/// environment — which this grader turns into its whole report. The report
+/// being accepted is the proof the environment carried the right values.
+#[test]
+fn a_string_cmd_gets_the_subject_from_the_environment() {
+    let sb = Sandbox::new("envline");
+    let grader = sb.write(
+        "grader.sh",
+        "#!/bin/sh\n\
+         printf '{\"contract\":\"pacrat-grade/v1\",\"grader\":\"example-grader\",\
+         \"subject\":{\"package\":\"%s\",\"commit\":\"%s\"},\"grade\":0,\
+         \"meta\":{\"tree\":\"%s\"}}' \
+         \"$PACRAT_PACKAGE\" \"$PACRAT_COMMIT\" \"$PACRAT_TREE\"\n",
+    );
+    let mut perms = fs::metadata(&grader).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&grader, perms).unwrap();
+    sb.write(
+        "config/pacrat/config.toml",
+        &format!(
+            "[[graders]]\nname = \"example-grader\"\ncmd = \"{}\"\ntimeout_s = 30\n",
+            grader.display()
+        ),
+    );
+
+    let (code, text) = sb.grade();
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("PROCEED"), "{text}");
+    // The visibility rule for the string form: the line is printed as-is
+    // before it runs, because it is the invocation.
+    assert!(
+        text.contains(&format!("run       {}", grader.display())),
+        "the string cmd was not announced as written:\n{text}"
+    );
+    assert!(sb.cached(), "the string form uses the same cache");
+}
+
 #[test]
 fn a_grade_at_the_block_threshold_holds() {
     let (_sb, code, text) = run("block", &report("mdcat", COMMIT, 4, (0, 4)), 0, None);

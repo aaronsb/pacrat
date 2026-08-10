@@ -730,7 +730,7 @@ impl Updates {
             ));
             g.push(Line::from(vec![
                 theme::plain("    "),
-                theme::dim(format!("$ {}", grader.cmd.join(" "))),
+                theme::dim(format!("$ {}", grader.cmd)),
             ]));
         }
         g.push(Line::default());

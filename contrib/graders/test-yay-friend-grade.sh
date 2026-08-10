@@ -19,6 +19,11 @@
 
 set -uo pipefail
 
+# The adapter reads these when its flags are absent (ADR-004); anything
+# leaked in from the caller's environment would quietly answer for a case
+# that meant to test the flags.
+unset PACRAT_PACKAGE PACRAT_TREE PACRAT_COMMIT
+
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 adapter="$here/yay-friend-grade"
 [ -x "$adapter" ] || {
@@ -452,6 +457,64 @@ for bad in "--package hello --tree $tmp/tree" "--package hello --commit $COMMIT"
 	fi
 done
 
+# --- the environment subject (ADR-004) --------------------------------------
+
+# pacrat's string cmd form passes no flags at all: the subject arrives as
+# PACRAT_PACKAGE, PACRAT_TREE and PACRAT_COMMIT. Mirrors the flag-driven
+# cache hit above, and must land in the same place.
+if PACRAT_PACKAGE=hello PACRAT_TREE="$tmp/tree" PACRAT_COMMIT=$COMMIT run; then
+	ok "an env-only invocation grades (exit 0)"
+	check '.grade == 1 and .subject.package == "hello"' \
+		"the env subject reaches the grading"
+	check ".subject.commit == \"$COMMIT\"" \
+		"the env commit is reported back"
+	check '.subject.version == "2.12.1-1"' \
+		"the env tree is read for the version"
+else
+	no "an env-only invocation should grade" "$err"
+fi
+
+# Flags win when both are present — an argv-form config running under a
+# PACRAT_*-exporting pacrat must keep meaning exactly what it meant.
+if PACRAT_PACKAGE=absent PACRAT_TREE="$tmp/nothing" PACRAT_COMMIT=$OTHER \
+	run --package hello --tree "$tmp/tree" --commit "$COMMIT"; then
+	ok "flags win over the environment (exit 0)"
+	check '.subject.package == "hello"' "the flag package won"
+	check ".subject.commit == \"$COMMIT\"" "the flag commit won"
+	check '.subject.version == "2.12.1-1"' "the flag tree won"
+else
+	no "flags should win over the environment" "$err"
+fi
+
+# A partial mix: the environment fills exactly the pieces the flags left out.
+if PACRAT_COMMIT=$COMMIT run --package hello --tree "$tmp/tree"; then
+	ok "the environment fills in a missing flag"
+else
+	no "the environment should fill in a missing flag" "$err"
+fi
+
+# Env values walk through the same validation as flag values.
+if PACRAT_PACKAGE=../etc PACRAT_TREE="$tmp/tree" PACRAT_COMMIT=$COMMIT run; then
+	no "a hostile env package must be rejected" "$out"
+else
+	ok "a hostile env package is rejected"
+fi
+if PACRAT_PACKAGE=hello PACRAT_TREE="$tmp/tree" PACRAT_COMMIT=nothex run; then
+	no "a non-hex env commit must be rejected" "$out"
+else
+	ok "a non-hex env commit is rejected"
+fi
+
+# With neither flags nor environment, the refusal points at both spellings.
+if run; then
+	no "no subject at all must be rejected"
+else
+	case $err in
+	*PACRAT_PACKAGE*) ok "the missing-subject message names the env variable" ;;
+	*) no "the missing-subject message should name PACRAT_PACKAGE" "$err" ;;
+	esac
+fi
+
 # --- through pacrat itself --------------------------------------------------
 
 # Everything above proves the adapter emits what the contract describes. Only
@@ -500,6 +563,35 @@ else
 		ok "pacrat cached the grading"
 	else
 		no "pacrat did not cache the grading" "$e2e_out"
+	fi
+
+	# The string form the adapter's header now documents: no flags, the
+	# subject in the environment (ADR-004). Fresh config and state dirs, so
+	# nothing from the argv-form run above can answer for it.
+	mkdir -p "$e2e/config2/pacrat"
+	printf '[[graders]]\nname = "yay-friend"\ncmd = "%s"\ntimeout_s = 600\nscale = { min = 0, max = 4 }\n' \
+		"$adapter" >"$e2e/config2/pacrat/config.toml"
+
+	e2e_out=$(env HOME="$e2e" PATH="$PATH" \
+		DOTFILES_DIR="$e2e/store" XDG_CONFIG_HOME="$e2e/config2" \
+		XDG_STATE_HOME="$e2e/state2" XDG_DATA_HOME="$XDG_DATA_HOME" \
+		PACRAT_SETUP_GATE=off \
+		"$pacrat" grade hello 2>&1)
+	e2e_status=$?
+
+	if [ $e2e_status -eq 0 ]; then
+		ok "pacrat accepts the grading via the string cmd (exit 0)"
+	else
+		no "pacrat rejected the string-cmd grading (exit $e2e_status)" "$e2e_out"
+	fi
+	case $e2e_out in
+	*"grade 1 of 0-4"*) ok "the env subject produced the same grade" ;;
+	*) no "the string-cmd run did not read the grade" "$e2e_out" ;;
+	esac
+	if [ -f "$e2e/state2/pacrat/grades/hello/$COMMIT.yay-friend.json" ]; then
+		ok "pacrat cached the string-cmd grading"
+	else
+		no "pacrat did not cache the string-cmd grading" "$e2e_out"
 	fi
 fi
 

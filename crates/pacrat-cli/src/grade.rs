@@ -47,7 +47,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use pacrat_core::config::{Grader, MANUAL};
+use pacrat_core::config::{Cmd, Grader, ENV_COMMIT, ENV_PACKAGE, ENV_TREE, MANUAL};
 use pacrat_core::grading::{
     commit_matches, has_quorum, worst_grade, Contribution, GradeReport, Standing, Subject,
     CONTRACT, PACRAT_SCALE,
@@ -336,6 +336,16 @@ pub fn grade_tree(
     // Re-checked here rather than trusted from the caller: this value becomes
     // a path component of the cache, and this function now has two callers.
     let commit = check_commit(commit)?;
+    // The package name gets the same posture, for the same reasons plus one:
+    // it becomes the cache directory below, and a grader's environment
+    // (ADR-004) — the env is set from validated values, never from whatever
+    // a caller happened to hold.
+    if !valid_name(package) {
+        return Err(format!(
+            "{package:?} is not a package name — expected letters, digits, \
+             and @._+- (no leading hyphen or dot)"
+        ));
+    }
     let dir = cache_dir(package)?;
 
     // Gradings nobody asked for this run — a manual one, or a grader since
@@ -344,10 +354,16 @@ pub fn grade_tree(
     let others = other_cached(&dir, commit, digest, &ctx.config.graders, package);
     let no_graders = ctx.config.graders.is_empty() && others.is_empty();
 
+    // Absolutized once, here, so `{tree}` and PACRAT_TREE carry the same
+    // value — which the contract promises — and so an argv-form grader
+    // under a relative DOTFILES_DIR is not handed a path it cannot resolve
+    // (the contract also says the working directory is not to be relied on).
+    let tree = std::path::absolute(tree).unwrap_or_else(|_| tree.to_path_buf());
+    let tree_str = tree.to_string_lossy().into_owned();
     let subj = Subj {
         package,
         commit,
-        tree: &tree.to_string_lossy(),
+        tree: &tree_str,
         digest,
         refresh,
     };
@@ -480,17 +496,36 @@ fn grade_with(grader: &Grader, dir: &Path, subj: &Subj) -> Outcome {
     }
 
     let argv = grader.argv(subj.package, subj.tree, subj.commit);
-    let shown = argv
-        .iter()
-        .map(|a| shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let shown = match &grader.cmd {
+        Cmd::Argv(_) => argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" "),
+        // A string cmd is printed as it stands — it *is* the invocation,
+        // already in the shell's own spelling, so quoting it again would
+        // print a line that is not what runs. The config is the owner's own
+        // text, but every line pacrat prints takes the same de-escaping
+        // walk, so a pasted-in control character cannot paint the terminal.
+        Cmd::Line(line) => visible_line(line).0,
+    };
     // Announced before it runs: a grader may sit for its whole timeout, and
     // ADR-001's always-visible-calls rule has no exception for slow ones.
     say!("run       {shown}");
 
+    // The subject, in the environment — both cmd forms get it (ADR-004).
+    // Every value here is already validated: the package and commit were
+    // re-checked at `grade_tree`'s door, and the tree was absolutized there
+    // too — the same string the `{tree}` placeholder carries, which the
+    // contract promises.
+    let env = [
+        (ENV_PACKAGE, subj.package.to_string()),
+        (ENV_TREE, subj.tree.to_string()),
+        (ENV_COMMIT, subj.commit.to_string()),
+    ];
+
     let timeout = Duration::from_secs(grader.timeout_s);
-    let ran = match run_with_timeout(&argv, timeout) {
+    let ran = match run_with_timeout(&argv, timeout, &env) {
         Ok(ran) => ran,
         Err(reason) => {
             return Outcome::Failed {
@@ -750,10 +785,14 @@ fn no_graders_message(package: &str) -> String {
         "",
         "           [[graders]]",
         "           name = \"my-grader\"",
-        "           cmd = [\"/path/to/grader\",",
-        "                  \"--package\", \"{package}\", \"--tree\", \"{tree}\", \"--commit\", \"{commit}\"]",
+        "           cmd = \"/path/to/grader\"",
         "           timeout_s = 300",
         "           scale = { min = 0, max = 4 }",
+        "",
+        "       A string cmd runs through sh, and the subject arrives as",
+        "       PACRAT_PACKAGE, PACRAT_TREE and PACRAT_COMMIT in the environment.",
+        "       An argv array with {package}/{tree}/{commit} placeholders works",
+        "       too, exec-exact — see the spec.",
         "",
         "       or record your own reading:",
         "",
@@ -783,10 +822,15 @@ struct Ran {
 /// while we blocked waiting, and we would report the deadlock as its
 /// timeout. stdin is `/dev/null` so a grader that prompts fails fast instead
 /// of hanging on a terminal that is not listening.
-fn run_with_timeout(argv: &[String], timeout: Duration) -> Result<Ran, String> {
+fn run_with_timeout(
+    argv: &[String],
+    timeout: Duration,
+    env: &[(&str, String)],
+) -> Result<Ran, String> {
     let started = Instant::now();
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1423,7 +1467,7 @@ mod tests {
              for i in $(seq 1 4000); do printf '0123456789012345678901234567890123456789012345678901234567890123456789'; done\n\
              printf '\"}}'\n",
         );
-        let ran = run_with_timeout(&big, Duration::from_secs(30)).unwrap();
+        let ran = run_with_timeout(&big, Duration::from_secs(30), &[]).unwrap();
         assert_eq!(ran.code, Some(0));
         assert!(ran.stdout.len() > 200_000, "got {} bytes", ran.stdout.len());
         assert!(!ran.timed_out);
@@ -1439,7 +1483,7 @@ mod tests {
         let f = Fixture::new("slow");
         let slow = f.grader_argv("slow", "sleep 60 &\nsleep 60\n");
         let started = Instant::now();
-        let ran = run_with_timeout(&slow, Duration::from_millis(300)).unwrap();
+        let ran = run_with_timeout(&slow, Duration::from_millis(300), &[]).unwrap();
         assert!(ran.timed_out, "should have timed out");
         // Generous, but far under the 60s the grader wanted: the point is
         // that the wait is bounded by pacrat and not by the grader.
@@ -1455,6 +1499,7 @@ mod tests {
         let e = run_with_timeout(
             &["/nonexistent/pacrat-test-grader".to_string()],
             Duration::from_secs(5),
+            &[],
         )
         .unwrap_err();
         assert!(e.contains("could not run"), "unhelpful error: {e}");
@@ -1464,7 +1509,7 @@ mod tests {
     fn exit_codes_and_stderr_come_back() {
         let f = Fixture::new("angry");
         let angry = f.grader_argv("angry", "echo 'no api key' >&2\nexit 3\n");
-        let ran = run_with_timeout(&angry, Duration::from_secs(5)).unwrap();
+        let ran = run_with_timeout(&angry, Duration::from_secs(5), &[]).unwrap();
         assert_eq!(ran.code, Some(3));
         assert!(stderr_tail(&ran.stderr).contains("no api key"));
     }
@@ -1480,7 +1525,7 @@ mod tests {
         let mut argv = f.grader_argv("echoargs", "for a in \"$@\"; do echo \"[$a]\"; done\n");
         argv.push(hostile.to_string());
         argv.push("second arg".to_string());
-        let ran = run_with_timeout(&argv, Duration::from_secs(5)).unwrap();
+        let ran = run_with_timeout(&argv, Duration::from_secs(5), &[]).unwrap();
         let out = String::from_utf8_lossy(&ran.stdout);
         assert_eq!(
             out,
@@ -1503,7 +1548,7 @@ mod tests {
     fn grader(name: &str, cmd: Vec<String>) -> Grader {
         Grader {
             name: name.into(),
-            cmd,
+            cmd: Cmd::Argv(cmd),
             timeout_s: 30,
             scale: None,
         }
@@ -1769,7 +1814,7 @@ mod tests {
         )
         .replace('\n', " ");
         let argv = f.grader_argv("big", &format!("cat <<'J'\n{report}\nJ\n"));
-        let ran = run_with_timeout(&argv, Duration::from_secs(30)).unwrap();
+        let ran = run_with_timeout(&argv, Duration::from_secs(30), &[]).unwrap();
         assert!(ran.stdout.len() > 100_000);
         assert!(ran.stdout.len() <= STDOUT_LIMIT);
         assert_eq!(
@@ -1988,6 +2033,74 @@ mod tests {
         // The only proof that matters: the program ran once, not twice.
         assert_eq!(fs::read_to_string(&counter).unwrap(), "ran\n");
         assert!(ok_path(&f.dir, FULL, "abbrev").exists());
+    }
+
+    /// ADR-004: every grader spawn exports the subject as PACRAT_PACKAGE,
+    /// PACRAT_TREE and PACRAT_COMMIT — the argv form included. The stub
+    /// builds its whole report out of the environment, so the report being
+    /// *accepted* (`is_about` checks package and commit) plus the tree
+    /// echoed into meta is the proof the values arrived, and arrived right.
+    #[test]
+    fn the_subject_is_in_an_argv_form_graders_environment() {
+        let f = Fixture::new("envargv");
+        let (tree, digest) = f.tree("pkgname=mdcat\n");
+        let g = grader(
+            "stub",
+            f.grader_argv(
+                "stub",
+                "printf '{\"contract\":\"pacrat-grade/v1\",\"grader\":\"stub\",\
+                 \"subject\":{\"package\":\"%s\",\"commit\":\"%s\"},\"grade\":0,\
+                 \"meta\":{\"tree\":\"%s\"}}' \
+                 \"$PACRAT_PACKAGE\" \"$PACRAT_COMMIT\" \"$PACRAT_TREE\"\n",
+            ),
+        );
+        let tree_s = tree.to_string_lossy().into_owned();
+        match grade_with(&g, &f.dir, &f.subj(&digest, &tree_s)) {
+            Outcome::Graded { report, .. } => {
+                assert_eq!(report.subject.package, "mdcat");
+                assert_eq!(
+                    report.meta.get("tree").and_then(|v| v.as_str()),
+                    Some(tree_s.as_str()),
+                    "PACRAT_TREE was not the absolute tree path"
+                );
+            }
+            Outcome::Failed { reason, .. } => {
+                panic!("the env subject did not arrive: {reason}")
+            }
+        }
+    }
+
+    /// The string form, end to end: the line reaches sh verbatim — the
+    /// `$PACRAT_*` references in it are the shell's to expand, never
+    /// pacrat's — and the subject arrives through the environment alone.
+    /// Downstream is identical to the argv form: same checks, same cache.
+    #[test]
+    fn a_string_cmd_runs_through_sh_with_the_subject_in_its_environment() {
+        let f = Fixture::new("envline");
+        let (tree, digest) = f.tree("pkgname=mdcat\n");
+        let g = Grader {
+            name: "one-liner".into(),
+            cmd: Cmd::Line(
+                r#"printf '{"contract":"pacrat-grade/v1","grader":"one-liner","subject":{"package":"%s","commit":"%s"},"grade":0,"meta":{"tree":"%s"}}' "$PACRAT_PACKAGE" "$PACRAT_COMMIT" "$PACRAT_TREE""#
+                    .into(),
+            ),
+            timeout_s: 30,
+            scale: None,
+        };
+        assert_eq!(g.validate(), Ok(()));
+        let tree_s = tree.to_string_lossy().into_owned();
+        match grade_with(&g, &f.dir, &f.subj(&digest, &tree_s)) {
+            Outcome::Graded { report, .. } => {
+                assert_eq!(report.subject.package, "mdcat");
+                assert_eq!(
+                    report.meta.get("tree").and_then(|v| v.as_str()),
+                    Some(tree_s.as_str())
+                );
+            }
+            Outcome::Failed { reason, .. } => panic!("the string cmd failed: {reason}"),
+        }
+        // Cached under the same key, by the same rule, as the argv form.
+        assert!(ok_path(&f.dir, FULL, "one-liner").exists());
     }
 
     /// A grader that fails leaves a breadcrumb and no grading — and is asked

@@ -27,11 +27,11 @@ Anything the grader wants a human to *see* rather than *decide with* goes in
 pacrat runs the grader as a subprocess, once per (package, commit), with a
 working directory you must not rely on.
 
-**argv.** The `cmd` in config is an argv template, not a command line. Every
-element is substituted independently and handed straight to `exec`; there is
-no shell on this path, so a value containing spaces, quotes or `;` stays
-exactly one argument and there is nothing to escape for. Three placeholders
-are substituted anywhere they appear in an argument:
+**argv.** A `cmd` given as an array is an argv template, not a command line.
+Every element is substituted independently and handed straight to `exec`;
+there is no shell on this path, so a value containing spaces, quotes or `;`
+stays exactly one argument and there is nothing to escape for. Three
+placeholders are substituted anywhere they appear in an argument:
 
 | Placeholder | Value |
 |---|---|
@@ -46,6 +46,32 @@ You may declare the placeholders in any order and may omit ones you do not
 need, but a grader that ignores `{commit}` cannot honor the subject-match
 rule below, and a grader that ignores `{tree}` is not reading the bytes
 pacrat is asking about.
+
+**One-line string.** A `cmd` given as a string is one line of shell:
+
+```toml
+cmd = "sometool --json \"$PACRAT_TREE\" | jq '{contract: \"pacrat-grade/v1\", …}'"
+```
+
+It runs as `sh -c <string>`, **verbatim**. pacrat substitutes nothing into
+it — no placeholders, ever — which is what preserves the argv form's
+security argument: the string is authored wholly by the config's owner and
+edited by nobody, so there is still no injection surface. The subject
+arrives through the environment (below); the shell you asked for does your
+quoting. A string containing `{package}`, `{tree}` or `{commit}` is a
+config error naming the environment convention, so the argv form's ceremony
+cannot be shipped into a string that would grep a literal brace. Everything
+downstream is identical for both forms — same timeout, same cache, same
+report checks, same aggregation — and a string cmd is printed, as one
+neutered line, before it runs: it *is* the invocation, though a multi-line
+TOML string renders flattened rather than verbatim.
+
+One timeout caveat specific to the string form: pacrat kills the `sh` it
+spawned, but a pipeline's stages are that shell's children, and a stage
+that ignores its parent's death can outlive the timeout. For an
+LLM-backed one-liner that can mean a paid call continues after pacrat has
+already reported UNGRADED. Keep expensive work first in the pipe, or trap
+signals in the line itself.
 
 **stdout** carries exactly one JSON object: the report. Nothing else, ever —
 no progress lines, no banner, no trailing log. If your tool prints, redirect
@@ -70,8 +96,21 @@ exit means "I have no answer", and pacrat records the grader as having
 produced nothing. That is the correct way to decline — see *Refusing to
 answer*.
 
-**Environment** is inherited. Read your own config and cache from the usual
-XDG locations; pacrat does not pass any of its own state.
+**Environment** is inherited, plus the subject. pacrat exports three
+variables to every grader it spawns — both cmd forms, every run:
+
+| Variable | Value |
+|---|---|
+| `PACRAT_PACKAGE` | The package name — the same value as `{package}` |
+| `PACRAT_TREE` | Absolute path to the tree to read — the same value as `{tree}` |
+| `PACRAT_COMMIT` | The commit the grading will be filed under — the same value as `{commit}` |
+
+These names are contract surface: renaming one is a breaking change for
+every grader that reads it, and gets the same care as a change to the
+report shape. The environment and the placeholders always carry the same
+values, so a grader may read the subject from either spelling. Beyond
+those three, read your own config and cache from the usual XDG locations;
+pacrat passes none of its own state.
 
 ## The report
 
@@ -243,19 +282,38 @@ single most common way an otherwise working adapter fails.
   read whose digest no longer matches is a miss, so an edited tree is
   re-graded rather than served an answer about bytes that are gone. Your JSON
   is stored verbatim, unknown fields and all.
-- **Every call is visible.** The argv is printed, shell-quoted, before the
-  grader runs — before, because a slow grader may sit for its whole timeout
-  and a call nobody can see is a call nobody can interrupt. There is no
-  hidden invocation and no silent retry.
+- **Every call is visible.** The invocation is printed before the grader
+  runs — the argv form shell-quoted, the string form as written, because
+  the string *is* the invocation — before, because a slow grader may sit
+  for its whole timeout and a call nobody can see is a call nobody can
+  interrupt. There is no hidden invocation and no silent retry.
 - **Only failures pacrat can explain are recorded as failures**, with their
   reason, so a later run can say why you contributed nothing without running
   you again.
 
 ## Configuration
 
-A host adds a grader to `~/.config/pacrat/config.toml`:
+A host adds a grader to `~/.config/pacrat/config.toml`. The string form
+covers both ends of the spectrum — a tool built for pacrat, which only
+needs naming, and a tool that has never heard of pacrat, shaped into the
+contract by a pipe — and that contrast is the point of the form:
 
 ```toml
+# A tool that emits pacrat-grade/v1 itself, reading the PACRAT_* subject:
+[[graders]]
+name = "yay-friend"
+cmd = "yay-friend grade"
+timeout_s = 600
+
+# A tool that does not know pacrat exists, reshaped on its way out:
+[[graders]]
+name = "sometool"
+cmd = "sometool --json \"$PACRAT_TREE\" | jq '{contract: \"pacrat-grade/v1\", grader: \"sometool\", subject: {package: env.PACRAT_PACKAGE, commit: env.PACRAT_COMMIT}, grade: .risk}'"
+timeout_s = 300
+scale = { min = 0, max = 4 }
+
+# The argv form remains, for exec-exact argument boundaries — no shell,
+# placeholders substituted per element:
 [[graders]]
 name = "example-grader"
 cmd = ["/usr/bin/example-grader", "--package", "{package}",
@@ -268,7 +326,9 @@ scale = { min = 0, max = 4 }
   cache: `[A-Za-z0-9_.+-]`, no leading `.` or `-`, not `manual` (reserved for
   a human's own reading), not `failed` or `*.failed` (those name the cache's
   failure records). Unique across graders, because it is the cache key.
-- **`cmd`** — the argv template.
+- **`cmd`** — one string (run by `sh -c`, verbatim, subject in the
+  environment) or an argv template (substituted per element, exec'd, no
+  shell).
 - **`timeout_s`** — default 300. Raise it for anything that calls a model.
   `0` is a config error, not "no limit": a grader killed before it ran would
   turn every package into a hold.
@@ -285,9 +345,13 @@ always answers.
 
 ## Example producers
 
+- `yay-friend grade` — [yay-friend](https://github.com/aaronsb/yay-friend)
+  is growing a native subcommand that emits this contract itself, reading
+  the `PACRAT_*` subject. Where the installed binary has it, `pacrat setup`
+  registers `cmd = "yay-friend grade"` and no adapter is involved.
 - `contrib/graders/yay-friend-grade` — an adapter that translates
-  [yay-friend](https://github.com/aaronsb/yay-friend)'s analysis cache into
-  this contract. It lives in `contrib/` rather than in pacrat because it is
-  yay-friend's side of the boundary: pacrat's own code contains nothing
-  specific to it, and the day yay-friend emits `pacrat-grade/v1` itself, the
-  adapter is deleted and nothing else changes.
+  yay-friend's analysis cache into this contract, for installed binaries
+  that predate the native subcommand. It lives in `contrib/` rather than in
+  pacrat because it is yay-friend's side of the boundary: pacrat's own code
+  contains nothing specific to it, and once every host's yay-friend speaks
+  the contract natively, the adapter is deleted and nothing else changes.

@@ -23,10 +23,15 @@
 #
 #     [[graders]]
 #     name = "yay-friend"
-#     cmd = ["/path/to/contrib/graders/yay-friend-grade",
-#            "--package", "{package}", "--tree", "{tree}", "--commit", "{commit}"]
+#     cmd = "/path/to/contrib/graders/yay-friend-grade"
 #     timeout_s = 600
 #     scale = { min = 0, max = 4 }
+#
+# No arguments: pacrat exports the subject as PACRAT_PACKAGE, PACRAT_TREE and
+# PACRAT_COMMIT (ADR-004), and this adapter reads them. The
+# --package/--tree/--commit flags remain for running it by hand and for the
+# argv-array form (`cmd = [..., "--package", "{package}", ...]`); a flag wins
+# over its environment variable when both are present.
 #
 # `timeout_s` is doubled from pacrat's default because the miss path calls an
 # LLM.
@@ -77,6 +82,10 @@ usage() {
 
 		Emits a pacrat-grade/v1 grading on stdout. Diagnostics go to stderr;
 		any failure is a nonzero exit, which pacrat records as UNGRADED.
+
+		Run by pacrat, the flags may be omitted: the subject is read from
+		PACRAT_PACKAGE, PACRAT_TREE and PACRAT_COMMIT in the environment.
+		A flag wins over its environment variable when both are present.
 	EOF
 }
 
@@ -111,9 +120,16 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-[ -n "$package" ] || die "--package is required"
-[ -n "$tree" ] || die "--tree is required"
-[ -n "$commit" ] || die "--commit is required"
+# The subject from the environment (ADR-004), for whichever pieces the flags
+# did not set. Flags win: they are the more deliberate spelling, and every
+# existing argv-form config keeps meaning exactly what it meant.
+[ -n "$package" ] || package=${PACRAT_PACKAGE-}
+[ -n "$tree" ] || tree=${PACRAT_TREE-}
+[ -n "$commit" ] || commit=${PACRAT_COMMIT-}
+
+[ -n "$package" ] || die "--package is required (or PACRAT_PACKAGE in the environment)"
+[ -n "$tree" ] || die "--tree is required (or PACRAT_TREE in the environment)"
+[ -n "$commit" ] || die "--commit is required (or PACRAT_COMMIT in the environment)"
 
 # Both of these become path components below. pacrat validates them too, but
 # an adapter that only works when its caller is careful is an adapter that
