@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+#
+# yay-friend → pacrat-grade/v1
+#
+# A shim on yay-friend's side of the boundary, and nothing else.
+#
+# pacrat's interface is the contract, specified tool-neutrally in
+# docs/grading-contract.md: any program that emits pacrat-grade/v1 is a
+# first-class grader, and pacrat's own code contains nothing about yay-friend
+# or about any other analyzer. This file exists only because yay-friend does
+# not emit the contract yet. It already does the work — it reads a PKGBUILD
+# with an LLM and files the answer under the AUR commit hash it read, which
+# is the same idempotency model the contract asks for — so all that is
+# missing is the shape.
+#
+# It is therefore deprecated by construction. The day yay-friend emits
+# pacrat-grade/v1 natively, delete this file and point `cmd` at yay-friend
+# itself; nothing on pacrat's side changes, because there is nothing on
+# pacrat's side to change. Do not fix a pacrat problem in here, and do not
+# fix a yay-friend problem in pacrat.
+#
+# Configure it in ~/.config/pacrat/config.toml:
+#
+#     [[graders]]
+#     name = "yay-friend"
+#     cmd = ["/path/to/contrib/graders/yay-friend-grade",
+#            "--package", "{package}", "--tree", "{tree}", "--commit", "{commit}"]
+#     timeout_s = 600
+#     scale = { min = 0, max = 4 }
+#
+# `timeout_s` is doubled from pacrat's default because the miss path calls an
+# LLM.
+#
+# `scale` pins what *this file* declares, which is not the same protection
+# pacrat's scale pin usually buys. The scale below is hardcoded 0-4, so a
+# change in yay-friend can never reach pacrat as a changed `scale` field —
+# what the pin catches is an edit to this adapter. The defense against
+# yay-friend moving its own units lives here instead: an entropy outside 0-4
+# is refused rather than translated, so a hypothetical 70-of-100 becomes
+# UNGRADED and not a mild WARN. Both halves are needed; neither replaces the
+# other.
+#
+# Dependency: jq (extra). One, on purpose — the translation is a JSON
+# reshape, and doing it in sh would mean parsing JSON in sh.
+#
+# ---------------------------------------------------------------------------
+# Which commit gets graded, and why the cache-hit path is the real one
+#
+# yay-friend's cache is keyed by commit, but `yay-friend analyze <pkg>`
+# always fetches *AUR HEAD* — it has no --commit. So on a cache miss this
+# adapter analyzes HEAD and then checks whether the entry that appeared is
+# the commit pacrat asked about. If HEAD has moved on, it has not: the
+# analysis is true about a tree nobody asked for, and emitting it under the
+# requested commit would file a grading of one tree under the name of
+# another. That is refused — exit nonzero, which pacrat reads as UNGRADED,
+# which holds.
+#
+# The cache-hit path is therefore the reliable one, and it is the one
+# pacrat's update loop actually takes: grade after fetch, when the candidate
+# commit *is* the HEAD yay-friend just looked at (or was, when its cache
+# entry was written).
+#
+# (yay-friend also files entries under `fallback-<pkg>-<version>` when it
+# could not get a commit at all. Those are unreachable here by construction:
+# pacrat only ever asks about a hex commit, and this refuses anything else.)
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+readonly ADAPTER='yay-friend-grade/v1'
+readonly GRADER='yay-friend'
+readonly MAX_FINDINGS=25
+
+usage() {
+	cat <<-'EOF'
+		usage: yay-friend-grade --package <name> --tree <dir> --commit <hash>
+
+		Emits a pacrat-grade/v1 grading on stdout. Diagnostics go to stderr;
+		any failure is a nonzero exit, which pacrat records as UNGRADED.
+	EOF
+}
+
+# Everything that is not the grading goes to stderr. pacrat parses stdout as
+# JSON and nothing else, so a stray progress line here is a failed grading.
+note() { printf 'yay-friend-grade: %s\n' "$*" >&2; }
+die() {
+	note "$*"
+	exit 1
+}
+
+package='' tree='' commit=''
+while [ $# -gt 0 ]; do
+	case $1 in
+	--package)
+		package=${2-}
+		shift 2 || die "--package needs a value"
+		;;
+	--tree)
+		tree=${2-}
+		shift 2 || die "--tree needs a value"
+		;;
+	--commit)
+		commit=${2-}
+		shift 2 || die "--commit needs a value"
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*) die "unknown argument $1 (see --help)" ;;
+	esac
+done
+
+[ -n "$package" ] || die "--package is required"
+[ -n "$tree" ] || die "--tree is required"
+[ -n "$commit" ] || die "--commit is required"
+
+# Both of these become path components below. pacrat validates them too, but
+# an adapter that only works when its caller is careful is an adapter that
+# breaks the first time it is run by hand.
+case $package in
+-* | .* | *[!A-Za-z0-9@._+-]*) die "$package is not a package name" ;;
+esac
+case $commit in
+*[!0-9a-fA-F]*) die "$commit is not a commit hash" ;;
+esac
+[ ${#commit} -ge 7 ] || die "commit $commit is too short to name a tree"
+# Sixty-four admits SHA-256 object ids, which git is migrating toward.
+# Bounded at all so an impossible commit is refused before the miss path
+# spends a real analyze — and a paid provider call — discovering that no
+# such tree exists.
+[ ${#commit} -le 64 ] || die "commit $commit is longer than any git object id"
+
+command -v jq >/dev/null 2>&1 ||
+	die "jq is required (pacman -S jq) — this adapter is a JSON translation"
+
+cache_root="${XDG_DATA_HOME:-$HOME/.local/share}/yay-friend/cache"
+# Lowercased for the filename: git and yay-friend both spell object ids in
+# lowercase, so an uppercase request would miss a cache entry that is
+# sitting right there — and then spend a real analyze discovering it. The
+# grading still reports the commit as pacrat spelled it; pacrat compares
+# case-insensitively, so echoing the request back is the faithful answer.
+commit_key=${commit,,}
+entry="$cache_root/$package/$commit_key.json"
+cached=true
+
+if [ ! -f "$entry" ]; then
+	cached=false
+	# Only needed on this path: a cache hit is a file read, and demanding
+	# the binary for it would fail a perfectly answerable question.
+	command -v yay-friend >/dev/null 2>&1 ||
+		die "no cached analysis at $entry, and yay-friend is not installed"
+	note "no cached analysis for $package@${commit:0:12} — analyzing AUR HEAD"
+	# stdout redirected: yay-friend's own report must not reach pacrat.
+	yay-friend analyze "$package" --no-spinner >&2 ||
+		die "yay-friend analyze $package failed"
+	[ -f "$entry" ] || die \
+		"yay-friend analyzed AUR HEAD for $package, which is not $commit — \
+refusing to grade one tree under another tree's name"
+fi
+
+# The path says which commit this is; the file says so too, and they can
+# disagree — a copied or hand-edited cache entry is a grading of something
+# else wearing the right filename.
+meta_commit=$(jq -r '.cache_metadata.commit_hash // ""' -- "$entry") ||
+	die "$entry is not readable JSON"
+meta_package=$(jq -r '.cache_metadata.package_name // .analysis.package_name // ""' -- "$entry")
+
+[ "$meta_package" = "$package" ] ||
+	die "$entry is an analysis of ${meta_package:-nothing}, not $package"
+
+# Prefix comparison, like pacrat's own: either side may be abbreviated,
+# seven is the shortest prefix git will abbreviate to, and hex case is not
+# meaningful — pacrat's `commit_matches` compares case-insensitively, and an
+# adapter that did not would refuse entries pacrat would have accepted.
+lower_meta=${meta_commit,,}
+lower_commit=${commit,,}
+n=${#lower_meta}
+if [ ${#lower_commit} -lt "$n" ]; then
+	n=${#lower_commit}
+fi
+if [ "$n" -lt 7 ] || [ "${lower_meta:0:$n}" != "${lower_commit:0:$n}" ]; then
+	die "$entry records commit ${meta_commit:-none}, not $commit"
+fi
+
+# yay-friend does not record the package version, so take it from the tree
+# pacrat handed us — that is what {tree} is for. Best effort: subject.version
+# is optional in the contract, and a missing .SRCINFO is not a grading
+# failure.
+tree_version() {
+	local srcinfo="$1/.SRCINFO" key sep value epoch='' pkgver='' pkgrel=''
+	[ -r "$srcinfo" ] || return 0
+	while read -r key sep value; do
+		[ "$sep" = "=" ] || continue
+		case $key in
+		epoch) [ -n "$epoch" ] || epoch=$value ;;
+		pkgver) [ -n "$pkgver" ] || pkgver=$value ;;
+		pkgrel) [ -n "$pkgrel" ] || pkgrel=$value ;;
+		esac
+	done <"$srcinfo"
+	[ -n "$pkgver" ] || return 0
+	printf '%s%s%s' "${epoch:+$epoch:}" "$pkgver" "${pkgrel:+-$pkgrel}"
+}
+version=$(tree_version "$tree" || true)
+
+# Built into a variable first: a jq program that dies partway through would
+# otherwise have already written half a grading to stdout, and half a
+# grading parses as garbage rather than as the failure it is.
+grading=$(
+	jq -e \
+		--arg package "$package" \
+		--arg commit "$commit" \
+		--arg version "$version" \
+		--arg adapter "$ADAPTER" \
+		--arg grader "$GRADER" \
+		--argjson cached "$cached" \
+		--argjson max_findings "$MAX_FINDINGS" '
+	# yay-friend levels are 0-4 in the cache (a Go enum), but its own prompt
+	# asks the model for MINIMAL..CRITICAL, so both spellings are accepted.
+	def level:
+		if . == null then null
+		elif type == "number" then floor
+		elif type == "string" then
+			{"MINIMAL":0,"LOW":1,"MODERATE":2,"HIGH":3,"CRITICAL":4}[ascii_upcase]
+		else null end;
+	# The *grade* must be a level yay-friend could actually have produced.
+	# Anything else is refused, never squeezed into range: clamping a
+	# negative to 0 would turn a broken analysis into a PROCEED, and
+	# clamping a 70 to 4 would invent a BLOCK nobody reported. Both are the
+	# approximation the contract says to refuse.
+	def place: if type == "number" and . >= 0 and . <= 4 then floor else null end;
+	# Finding levels are advisory and clamped instead, deliberately: they do
+	# not move the grade, and a level outside 0-255 would otherwise be
+	# rejected by the pacrat parser and cost a whole grading over one
+	# annotation. (No apostrophes in here: the jq program is inside a
+	# single-quoted shell string.)
+	def clamp: if . == null then null elif . < 0 then 0 elif . > 4 then 4 else . end;
+	def oneline:
+		(. // "") | tostring
+		# Whitespace first, so a newline becomes a space and does not weld
+		# two words together when the control strip below removes it.
+		| gsub("\\s+"; " ")
+		# Then every remaining control character, by code point rather than
+		# by regex class: a bracket expression written with backslash-u is
+		# a set of literal letters to Oniguruma, which silently eats text.
+		# pacrat neuters these too, but a grader that leans on its reader
+		# to sanitize is a grader that breaks the next reader.
+		| explode | map(select(. > 31 and . != 127)) | implode
+		| sub("^ ";"") | sub(" $";"");
+	def cap($n): if (. | length) > $n then (.[:$n - 1] + "…") else . end;
+
+	.analysis as $a
+	| ($a.overall_entropy | level | place) as $grade
+	| if $grade == null then
+		error("overall_entropy is \($a.overall_entropy | tojson), which is not a 0-4 level")
+	  else . end
+	| {
+		contract: "pacrat-grade/v1",
+		grader: $grader,
+		subject: ({ package: $package, commit: $commit }
+			+ (if $version == "" then {} else { version: $version } end)),
+		grade: $grade,
+		# Pinned, not inherited: this adapter promises 0-4 and rejects
+		# anything it cannot express on it, above.
+		scale: { min: 0, max: 4 },
+		findings: [
+			($a.findings // [])[:$max_findings][]
+			# entropy is the axis the grade is on; severity is the
+			# fallback for an entry that only carries the other one.
+			| (((.entropy | level | clamp) // (.severity | level | clamp)) // 0) as $level
+			| ([(.type | oneline), (.description | oneline)]
+				| map(select(. != "")) | join(": ") | cap(240)) as $title
+			| ((.file | oneline) as $file
+				| ((if (.line_number | type) == "number" then .line_number else 0 end) | floor) as $line
+				| if $line > 0 then { span: "\(if $file == "" then "PKGBUILD" else $file end):\($line)" }
+				  elif $file != "" then { span: $file }
+				  else {} end) as $span
+			| { level: $level,
+				title: (if $title == "" then "(no description)" else $title end) } + $span
+		],
+		meta: ({ adapter: $adapter,
+			 cached: $cached,
+			 provider: ($a.provider | oneline) }
+			# "note" is the one meta key pacrat prints, so the
+			# one-line summary from yay-friend goes there.
+			+ (($a.summary | oneline | cap(200)) as $s
+				| if $s == "" then {} else { note: $s } end)
+			+ (($a.recommendation | oneline) as $r
+				| if $r == "" then {} else { recommendation: $r } end)
+			+ ((.cache_metadata.yay_friend_version | oneline) as $v
+				| if $v == "" then {} else { yay_friend_version: $v } end))
+	}' -- "$entry"
+) || die "$entry does not translate to a grading"
+
+printf '%s\n' "$grading"

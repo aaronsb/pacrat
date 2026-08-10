@@ -102,8 +102,13 @@ pinned repo-first is left open.
 
 ### Grading contract (pacrat-grade/v1)
 
-PROCEED/WARN/BLOCK is **pacrat's data**. Graders — yay-friend, future tools,
-or a human via `pacrat grade --grade N --note …` — return only:
+> The normative specification is `docs/grading-contract.md`, which is
+> tool-neutral and implementable without reference to any particular
+> analyzer. This section records the decision and the reasoning; where the
+> two disagree about a detail, the spec is what pacrat implements.
+
+PROCEED/WARN/BLOCK is **pacrat's data**. Graders — any tool that speaks the
+contract, or a human via `pacrat grade --grade N --note …` — return only:
 
 ```json
 { "contract": "pacrat-grade/v1",

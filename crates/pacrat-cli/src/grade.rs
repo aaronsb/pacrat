@@ -52,12 +52,12 @@ use pacrat_core::grading::{
     commit_matches, has_quorum, worst_grade, Contribution, GradeReport, Standing, Subject,
     CONTRACT, PACRAT_SCALE,
 };
+use pacrat_core::pkg::valid_name;
 use pacrat_core::{Thresholds, Verdict};
 
 use crate::ctx::{self, Ctx};
 use crate::fstree;
 use crate::out::{shell_quote, truncate, visible_line};
-use crate::vendor::valid_name;
 use crate::HELD;
 
 /// How often the runner asks whether the child has exited. Short enough that
@@ -664,12 +664,16 @@ fn no_graders_message(package: &str) -> String {
     let lines = [
         "no graders configured, and no --grade given — there is nothing to run.",
         "",
-        "       Configure one in ~/.config/pacrat/config.toml:",
+        "       A grader is any program that prints a pacrat-grade/v1 report on",
+        "       stdout — docs/grading-contract.md is the spec, contrib/graders/",
+        "       has adapters. Configure one in ~/.config/pacrat/config.toml:",
         "",
         "           [[graders]]",
-        "           name = \"yay-friend\"",
-        "           cmd = [\"yay-friend\", \"--format\", \"pacrat\", \"--tree\", \"{tree}\", \"{package}\"]",
+        "           name = \"my-grader\"",
+        "           cmd = [\"/path/to/grader\",",
+        "                  \"--package\", \"{package}\", \"--tree\", \"{tree}\", \"--commit\", \"{commit}\"]",
         "           timeout_s = 300",
+        "           scale = { min = 0, max = 4 }",
         "",
         "       or record your own reading:",
         "",

@@ -49,6 +49,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use pacrat_core::grading::commit_matches;
+use pacrat_core::pkg::valid_name;
 use pacrat_core::sources::{valid_commit, SourceEntry};
 use pacrat_core::Verdict;
 
@@ -58,7 +59,7 @@ use crate::grade;
 use crate::out::{list_preview, shell_quote, short_hash, truncate, visible, visible_line};
 use crate::proc;
 use crate::updates;
-use crate::vendor::{self, valid_name};
+use crate::vendor;
 use crate::HELD;
 
 /// Wall-clock bound on the candidate clone. Longer than `updates`' probe,

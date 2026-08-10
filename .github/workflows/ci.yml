@@ -23,3 +23,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      # After `test`, deliberately: `cargo test` has built the debug binary
+      # by then, so the harness finds it and its last stage drives a real
+      # `pacrat grade` through the adapter. Run before it, that stage would
+      # silently skip. jq and python3 are both on ubuntu-latest; yay-friend
+      # is not, and is not needed — the harness fakes it.
+      - name: contrib graders
+        run: ./contrib/graders/test-yay-friend-grade.sh

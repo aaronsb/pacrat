@@ -1,7 +1,7 @@
 //! `pacrat status` — the CLI twin of the overview screen: store, ledger
 //! counts, per-host tracked sizes, and this host's drift per source.
 
-use pacrat_core::pkg::{drift, Source};
+use pacrat_core::pkg::Source;
 use pacrat_core::sources::Role;
 
 use crate::ctx::Ctx;
@@ -53,8 +53,8 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
         let marker = if *host == ctx.host { "*" } else { " " };
         let sizes: Vec<String> = Source::ALL
             .iter()
-            .map(|s| format!("{} {}", s.name(), ctx.tracked(host, *s).len()))
-            .collect();
+            .map(|s| Ok(format!("{} {}", s.name(), ctx.tracked(host, *s)?.len())))
+            .collect::<Result<_, String>>()?;
         println!(" {marker}{host:<10} {}", sizes.join(" · "));
     }
 
@@ -69,23 +69,21 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
 
     println!();
     println!("drift on {} (tracked vs installed)", ctx.host);
-    for source in Source::ALL {
-        let tracked = ctx.tracked(&ctx.host, source);
-        let installed = live::installed(source)?;
-        let d = drift(&tracked, &installed);
+    for sd in live::host_drift(ctx)? {
+        let d = &sd.drift;
         if d.in_sync() {
             println!(
                 "  {:<8} in sync ({} packages)",
-                source.name(),
-                tracked.len()
+                sd.source.name(),
+                sd.tracked.len()
             );
         } else {
             println!(
                 "  {:<8} {} missing · {} extra   [{}]",
-                source.name(),
+                sd.source.name(),
                 d.missing.len(),
                 d.extra.len(),
-                live::query_argv(source)
+                live::query_argv(sd.source)
             );
             if !d.missing.is_empty() {
                 println!("           missing: {}", list_preview(&d.missing, 12));
@@ -95,5 +93,8 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
             }
         }
     }
+    println!();
+    println!("       `pacrat sync` turns that into commands that move this host toward");
+    println!("       the store — it prints them and runs none of them");
     Ok(())
 }
