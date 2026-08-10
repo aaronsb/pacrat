@@ -196,7 +196,7 @@ fn interview(ctx: &Ctx, answers: &Interview) -> Result<(), String> {
         None => config.update_mode,
     };
 
-    grader_question(&mut config, answers, tty)?;
+    grader_question(ctx, &mut config, answers, tty)?;
 
     let path = crate::config::save(&config)?;
     println!(
@@ -207,22 +207,31 @@ fn interview(ctx: &Ctx, answers: &Interview) -> Result<(), String> {
     Ok(())
 }
 
-/// The one structured question. Existing graders are never rewritten or
-/// removed here — the interview only ever *adds* the contrib adapter, so a
-/// hand-tuned entry survives every re-run.
-fn grader_question(config: &mut Config, answers: &Interview, tty: bool) -> Result<(), String> {
+/// The one structured question. Graders other than yay-friend are never
+/// touched here, and even yay-friend's own entry is only ever changed with
+/// a yes at a terminal — a hand-tuned entry survives every re-run.
+fn grader_question(
+    ctx: &Ctx,
+    config: &mut Config,
+    answers: &Interview,
+    tty: bool,
+) -> Result<(), String> {
     if answers.no_graders {
         println!("grader  --no-graders — registering none.");
         return Ok(());
     }
-    if config.graders.iter().any(|g| g.name == "yay-friend") {
-        println!("grader  yay-friend is already registered — leaving it as it is.");
-        return Ok(());
+    if let Some(i) = config.graders.iter().position(|g| g.name == "yay-friend") {
+        return modernize_question(config, i, tty);
     }
     if answers.register_yay_friend {
-        let adapter = adapter_path().ok_or(
-            "--register-yay-friend: contrib/graders/yay-friend-grade was not found near \
-             this binary. Run `pacrat setup` at a terminal to type the path, or copy the \
+        if probe_native() {
+            register_native(config);
+            return Ok(());
+        }
+        let adapter = adapter_path(ctx).ok_or(
+            "--register-yay-friend: the installed yay-friend has no `grade` subcommand, \
+             and contrib/graders/yay-friend-grade was not found near this binary or in \
+             the store. Run `pacrat setup` at a terminal to type the path, or copy the \
              [[graders]] entry from the adapter's own header into the config file.",
         )?;
         register(config, &adapter)?;
@@ -233,24 +242,32 @@ fn grader_question(config: &mut Config, answers: &Interview, tty: bool) -> Resul
         return Ok(());
     }
 
-    let absent: Vec<&str> = ["yay-friend", "jq"]
-        .into_iter()
-        .filter(|p| !on_path(p))
-        .collect();
-    if !absent.is_empty() {
-        println!(
-            "grader  {} not on PATH — skipping grader registration. The contrib",
-            absent.join(" and ")
-        );
-        println!("        adapter is in contrib/graders/ when you want it.");
+    if !on_path("yay-friend") {
+        println!("grader  yay-friend is not on PATH — skipping grader registration. The");
+        println!("        contrib adapter is in contrib/graders/ when you want it.");
+        return Ok(());
+    }
+    if probe_native() {
+        println!("grader  this yay-friend emits pacrat-grade/v1 itself (`yay-friend grade`).");
+        if ask_choice("        register it as a grader?", &["y", "n"], "n")? == "y" {
+            register_native(config);
+        } else {
+            println!("grader  skipped — `pacrat setup` offers again any time.");
+        }
+        return Ok(());
+    }
+    if !on_path("jq") {
+        println!("grader  this yay-friend has no `grade` subcommand, and jq is not on PATH");
+        println!("        (the contrib adapter is a jq translation) — skipping grader");
+        println!("        registration. pacman -S jq, then `pacrat setup` offers again.");
         return Ok(());
     }
 
-    let adapter = match adapter_path() {
+    let adapter = match adapter_path(ctx) {
         Some(path) => path,
         None => {
             println!("grader  yay-friend and jq are on PATH, but the contrib adapter was not");
-            println!("        found near this binary.");
+            println!("        found near this binary or in the store.");
             let typed = ask_line("        path to yay-friend-grade (empty to skip): ")?;
             if typed.is_empty() {
                 println!("grader  skipped.");
@@ -265,8 +282,9 @@ fn grader_question(config: &mut Config, answers: &Interview, tty: bool) -> Resul
         }
     };
 
-    println!("grader  yay-friend and jq are on PATH, and the contrib adapter is at");
+    println!("grader  this yay-friend has no `grade` subcommand; the contrib adapter at");
     println!("        {}", adapter.display());
+    println!("        translates its analysis cache to pacrat-grade/v1.");
     if ask_choice("        register it as a grader?", &["y", "n"], "n")? == "y" {
         register(config, &adapter)?;
     } else {
@@ -275,24 +293,114 @@ fn grader_question(config: &mut Config, answers: &Interview, tty: bool) -> Resul
     Ok(())
 }
 
-/// The `[[graders]]` entry the adapter's own header documents: absolute
-/// path, the three placeholders, a 600s timeout (the miss path calls an
-/// LLM), and the 0-4 scale pin.
+/// An existing yay-friend entry. An argv-form one is offered the ADR-004
+/// rewrite — one string, subject in the environment — at a terminal, and
+/// only that: declining leaves it byte-for-byte as it was, a string-form
+/// one has nothing to modernize, and no other grader is ever considered.
+fn modernize_question(config: &mut Config, i: usize, tty: bool) -> Result<(), String> {
+    if !tty || matches!(config.graders[i].cmd, Cmd::Line(_)) {
+        println!("grader  yay-friend is already registered — leaving it as it is.");
+        return Ok(());
+    }
+    let native = probe_native();
+    let Some(updated) = modernized(&config.graders[i], native) else {
+        println!("grader  yay-friend is already registered — leaving it as it is.");
+        return Ok(());
+    };
+    println!("grader  yay-friend is registered in the argv form. Since ADR-004 the");
+    println!("        subject arrives as PACRAT_* environment variables, so one line");
+    println!("        is enough:");
+    println!("          cmd = \"{}\"", updated.cmd);
+    if native && config.graders[i].scale.is_some() {
+        println!("        (the native subcommand declares its own scale, so the pin");
+        println!("        would be dropped)");
+    }
+    if ask_choice("        rewrite it to the string form?", &["y", "n"], "n")? == "y" {
+        config.graders[i] = updated;
+        println!("grader  rewrote yay-friend to the string form.");
+    } else {
+        println!("grader  left as it is.");
+    }
+    Ok(())
+}
+
+/// The string-form rewrite of an argv-form yay-friend entry: the native
+/// subcommand when the installed binary has it, the adapter the entry
+/// already points at otherwise. `None` when there is nothing to rewrite.
+/// The entry's own timeout survives either way; the scale pin survives the
+/// adapter rewrite (it still pins the same file) and is dropped for the
+/// native one, whose report declares its own scale.
+fn modernized(g: &Grader, native: bool) -> Option<Grader> {
+    let Cmd::Argv(argv) = &g.cmd else { return None };
+    let cmd = if native {
+        Cmd::Line(NATIVE_CMD.into())
+    } else {
+        let program = argv.first().filter(|p| !p.is_empty())?;
+        Cmd::Line(crate::out::shell_quote(program))
+    };
+    Some(Grader {
+        name: g.name.clone(),
+        cmd,
+        timeout_s: g.timeout_s,
+        scale: if native { None } else { g.scale },
+    })
+}
+
+/// The one line the whole feature was named for: yay-friend speaking the
+/// contract itself, subject from the environment, adapter not involved.
+const NATIVE_CMD: &str = "yay-friend grade";
+
+/// Does the installed yay-friend emit the contract itself? `yay-friend
+/// grade --help` exits 0 exactly when the subcommand exists — cobra fails
+/// nonzero on an unknown one — so the probe reads nothing, only the exit
+/// status. Announced before it runs, like every external call.
+fn probe_native() -> bool {
+    if !on_path("yay-friend") {
+        return false;
+    }
+    println!("grader  probing: yay-friend grade --help");
+    subcommand_exists("yay-friend")
+}
+
+/// The probe itself, on any program, so the stubs in the tests can answer
+/// both ways without a yay-friend installed.
+fn subcommand_exists(program: &str) -> bool {
+    Command::new(program)
+        .args(["grade", "--help"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Register the native subcommand (ADR-004, as amended): one string, no
+/// scale pin — the report declares its scale, and pinning what the tool
+/// owns is the tool's business now. The timeout stays 600s because a cache
+/// miss still calls a model.
+fn register_native(config: &mut Config) {
+    config.graders.push(Grader {
+        name: "yay-friend".into(),
+        cmd: Cmd::Line(NATIVE_CMD.into()),
+        timeout_s: 600,
+        scale: None,
+    });
+    println!("grader  registered yay-friend (native `{NATIVE_CMD}`).");
+}
+
+/// Register the contrib adapter, in the string form its header documents
+/// (ADR-004): the subject arrives as PACRAT_* environment variables, so
+/// the cmd is the adapter's absolute path and nothing else — quoted only
+/// when the path needs it, because the line is handed to sh. A 600s
+/// timeout (the miss path calls an LLM) and the 0-4 scale pin, as before.
 fn register(config: &mut Config, adapter: &Path) -> Result<(), String> {
     let adapter = adapter
         .canonicalize()
         .map_err(|e| format!("{}: {e}", adapter.display()))?;
     config.graders.push(Grader {
         name: "yay-friend".into(),
-        cmd: Cmd::Argv(vec![
-            adapter.to_string_lossy().into_owned(),
-            "--package".into(),
-            "{package}".into(),
-            "--tree".into(),
-            "{tree}".into(),
-            "--commit".into(),
-            "{commit}".into(),
-        ]),
+        cmd: Cmd::Line(crate::out::shell_quote(&adapter.to_string_lossy())),
         timeout_s: 600,
         scale: Some(Scale { min: 0, max: 4 }),
     });
@@ -309,17 +417,43 @@ fn on_path(program: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The contrib adapter, found from where this binary runs: a checkout has
-/// `target/{debug,release}/pacrat` with `contrib/` two levels up, so walking
-/// the ancestors finds it wherever the target directory landed. An installed
-/// binary has no checkout above it, which is the `None` — the interview then
-/// asks for the path instead of guessing one.
-fn adapter_path() -> Option<PathBuf> {
+/// The contrib adapter, found without asking (ADR-004): the development
+/// checkout first, then the store. Only when both rungs miss does the
+/// interview fall back to asking for the path.
+fn adapter_path(ctx: &Ctx) -> Option<PathBuf> {
+    checkout_adapter().or_else(|| store_adapter(&ctx.store))
+}
+
+/// Rung 1: a checkout has `target/{debug,release}/pacrat` with `contrib/`
+/// two levels up, so walking the ancestors of `current_exe()` finds it
+/// wherever the target directory landed. An installed binary has no
+/// checkout above it, which is the `None`.
+fn checkout_adapter() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?.canonicalize().ok()?;
-    exe.ancestors().find_map(|dir| {
-        let candidate = dir.join("contrib").join("graders").join("yay-friend-grade");
-        candidate.is_file().then_some(candidate)
-    })
+    exe.ancestors()
+        .find_map(|dir| offerable(dir.join("contrib").join("graders").join("yay-friend-grade")))
+}
+
+/// Rung 2: the installed case, which the first real setup run was missing —
+/// the binary lives in `~/.local/bin`, but the store is on every machine at
+/// a place `Ctx` already knows, and pacrat nests inside it as `pacrat/`.
+fn store_adapter(store: &Path) -> Option<PathBuf> {
+    offerable(
+        store
+            .join("pacrat")
+            .join("contrib")
+            .join("graders")
+            .join("yay-friend-grade"),
+    )
+}
+
+/// A found path is offered only when accepting the offer could work: it
+/// must exist and be executable, because what gets registered is a cmd
+/// that sh will exec.
+fn offerable(candidate: PathBuf) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::metadata(&candidate).ok()?;
+    (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
 }
 
 /// One question, a fixed set of answers, a default that pressing Enter (or
@@ -965,6 +1099,138 @@ mod tests {
             };
             assert!(r.validate().is_err(), "{path:?} should be rejected");
         }
+    }
+
+    // ---- grader registration (ADR-004) ----
+
+    #[test]
+    fn the_store_rung_offers_only_an_executable_adapter() {
+        let dir = env::temp_dir().join(format!("pacrat-setup-store-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let graders = dir.join("pacrat/contrib/graders");
+        fs::create_dir_all(&graders).unwrap();
+
+        // Nothing there: the rung misses rather than guessing a path.
+        assert_eq!(store_adapter(&dir), None);
+
+        // Present but not executable: found is not offerable — registering
+        // it would write a cmd sh cannot exec.
+        let adapter = graders.join("yay-friend-grade");
+        fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store_adapter(&dir), None);
+
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(store_adapter(&dir), Some(adapter.clone()));
+
+        // A directory wearing the right name is not an adapter.
+        fs::remove_file(&adapter).unwrap();
+        fs::create_dir_all(&adapter).unwrap();
+        assert_eq!(store_adapter(&dir), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The native probe reads nothing but the exit status: a yay-friend
+    /// with the `grade` subcommand answers 0 to `grade --help`, and a cobra
+    /// CLI without it fails nonzero on the unknown subcommand.
+    #[test]
+    fn the_native_probe_is_an_exit_status() {
+        let dir = env::temp_dir().join(format!("pacrat-setup-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stub = |name: &str, body: &str| {
+            let path = dir.join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let native = stub(
+            "native",
+            "#!/bin/sh\n[ \"$1\" = grade ] && exit 0\nexit 1\n",
+        );
+        let old = stub(
+            "old",
+            "#!/bin/sh\necho 'Error: unknown command \"grade\"' >&2\nexit 1\n",
+        );
+        assert!(subcommand_exists(&native.to_string_lossy()));
+        assert!(!subcommand_exists(&old.to_string_lossy()));
+        // No binary at all is not a native yay-friend either.
+        assert!(!subcommand_exists("/nonexistent/yay-friend"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn argv_yay_friend() -> Grader {
+        Grader {
+            name: "yay-friend".into(),
+            cmd: Cmd::Argv(vec![
+                "/opt/adapters/yay-friend-grade".into(),
+                "--package".into(),
+                "{package}".into(),
+                "--tree".into(),
+                "{tree}".into(),
+                "--commit".into(),
+                "{commit}".into(),
+            ]),
+            timeout_s: 700,
+            scale: Some(Scale { min: 0, max: 4 }),
+        }
+    }
+
+    #[test]
+    fn modernizing_keeps_the_adapter_and_the_owners_settings() {
+        let updated = modernized(&argv_yay_friend(), false).unwrap();
+        assert_eq!(
+            updated.cmd,
+            Cmd::Line("/opt/adapters/yay-friend-grade".into())
+        );
+        assert_eq!(updated.timeout_s, 700, "the owner's timeout survives");
+        assert_eq!(
+            updated.scale,
+            Some(Scale { min: 0, max: 4 }),
+            "the pin still pins the same file"
+        );
+        // The rewritten entry is one the config writer will accept.
+        assert_eq!(updated.validate(), Ok(()));
+
+        // A path sh would word-split is quoted on its way into the line.
+        let mut spaced = argv_yay_friend();
+        spaced.cmd = Cmd::Argv(vec!["/opt/my adapters/yay-friend-grade".into()]);
+        assert_eq!(
+            modernized(&spaced, false).unwrap().cmd,
+            Cmd::Line("'/opt/my adapters/yay-friend-grade'".into())
+        );
+    }
+
+    #[test]
+    fn modernizing_to_the_native_subcommand_drops_the_pin() {
+        let updated = modernized(&argv_yay_friend(), true).unwrap();
+        assert_eq!(updated.cmd, Cmd::Line(NATIVE_CMD.into()));
+        assert_eq!(updated.timeout_s, 700, "the owner's timeout survives");
+        assert_eq!(
+            updated.scale, None,
+            "the native report declares its own scale"
+        );
+        assert_eq!(updated.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_string_entry_and_a_broken_entry_have_nothing_to_modernize() {
+        let mut g = argv_yay_friend();
+        g.cmd = Cmd::Line("/opt/adapters/yay-friend-grade".into());
+        assert_eq!(modernized(&g, false), None);
+        g.cmd = Cmd::Argv(vec![]);
+        assert_eq!(modernized(&g, false), None);
+    }
+
+    /// Headless, an existing entry is never touched: the rewrite needs a
+    /// terminal to say yes at, and this path never even probes.
+    #[test]
+    fn without_a_terminal_an_existing_entry_is_left_alone() {
+        let mut config = Config::default();
+        config.graders.push(argv_yay_friend());
+        let before = config.clone();
+        modernize_question(&mut config, 0, false).unwrap();
+        assert_eq!(config, before);
     }
 
     // ---- the guard, actually executed ----
