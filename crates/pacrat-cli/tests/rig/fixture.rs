@@ -92,6 +92,9 @@ impl Fixture {
     /// never touch the machine it runs on.
     fn shims(&self) {
         let live = self.root.join("live").display().to_string();
+        // A shim miss must reach the failure report, not just a stderr
+        // nobody surfaces — the rig prints this log when a scenario fails.
+        let log = self.root.join("shim-errors.log").display().to_string();
         self.shim(
             "pacman",
             &format!(
@@ -105,7 +108,8 @@ case "$*" in
   '-Si -- rat-hole') exec cat "{live}/si-rat-hole.txt" ;;
   '-Si -- '*) echo "error: package was not found" >&2; exit 1 ;;
   '-Qi -- '*) exit 1 ;;
-  *) echo "pacman shim: unexpected argv: $*" >&2; exit 9 ;;
+  *) echo "pacman shim: unexpected argv: $*" >&2
+     echo "pacman shim: unexpected argv: $*" >>"{log}"; exit 9 ;;
 esac
 "#
             ),
@@ -123,15 +127,19 @@ for url; do :; done
 case "$url" in
   *'/search?'*) exec cat "{live}/aur-search.json" ;;
   *'/info?'*) exec cat "{live}/aur-info.json" ;;
-  *) echo "curl shim: unexpected url: $url" >&2; exit 22 ;;
+  *) echo "curl shim: unexpected url: $url" >&2
+     echo "curl shim: unexpected url: $url" >>"{log}"; exit 22 ;;
 esac
 "#
             ),
         );
         self.shim(
             "git",
-            "#!/bin/sh\n# The ledger is empty, so nothing here should ever probe an upstream.\n\
-             echo \"git shim: unexpected argv: $*\" >&2; exit 9\n",
+            &format!(
+                "#!/bin/sh\n# The ledger is empty, so nothing here should ever probe an upstream.\n\
+                 echo \"git shim: unexpected argv: $*\" >&2\n\
+                 echo \"git shim: unexpected argv: $*\" >>\"{log}\"; exit 9\n"
+            ),
         );
     }
 

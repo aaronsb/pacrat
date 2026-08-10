@@ -62,6 +62,9 @@ pub struct Rig {
     /// Raw pty output, ferried out of the blocking reader thread.
     rx: mpsc::Receiver<Vec<u8>>,
     cast: Cast,
+    /// The fixture's shim-complaint log, printed with any failure — a shim
+    /// miss that only reached a stderr nobody surfaces is a silent lie.
+    shim_log: PathBuf,
 }
 
 /// Spawn `pacrat tui` at the given geometry inside the fixture's sandbox.
@@ -134,6 +137,7 @@ pub fn spawn(name: &str, (cols, rows): (u16, u16), fixture: &Fixture) -> Rig {
         writer,
         rx,
         cast: Cast::new(name, cols, rows),
+        shim_log: fixture.root.join("shim-errors.log"),
     }
 }
 
@@ -286,14 +290,31 @@ impl Rig {
     fn ingest(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
         self.cast.output(bytes);
+        // Answer the cursor-position query the way a real terminal does.
+        // crossterm asks with ESC[6n and, unanswered, blocks two seconds
+        // and falls back — so a rig that stayed silent would be blessing a
+        // fallback branch no real terminal takes, and paying the timeout on
+        // every affected scenario (found in review: 2.10s → 0.11s).
+        if bytes.windows(4).any(|w| w == b"\x1b[6n") {
+            let (row, col) = self.parser.screen().cursor_position();
+            let reply = format!("\x1b[{};{}R", row + 1, col + 1);
+            let _ = self.writer.write_all(reply.as_bytes());
+            let _ = self.writer.flush();
+        }
     }
 
     /// Every rig failure carries the same evidence: what went wrong, the
     /// grid as it stood, and where the replayable record landed.
     fn fail(&mut self, why: &str) -> ! {
         let grid = self.grid();
+        let shims = std::fs::read_to_string(&self.shim_log).unwrap_or_default();
+        let shims = if shims.is_empty() {
+            String::new()
+        } else {
+            format!("--- shim complaints ---\n{shims}")
+        };
         panic!(
-            "rig [{} {}x{}]: {why}\n--- screen ---\n{grid}--- cast: {} ---",
+            "rig [{} {}x{}]: {why}\n--- screen ---\n{grid}{shims}--- cast: {} ---",
             self.name,
             self.cols,
             self.rows,
@@ -306,10 +327,24 @@ impl Drop for Rig {
     fn drop(&mut self) {
         // Kill the child and keep the terminal as it is: the pty is the
         // scenario's terminal, not the test runner's, and there is nothing
-        // of ours to restore. The wait reaps the zombie; the reader thread
-        // ends itself on the EOF the kill causes.
+        // of ours to restore. The reap is bounded like every other wait in
+        // this rig — a child that ignored the kill would otherwise hang the
+        // whole suite from inside a destructor.
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    eprintln!(
+                        "rig [{}]: child ignored the kill for 5s — leaking it",
+                        self.name
+                    );
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
         self.pump();
     }
 }
