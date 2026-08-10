@@ -519,13 +519,7 @@ fn sh(word: &str) -> String {
 /// install` commands have something real to copy from (ADR-001 puts host
 /// scratch under XDG state).
 fn staging_dir() -> Result<PathBuf, String> {
-    let base = match env::var_os("XDG_STATE_HOME") {
-        Some(p) => PathBuf::from(p),
-        None => PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?)
-            .join(".local")
-            .join("state"),
-    };
-    Ok(base.join("pacrat").join("setup"))
+    Ok(crate::ctx::state_dir()?.join("setup"))
 }
 
 fn stage(dir: &Path, name: &str, content: &str) -> Result<(), String> {

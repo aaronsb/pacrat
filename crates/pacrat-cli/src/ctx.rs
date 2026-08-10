@@ -121,6 +121,19 @@ impl Ctx {
     }
 }
 
+/// This host's pacrat state directory — job queues, probe history, the grade
+/// cache, staged root-owned files (ADR-001, data placement). Host scratch,
+/// never the store: nothing under here is synced to the fleet.
+pub fn state_dir() -> Result<PathBuf, String> {
+    let base = match env::var_os("XDG_STATE_HOME") {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?)
+            .join(".local")
+            .join("state"),
+    };
+    Ok(base.join("pacrat"))
+}
+
 fn hostname() -> String {
     if let Ok(name) = fs::read_to_string("/etc/hostname") {
         let name = name.trim();

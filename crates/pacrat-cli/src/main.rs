@@ -5,6 +5,7 @@ mod aur;
 mod ctx;
 mod custody;
 mod fstree;
+mod grade;
 mod hosts;
 mod info;
 mod live;
@@ -14,6 +15,12 @@ mod search;
 mod setup;
 mod status;
 mod vendor;
+
+/// Exit code for "ran fine, deliberately did not act". ADR-001 gives 10 this
+/// meaning for the headless update loop (0 clean, 10 holds present, 1
+/// failure), and every verb that can decline shares it so that
+/// `pacrat grade x && pacrat build x` cannot read a hold as a go.
+pub const HELD: i32 = 10;
 
 /// pacrat — store-backed package curation for Arch.
 ///
@@ -66,7 +73,18 @@ enum Command {
     /// Review one pending update (diff since reviewed commit + gradings)
     Review { package: String },
     /// Record a grading (runs configured graders; --grade N for manual)
-    Grade { package: String },
+    Grade {
+        package: String,
+        /// Commit to grade (default: the ledger's reviewed commit)
+        #[arg(long)]
+        commit: Option<String>,
+        /// Record your own grade instead of running graders (0-4)
+        #[arg(long)]
+        grade: Option<u8>,
+        /// Why — required with --grade
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Build vendored packages into the local repo
     Build { packages: Vec<String> },
     /// Host-vs-manifest matrix
@@ -106,6 +124,12 @@ fn main() {
             yes,
             force,
         }) => vendor::run(&ctx, package, upstream.as_deref(), role, yes, force),
+        Some(Command::Grade {
+            ref package,
+            ref commit,
+            grade,
+            ref note,
+        }) => grade::run(&ctx, package, commit.as_deref(), grade, note.as_deref()),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {

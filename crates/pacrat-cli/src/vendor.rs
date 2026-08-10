@@ -31,12 +31,7 @@ use pacrat_core::sources::{Role, SourceEntry, Sources};
 use crate::ctx::Ctx;
 use crate::fstree;
 use crate::out::{list_preview, visible};
-
-/// Exit code for "ran fine, deliberately did not act". ADR-001 gives this
-/// meaning to 10 for the headless update loop (0 clean, 10 holds present,
-/// 1 failure); a declined review is the same kind of outcome, and sharing
-/// the code keeps `pacrat vendor x && pacrat build x` honest.
-const HELD: i32 = 10;
+use crate::HELD;
 
 /// The ledger `Role` as a CLI flag; core owns the model, clap owns the words.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -126,8 +121,9 @@ impl Held {
 
 /// Package names: pacman's alphabet, as an allowlist. The name becomes a
 /// path component in the store and an argument to git, so anything outside
-/// this set is refused rather than escaped.
-fn valid_name(name: &str) -> bool {
+/// this set is refused rather than escaped. Shared with `pacrat grade`,
+/// which puts the same name in a cache path and a grader's argv.
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
         && !name.starts_with('.')

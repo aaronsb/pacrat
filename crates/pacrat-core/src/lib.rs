@@ -3,6 +3,7 @@
 //! the CLI crate.
 
 pub mod config;
+pub mod grading;
 pub mod pkg;
 pub mod sources;
 
@@ -28,6 +29,25 @@ pub enum Verdict {
     Block,
     /// No valid grading for this candidate commit. Never treated as Proceed.
     Ungraded,
+}
+
+impl Verdict {
+    /// The word pacrat prints. Shouted, because it is the line a human scans
+    /// for in a wall of grader output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Proceed => "PROCEED",
+            Verdict::Warn => "WARN",
+            Verdict::Block => "BLOCK",
+            Verdict::Ungraded => "UNGRADED",
+        }
+    }
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 /// Grade→verdict thresholds. Config data, not grader data: changing risk
@@ -76,6 +96,16 @@ mod tests {
         assert_eq!(t.verdict(Some(2)), Verdict::Warn);
         assert_eq!(t.verdict(Some(4)), Verdict::Block);
         assert_eq!(t.verdict(None), Verdict::Ungraded);
+    }
+
+    /// The verdict word is printed, compared and (soon) parsed by scripts;
+    /// pin it here so a rename is a deliberate change.
+    #[test]
+    fn verdicts_print_as_the_adr_words() {
+        assert_eq!(Verdict::Proceed.to_string(), "PROCEED");
+        assert_eq!(Verdict::Warn.to_string(), "WARN");
+        assert_eq!(Verdict::Block.to_string(), "BLOCK");
+        assert_eq!(Verdict::Ungraded.to_string(), "UNGRADED");
     }
 
     #[test]

@@ -109,12 +109,163 @@ impl Repo {
     }
 }
 
+/// The placeholders a grader's argv template may use, in the order the
+/// error message lists them.
+pub const PLACEHOLDERS: [&str; 3] = ["package", "tree", "commit"];
+
+/// The grader name pacrat keeps for itself: a human's own judgement,
+/// recorded by `pacrat grade --grade N --note …`.
+pub const MANUAL: &str = "manual";
+
+/// An external grader: a program pacrat runs to get a `pacrat-grade/v1`
+/// report on stdout.
+///
+/// `cmd` is an **argv template**, never a command line. Each element is
+/// substituted independently and handed straight to exec, so a value
+/// containing spaces, quotes or `;` stays exactly one argument — there is no
+/// shell anywhere on this path and therefore nothing to escape for. The
+/// placeholders are checked here rather than at substitution time so a typo
+/// in the config is an error at load, not a grader that silently receives
+/// the literal text `{treee}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grader {
+    /// Names the grader in output and in the cache file. Restricted to a
+    /// filename-safe alphabet because it becomes a path component.
+    pub name: String,
+    pub cmd: Vec<String>,
+    #[serde(default = "default_timeout_s")]
+    pub timeout_s: u64,
+}
+
+/// Five minutes: an LLM-backed grader reading a PKGBUILD is slow, and a
+/// timeout that fires on a working grader turns every run into an
+/// unnecessary hold.
+fn default_timeout_s() -> u64 {
+    300
+}
+
+impl Grader {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty() {
+            return Err("a grader has no name".into());
+        }
+        if self.name == MANUAL {
+            return Err(format!(
+                "grader {MANUAL:?} is built in (`pacrat grade --grade N --note …`) \
+                 and cannot be configured as a program"
+            ));
+        }
+        // The name becomes `<commit>.<name>.json` in the grade cache. An
+        // allowlist keeps a config typo from writing outside that directory.
+        if self.name.starts_with('.') || self.name.starts_with('-') {
+            return Err(format!(
+                "grader name {:?} may not begin with '.' or '-'",
+                self.name
+            ));
+        }
+        if let Some(bad) = self
+            .name
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || "_.+-".contains(*c)))
+        {
+            return Err(format!(
+                "grader name {:?} contains {bad:?}: names are [A-Za-z0-9_.+-]+ because \
+                 the name is a filename in the grade cache",
+                self.name
+            ));
+        }
+
+        let Some(program) = self.cmd.first() else {
+            return Err(format!("grader {:?} has an empty cmd", self.name));
+        };
+        if program.is_empty() {
+            return Err(format!("grader {:?} has an empty program name", self.name));
+        }
+        // The program is the grader. Taking it from the subject would let a
+        // package name choose what runs.
+        if program.contains('{') {
+            return Err(format!(
+                "grader {:?}: the program {program:?} may not contain a placeholder — \
+                 pacrat substitutes into arguments, not into what it executes",
+                self.name
+            ));
+        }
+        for arg in &self.cmd {
+            check_placeholders(arg).map_err(|e| format!("grader {:?}: {e}", self.name))?;
+        }
+
+        if self.timeout_s == 0 {
+            return Err(format!(
+                "grader {:?} has timeout_s = 0 — it would be killed before it ran",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+
+    /// The argv for one subject. Single-pass: a substituted value that
+    /// happens to read like a placeholder is never substituted again.
+    pub fn argv(&self, package: &str, tree: &str, commit: &str) -> Vec<String> {
+        let values = [("package", package), ("tree", tree), ("commit", commit)];
+        self.cmd.iter().map(|a| substitute(a, &values)).collect()
+    }
+}
+
+fn check_placeholders(arg: &str) -> Result<(), String> {
+    let mut rest = arg;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            return Err(format!("{arg:?} has an unclosed '{{'"));
+        };
+        let name = &after[..close];
+        if !PLACEHOLDERS.contains(&name) {
+            return Err(format!(
+                "{arg:?} uses unknown placeholder {{{name}}} — pacrat substitutes {}",
+                PLACEHOLDERS.map(|p| format!("{{{p}}}")).join(", ")
+            ));
+        }
+        rest = &after[close + 1..];
+    }
+    if rest.contains('}') {
+        return Err(format!("{arg:?} has a '}}' with no '{{'"));
+    }
+    Ok(())
+}
+
+/// Replace every known `{name}` with its value, left to right, consuming the
+/// input as it goes. Unknown placeholders are left literal — `validate`
+/// already rejected them, and an unvalidated template should show the user
+/// its own text rather than quietly dropping it.
+fn substitute(arg: &str, values: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else { break };
+        let name = &after[..close];
+        match values.iter().find(|(k, _)| *k == name) {
+            Some((_, value)) => {
+                out.push_str(&rest[..open]);
+                out.push_str(value);
+            }
+            None => out.push_str(&rest[..open + 1 + close + 1]),
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub default_ui: Ui,
     pub thresholds: Thresholds,
     pub repo: Repo,
+    /// External graders, run in the order configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graders: Vec<Grader>,
 }
 
 impl Config {
@@ -124,7 +275,26 @@ impl Config {
     pub fn from_toml(s: &str) -> Result<Self, String> {
         let config: Self = toml::from_str(s).map_err(|e| e.to_string())?;
         config.repo.validate()?;
+        config.validate_graders()?;
         Ok(config)
+    }
+
+    /// Names must be unique: they are the cache filename, so two graders
+    /// sharing one would overwrite each other's gradings.
+    fn validate_graders(&self) -> Result<(), String> {
+        let mut seen: Vec<&str> = Vec::new();
+        for grader in &self.graders {
+            grader.validate()?;
+            if seen.contains(&grader.name.as_str()) {
+                return Err(format!(
+                    "two graders are named {:?} — the name is the grade cache's key, \
+                     so they would overwrite each other",
+                    grader.name
+                ));
+            }
+            seen.push(&grader.name);
+        }
+        Ok(())
     }
 }
 
@@ -256,5 +426,205 @@ server = "https://codeberg.org/aaronsb/fleet-repo/releases/latest/download"
     fn a_hostile_config_file_fails_to_parse() {
         let err = Config::from_toml("[repo]\nname = \"x\\nSigLevel = Never\"\n").unwrap_err();
         assert!(err.contains("repo.name"), "unhelpful error: {err}");
+    }
+
+    // ---- graders ----
+
+    fn grader() -> Grader {
+        Grader {
+            name: "yay-friend".into(),
+            cmd: vec![
+                "yay-friend".into(),
+                "--format".into(),
+                "pacrat".into(),
+                "--tree".into(),
+                "{tree}".into(),
+                "{package}".into(),
+            ],
+            timeout_s: 300,
+        }
+    }
+
+    #[test]
+    fn graders_are_read_from_the_config_with_a_default_timeout() {
+        let c = Config::from_toml(
+            r#"
+[[graders]]
+name = "yay-friend"
+cmd = ["yay-friend", "--format", "pacrat", "--tree", "{tree}", "{package}"]
+
+[[graders]]
+name = "shellcheck-pkgbuild"
+cmd = ["/usr/local/bin/pkgb-grade", "{tree}/PKGBUILD", "--commit={commit}"]
+timeout_s = 30
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.graders.len(), 2);
+        assert_eq!(c.graders[0].timeout_s, 300);
+        assert_eq!(c.graders[1].timeout_s, 30);
+        // No graders is the default, and an empty list stays empty.
+        assert!(Config::from_toml("").unwrap().graders.is_empty());
+    }
+
+    #[test]
+    fn grader_names_must_be_usable_as_a_filename() {
+        for name in ["", ".hidden", "-x", "a/b", "a b", "..", "a\nb", "naïve"] {
+            let g = Grader {
+                name: name.into(),
+                ..grader()
+            };
+            assert!(g.validate().is_err(), "name {name:?} should be rejected");
+        }
+        for name in ["yay-friend", "pkgb.v2", "a_b+c", "grader3"] {
+            let g = Grader {
+                name: name.into(),
+                ..grader()
+            };
+            assert_eq!(g.validate(), Ok(()), "name {name:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn manual_is_reserved_for_the_human() {
+        let g = Grader {
+            name: MANUAL.into(),
+            ..grader()
+        };
+        let err = g.validate().unwrap_err();
+        assert!(err.contains("built in"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn duplicate_grader_names_are_rejected() {
+        let err = Config::from_toml(
+            r#"
+[[graders]]
+name = "yf"
+cmd = ["a"]
+
+[[graders]]
+name = "yf"
+cmd = ["b"]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("overwrite"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_empty_or_placeholder_program_is_rejected() {
+        for cmd in [vec![], vec!["".into()], vec!["{package}".into()]] {
+            let g = Grader { cmd, ..grader() };
+            assert!(g.validate().is_err(), "cmd {:?} should be rejected", g.cmd);
+        }
+    }
+
+    #[test]
+    fn unknown_placeholders_are_a_config_error() {
+        for arg in ["{treee}", "{}", "{Package}", "--x={sha}", "{tree", "tree}"] {
+            let g = Grader {
+                cmd: vec!["yf".into(), arg.into()],
+                ..grader()
+            };
+            let err = g
+                .validate()
+                .unwrap_err_or_else(|| panic!("{arg:?} should be rejected"));
+            assert!(
+                err.contains("placeholder") || err.contains('{') || err.contains('}'),
+                "unhelpful error for {arg:?}: {err}"
+            );
+        }
+        // The known three, in every position, are fine.
+        let g = Grader {
+            cmd: vec![
+                "yf".into(),
+                "{package}@{commit}".into(),
+                "{tree}/PKGBUILD".into(),
+            ],
+            ..grader()
+        };
+        assert_eq!(g.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_zero_timeout_is_rejected() {
+        let g = Grader {
+            timeout_s: 0,
+            ..grader()
+        };
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn substitution_is_per_argument_and_total() {
+        let argv = grader().argv("mdcat", "/store/aur/packages/mdcat", "3f9c21ab");
+        assert_eq!(
+            argv,
+            [
+                "yay-friend",
+                "--format",
+                "pacrat",
+                "--tree",
+                "/store/aur/packages/mdcat",
+                "mdcat"
+            ]
+        );
+    }
+
+    /// The whole point of an argv template: nothing a value contains can
+    /// become syntax, because there is no syntax left to become. A value
+    /// with spaces, semicolons and quotes stays exactly one argv element.
+    #[test]
+    fn a_hostile_value_stays_one_argument() {
+        let g = Grader {
+            cmd: vec!["yf".into(), "{package}".into(), "--tree={tree}".into()],
+            ..grader()
+        };
+        let hostile = "a; rm -rf ~ #'\"$(id)`id`\n";
+        let argv = g.argv(hostile, "/store/my tree", "3f9c21ab");
+        assert_eq!(
+            argv.len(),
+            3,
+            "a value split into extra arguments: {argv:?}"
+        );
+        assert_eq!(argv[1], hostile, "the value was altered on the way to exec");
+        assert_eq!(argv[2], "--tree=/store/my tree");
+    }
+
+    /// Substitution happens once. A tree path containing `{commit}` is
+    /// data, not another template.
+    #[test]
+    fn a_substituted_value_is_not_substituted_again() {
+        let g = Grader {
+            cmd: vec!["yf".into(), "{tree}".into(), "{package}".into()],
+            ..grader()
+        };
+        let argv = g.argv("{tree}", "/store/{commit}/x", "3f9c21ab");
+        assert_eq!(argv[1], "/store/{commit}/x");
+        assert_eq!(argv[2], "{tree}");
+    }
+
+    #[test]
+    fn an_unvalidated_template_keeps_its_unknown_placeholders_literal() {
+        let g = Grader {
+            cmd: vec!["yf".into(), "{sha}-{package}".into(), "{tree".into()],
+            ..grader()
+        };
+        let argv = g.argv("mdcat", "/t", "3f9c21ab");
+        assert_eq!(argv[1], "{sha}-mdcat");
+        assert_eq!(argv[2], "{tree");
+    }
+
+    trait UnwrapErrOrElse {
+        fn unwrap_err_or_else(self, f: impl FnOnce() -> String) -> String;
+    }
+    impl UnwrapErrOrElse for Result<(), String> {
+        fn unwrap_err_or_else(self, f: impl FnOnce() -> String) -> String {
+            match self {
+                Ok(()) => panic!("{}", f()),
+                Err(e) => e,
+            }
+        }
     }
 }

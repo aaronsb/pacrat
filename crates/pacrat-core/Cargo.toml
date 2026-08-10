@@ -9,3 +9,8 @@ repository.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# The pacrat-grade/v1 contract is JSON, and rejecting a malformed grading is
+# model work — the same reason `Config::from_toml` parses here rather than in
+# the CLI. serde_json is already on the lock for the AUR RPC, at the same
+# version, so this adds nothing new to build. Core still does no I/O.
+serde_json = "1"
