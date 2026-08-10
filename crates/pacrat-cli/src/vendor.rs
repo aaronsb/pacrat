@@ -74,8 +74,13 @@ struct Plan<'a> {
 
 /// Why a package cannot be vendored again. The three states are not the same
 /// mistake, and the advice differs, so they are not the same message.
+///
+/// Shared with `review`, which asks the mirror-image question — a review
+/// needs exactly the state vendoring refuses, a finished vendoring — and
+/// must describe the two broken stores in the same words rather than
+/// inventing a second vocabulary for them.
 #[derive(Debug, PartialEq, Eq)]
-enum Held {
+pub enum Held {
     /// Ledger entry and tree: a finished vendoring.
     Vendored,
     /// Ledger entry, no tree: someone deleted the tree, or a sync half-landed.
@@ -84,7 +89,7 @@ enum Held {
     TreeOnly,
 }
 
-fn held(in_ledger: bool, on_disk: bool) -> Option<Held> {
+pub fn held(in_ledger: bool, on_disk: bool) -> Option<Held> {
     match (in_ledger, on_disk) {
         (true, true) => Some(Held::Vendored),
         (true, false) => Some(Held::LedgerOnly),
@@ -94,7 +99,7 @@ fn held(in_ledger: bool, on_disk: bool) -> Option<Held> {
 }
 
 impl Held {
-    fn explain(&self, package: &str, tree: &Path) -> String {
+    pub fn explain(&self, package: &str, tree: &Path) -> String {
         match self {
             // The review gate is the way forward only when there is an entry
             // to review against.
@@ -173,7 +178,7 @@ pub fn run(
         role,
         yes,
         force,
-        clone: scratch_dir(package)?,
+        clone: scratch_dir("vendor", package)?,
         tree,
     };
 
@@ -244,7 +249,7 @@ fn execute(ctx: &Ctx, plan: &Plan) -> Result<Outcome, String> {
 
     render_review(&plan.clone, &files)?;
 
-    if !plan.yes && !confirm(plan.package, short_hash(&commit))? {
+    if !plan.yes && !confirm("vendor", plan.package, short_hash(&commit))? {
         return Ok(Outcome::Declined);
     }
 
@@ -370,6 +375,11 @@ fn commit_to_store(ctx: &Ctx, plan: &Plan, files: &[String], commit: &str) -> Re
             reviewed: commit.to_string(),
             role: plan.role.into(),
             note: None,
+            // A re-vendoring replaces the row wholesale, refusals included:
+            // whatever was rejected was rejected against a tree that is no
+            // longer the one in the store.
+            rejected: None,
+            rejected_note: None,
         },
     );
     ctx.save_sources(&sources).map_err(|e| {
@@ -401,17 +411,20 @@ fn commit_to_store(ctx: &Ctx, plan: &Plan, files: &[String], commit: &str) -> Re
     Ok(())
 }
 
-/// A scratch clone target under the system temp dir, created here rather
-/// than left to git: 0700 up front means the untrusted tree is never
+/// A scratch working directory under the system temp dir, created here
+/// rather than left to git: 0700 up front means the untrusted tree is never
 /// world-readable, and `create` failing on collision closes the window a
 /// check-then-create would leave open.
-fn scratch_dir(package: &str) -> Result<PathBuf, String> {
+///
+/// `verb` names the owner in the path, so a scratch left behind by a failure
+/// says which command dropped it.
+pub fn scratch_dir(verb: &str, package: &str) -> Result<PathBuf, String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!(
-        "pacrat-vendor-{package}-{}-{nanos}",
+        "pacrat-{verb}-{package}-{}-{nanos}",
         std::process::id()
     ));
     fs::DirBuilder::new()
@@ -424,7 +437,15 @@ fn scratch_dir(package: &str) -> Result<PathBuf, String> {
 /// Run git, showing the argv first — every external call pacrat makes is
 /// visible, and that rule has no exceptions for the quiet ones (ADR-001).
 /// Returns trimmed stdout; a non-zero exit is an error carrying stderr.
-fn git<const N: usize>(argv: [&OsStr; N]) -> Result<String, String> {
+///
+/// Unbounded: `Command::output` waits as long as the child cares to run.
+/// That is right for the local calls — a `rev-parse` in a clone we already
+/// have answers or fails at once — and is a known gap for the clone above,
+/// which reaches the network and would sit forever on a remote that accepts
+/// the connection and then says nothing. New calls that talk to a remote
+/// should go through [`crate::proc`] instead, where "never answers" is a
+/// reportable outcome (`review` does).
+pub fn git<const N: usize>(argv: [&OsStr; N]) -> Result<String, String> {
     let shown = argv
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -454,8 +475,11 @@ fn store_rel(store: &Path, path: &Path) -> String {
 
 /// Ask. A closed stdin is a "no": unattended runs must use --yes explicitly
 /// rather than have silence read as consent.
-fn confirm(package: &str, commit: &str) -> Result<bool, String> {
-    print!("vendor {package} at {commit}? [y/N] ");
+///
+/// `verb` is the word for what is about to happen (`vendor`, `adopt`), so
+/// the prompt and the "use --yes" hint name the command the human ran.
+pub fn confirm(verb: &str, package: &str, commit: &str) -> Result<bool, String> {
+    print!("{verb} {package} at {commit}? [y/N] ");
     io::stdout().flush().map_err(|e| format!("stdout: {e}"))?;
     let mut answer = String::new();
     let read = io::stdin()
@@ -463,7 +487,7 @@ fn confirm(package: &str, commit: &str) -> Result<bool, String> {
         .map_err(|e| format!("stdin: {e}"))?;
     if read == 0 {
         println!();
-        println!("no answer on stdin (use --yes to vendor unattended)");
+        println!("no answer on stdin (use --yes to {verb} unattended)");
         return Ok(false);
     }
     if !io::stdin().is_terminal() {

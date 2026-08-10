@@ -33,7 +33,12 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Per-pipe ceiling. Generous for anything pacrat asks a child to say, and
 /// finite, which is the point.
-const PIPE_LIMIT: u64 = 1 << 20;
+///
+/// Public because a caller that shows a child's output to a human has to be
+/// able to say "this was cut off". Output at exactly this length is output
+/// that may have been truncated, and reporting it as complete would be the
+/// silent kind of wrong (`review`'s diff).
+pub const PIPE_LIMIT: u64 = 1 << 20;
 
 pub struct Ran {
     pub status: ExitStatus,

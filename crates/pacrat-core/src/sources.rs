@@ -41,6 +41,19 @@ pub struct SourceEntry {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// A candidate commit a human looked at and refused (`pacrat reject`).
+    ///
+    /// Recorded rather than remembered, because the alternative is a drift
+    /// report that asks the same question every hour and trains the reader
+    /// to dismiss it. The refusal is scoped to *that* commit: upstream
+    /// moving past it is a new candidate and a new question, which is why
+    /// this holds a commit and not a flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+    /// Why it was refused. Optional in the same way `--note` is optional on
+    /// a rejection: the commit is the decision, the note is the reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_note: Option<String>,
 }
 
 /// Is this the shape of a git object id?
@@ -76,12 +89,21 @@ impl Sources {
 
     fn validate(&self) -> Result<(), String> {
         for (package, entry) in &self.packages {
-            if !valid_commit(&entry.reviewed) {
-                return Err(format!(
-                    "packages.{package}.reviewed is {:?}, which is not a commit hash — \
-                     expected 7-64 hex characters as `git rev-parse` prints them",
-                    entry.reviewed
-                ));
+            // `rejected` is held to the same standard as `reviewed`, and for
+            // the same reason: it is compared against a commit and printed,
+            // and a field that can hold anything eventually reaches somewhere
+            // its shape matters.
+            for (field, value) in [
+                ("reviewed", Some(&entry.reviewed)),
+                ("rejected", entry.rejected.as_ref()),
+            ] {
+                let Some(value) = value else { continue };
+                if !valid_commit(value) {
+                    return Err(format!(
+                        "packages.{package}.{field} is {value:?}, which is not a commit hash — \
+                         expected 7-64 hex characters as `git rev-parse` prints them"
+                    ));
+                }
             }
         }
         Ok(())
@@ -127,6 +149,61 @@ note = "ours"
 
         let back = Sources::from_toml(&s.to_toml()).unwrap();
         assert_eq!(back, s);
+    }
+
+    /// A refusal is part of the ledger row, and survives a round trip — it
+    /// is what keeps `pacrat updates` from re-asking a question a human has
+    /// already answered.
+    #[test]
+    fn a_rejection_roundtrips_and_is_absent_when_there_is_none() {
+        let toml = r#"
+[packages.mdcat]
+upstream = "https://aur.archlinux.org/mdcat.git"
+reviewed = "3f9c21ab"
+role = "vendored"
+rejected = "7d02e4c1"
+rejected_note = "post_install gained curl … | sh"
+"#;
+        let s = Sources::from_toml(toml).unwrap();
+        let entry = &s.packages["mdcat"];
+        assert_eq!(entry.rejected.as_deref(), Some("7d02e4c1"));
+        assert_eq!(
+            entry.rejected_note.as_deref(),
+            Some("post_install gained curl … | sh")
+        );
+        assert_eq!(Sources::from_toml(&s.to_toml()).unwrap(), s);
+
+        // A row with no refusal writes no keys at all: the common case must
+        // not grow two empty lines per package.
+        let plain = Sources::from_toml(
+            "[packages.mdcat]\nupstream = \"u\"\nreviewed = \"3f9c21ab\"\nrole = \"vendored\"\n",
+        )
+        .unwrap();
+        let text = plain.to_toml();
+        assert!(!text.contains("rejected"), "{text}");
+    }
+
+    /// `rejected` reaches the same places `reviewed` does — a comparison
+    /// against a git hash and a printed line — so it is validated the same.
+    #[test]
+    fn a_rejected_commit_that_is_not_a_commit_fails_to_parse_too() {
+        for rejected in ["../../../../PWNED", "", "HEAD~1", "zzzzzzzz"] {
+            let toml = format!(
+                "[packages.mdcat]\n\
+                 upstream = \"u\"\n\
+                 reviewed = \"3f9c21ab\"\n\
+                 role = \"vendored\"\n\
+                 rejected = {rejected:?}\n"
+            );
+            let err = match Sources::from_toml(&toml) {
+                Ok(_) => panic!("rejected {rejected:?} should have been rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("rejected") && err.contains("mdcat"),
+                "unhelpful error for {rejected:?}: {err}"
+            );
+        }
     }
 
     #[test]

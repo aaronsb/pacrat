@@ -51,6 +51,16 @@
 //! the code that gets a human looking. A run that is both partly broken and
 //! has something pending exits 10; the unreachable rows are in the table
 //! above it, where the human who came for the 10 will see them.
+//!
+//! ## Refusals
+//!
+//! A candidate a human has rejected (`pacrat reject`) is drift with an
+//! answer already on it. It is listed, in its own region, and it is **not
+//! pending**: it neither exits 10 nor counts toward the pending total. A
+//! timer that re-raised a decided question every hour would teach its reader
+//! to ignore the one row that mattered. The refusal names a commit, so
+//! upstream moving past it is a new candidate, unrejected, and pending
+//! again — see `sources::SourceEntry::rejected`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
@@ -65,7 +75,7 @@ use serde::Serialize;
 use crate::aur::{self, AurPkg};
 use crate::ctx::Ctx;
 use crate::custody;
-use crate::out::{list_preview, shell_quote, short_hash, truncate, visible};
+use crate::out::{list_preview, shell_quote, short_hash, truncate, visible, visible_line};
 use crate::pacman;
 use crate::proc;
 
@@ -122,6 +132,9 @@ enum Probe {
     Current,
     /// Upstream has moved: the candidate commit awaiting review.
     Pending(String),
+    /// Upstream has moved to a commit a human already refused. Drift with an
+    /// answer on it — reported, never counted as pending.
+    Rejected(String),
     /// Could not ask. Not the same as "no update" and never counted as one.
     Unreachable(String),
 }
@@ -135,8 +148,27 @@ struct Row {
     /// to ask the RPC about, which is the pkgbase and not always the package.
     aur: Option<String>,
     probe: Probe,
+    /// Why the human refused, when they said. Only ever shown on a
+    /// `Rejected` row.
+    rejected_note: Option<String>,
     // gradings join here (task #13): the verdict column reads from the
     // grading cache, keyed by (grader, package, candidate commit).
+}
+
+/// The ledger half's rows, sorted into what the reader is being told.
+struct Ledger<'a> {
+    pending: &'a [&'a Row],
+    rejected: &'a [&'a Row],
+    unreachable: &'a [&'a Row],
+    /// Rows found at their reviewed commit.
+    current: usize,
+}
+
+impl Ledger<'_> {
+    /// Is there anything at all to show from this half?
+    fn quiet(&self) -> bool {
+        self.pending.is_empty() && self.rejected.is_empty() && self.unreachable.is_empty()
+    }
 }
 
 /// One tracked-but-not-vendored AUR package that has moved.
@@ -191,12 +223,14 @@ pub fn run(ctx: &Ctx, fmt: Format) -> Result<(), String> {
         ));
     }
 
-    let (pending, unreachable): (Vec<&Row>, Vec<&Row>) = rows
-        .iter()
-        .filter(|r| r.probe != Probe::Current)
-        .partition(|r| matches!(r.probe, Probe::Pending(_)));
+    let of = |want: fn(&Probe) -> bool| -> Vec<&Row> {
+        rows.iter().filter(|r| want(&r.probe)).collect()
+    };
+    let pending = of(|p| matches!(p, Probe::Pending(_)));
+    let rejected = of(|p| matches!(p, Probe::Rejected(_)));
+    let unreachable = of(|p| matches!(p, Probe::Unreachable(_)));
 
-    let current = rows.len() - pending.len() - unreachable.len();
+    let current = rows.len() - pending.len() - rejected.len() - unreachable.len();
 
     // Decided before the report is written, not after: the headline "nothing
     // pending" is exactly the claim a broken run has not earned, and it
@@ -209,16 +243,15 @@ pub fn run(ctx: &Ctx, fmt: Format) -> Result<(), String> {
     });
     let complete = !matches!(verdict, Verdict::Broken(_));
 
+    let report = Ledger {
+        pending: &pending,
+        rejected: &rejected,
+        unreachable: &unreachable,
+        current,
+    };
     match fmt {
-        Format::Text => report_text(
-            &pending,
-            &unreachable,
-            &versions,
-            current,
-            &upstream,
-            complete,
-        ),
-        Format::Json => report_json(&pending, &unreachable, &versions, current, &upstream)?,
+        Format::Text => report_text(&report, &versions, &upstream, complete),
+        Format::Json => report_json(&report, &versions, &upstream)?,
     }
 
     match verdict {
@@ -276,10 +309,11 @@ fn verdict(o: Outcome) -> Verdict {
 
 /// `git ls-remote -- <upstream> HEAD` for one ledger entry.
 fn probe(package: &str, entry: &SourceEntry, fmt: Format) -> Row {
-    let probe = match ls_remote(&entry.upstream, fmt) {
+    let probe = match ls_remote(&entry.upstream, |line| fmt.trace(line)) {
         Err(e) => Probe::Unreachable(e),
-        Ok(candidate) if drifted(&entry.reviewed, &candidate) => Probe::Pending(candidate),
-        Ok(_) => Probe::Current,
+        Ok(candidate) if !drifted(&entry.reviewed, &candidate) => Probe::Current,
+        Ok(candidate) if refused(entry, &candidate) => Probe::Rejected(candidate),
+        Ok(candidate) => Probe::Pending(candidate),
     };
     Row {
         package: package.to_string(),
@@ -287,7 +321,26 @@ fn probe(package: &str, entry: &SourceEntry, fmt: Format) -> Row {
         role: entry.role,
         aur: aur_repo(&entry.upstream).map(str::to_string),
         probe,
+        rejected_note: entry.rejected_note.clone(),
     }
+}
+
+/// Has a human already refused this exact candidate?
+///
+/// Expressed through [`drifted`] rather than a second comparison of its own:
+/// `rejected` is a commit in the same hand-editable ledger `reviewed` lives
+/// in, and two predicates that disagree about whether a short hash matches
+/// would eventually hide a pending update behind a stale refusal. A
+/// `rejected` value that names no commit is therefore drift — which is to
+/// say the row stays pending, the safe direction.
+///
+/// Shared with `review`: the verb that records a refusal and the verb that
+/// honours it have to mean the same thing by it.
+pub fn refused(entry: &SourceEntry, candidate: &str) -> bool {
+    entry
+        .rejected
+        .as_deref()
+        .is_some_and(|commit| !drifted(commit, candidate))
 }
 
 /// Ask a remote for its HEAD, argv first.
@@ -306,10 +359,16 @@ fn probe(package: &str, entry: &SourceEntry, fmt: Format) -> Row {
 /// * The timeout makes "never answers" a reportable outcome. A TCP connect to
 ///   a host that drops packets does not return on its own, and one such
 ///   upstream would otherwise hang the whole run.
-fn ls_remote(upstream: &str, fmt: Format) -> Result<String, String> {
-    fmt.trace(&format!(
+///
+/// `trace` is where the argv line goes: stdout for a human, stderr when the
+/// answer is JSON. Shared with `review`, whose verbs ask the same question of
+/// the same remotes and must ask it the same guarded way.
+pub fn ls_remote(upstream: &str, trace: impl Fn(&str)) -> Result<String, String> {
+    // Quoted so the line can be pasted, and neutered so it cannot paint:
+    // the URL comes out of a ledger every host in the fleet can write to.
+    trace(&format!(
         "run       git ls-remote -- {} HEAD",
-        shell_quote(upstream)
+        visible_line(&shell_quote(upstream)).0
     ));
     let mut cmd = Command::new("git");
     cmd.args(["ls-remote", "--", upstream, "HEAD"])
@@ -411,7 +470,7 @@ fn parse_ls_remote(text: &str) -> Option<&str> {
 /// pacrat cannot read, and an unreadable ledger is reported as drift. This
 /// verb's whole job is to notice; the failure it must not have is calling
 /// something current on a comparison that did not really happen.
-fn drifted(reviewed: &str, candidate: &str) -> bool {
+pub fn drifted(reviewed: &str, candidate: &str) -> bool {
     let reviewed = reviewed.trim().to_ascii_lowercase();
     if !names_a_commit(&reviewed) {
         return true;
@@ -575,17 +634,15 @@ fn upstream_candidates(
 }
 
 fn report_text(
-    pending: &[&Row],
-    unreachable: &[&Row],
+    ledger: &Ledger,
     versions: &BTreeMap<String, String>,
-    current: usize,
     upstream: &UpstreamHalf,
     complete: bool,
 ) {
     println!();
-    if pending.is_empty() && unreachable.is_empty() && upstream.rows.is_empty() {
+    if ledger.quiet() && upstream.rows.is_empty() {
         println!(
-            "{} — {current} curated {}",
+            "{} — {} curated {}",
             // The unqualified headline is a claim about everything. A run
             // that could not ask every question has not earned it, and the
             // exit code is about to say so.
@@ -594,15 +651,16 @@ fn report_text(
             } else {
                 "nothing pending in what could be checked"
             },
-            if current == 1 {
+            ledger.current,
+            if ledger.current == 1 {
                 "package at its reviewed commit"
             } else {
                 "packages at their reviewed commits"
             }
         );
     } else {
-        if !pending.is_empty() || !unreachable.is_empty() {
-            render_pending(pending, unreachable, versions, current);
+        if !ledger.quiet() {
+            render_ledger(ledger, versions);
         }
         if !upstream.rows.is_empty() {
             render_upstream(&upstream.rows);
@@ -613,27 +671,27 @@ fn report_text(
     }
 }
 
-/// The ledger half: what has moved, and what could not be asked.
-fn render_pending(
-    pending: &[&Row],
-    unreachable: &[&Row],
-    versions: &BTreeMap<String, String>,
-    current: usize,
-) {
+/// The ledger half: what has moved, what was refused, and what could not be
+/// asked.
+fn render_ledger(ledger: &Ledger, versions: &BTreeMap<String, String>) {
     let name_w = column(
-        pending
+        ledger
+            .pending
             .iter()
-            .chain(unreachable)
+            .chain(ledger.unreachable)
             .map(|r| r.package.as_str()),
         "package",
     );
-    // gradings join here (task #13): a `grade` column goes between role and
-    // version, and the header grows with it.
-    println!(
-        "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  version",
-        "package", "reviewed → candidate", "role"
-    );
-    for row in pending {
+    let drift_table = !ledger.pending.is_empty() || !ledger.unreachable.is_empty();
+    if drift_table {
+        // gradings join here (task #13): a `grade` column goes between role
+        // and version, and the header grows with it.
+        println!(
+            "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  version",
+            "package", "reviewed → candidate", "role"
+        );
+    }
+    for row in ledger.pending {
         let Probe::Pending(candidate) = &row.probe else {
             continue;
         };
@@ -649,7 +707,7 @@ fn render_pending(
             custody::label(Some(row.role.into())),
         );
     }
-    for row in unreachable {
+    for row in ledger.unreachable {
         let Probe::Unreachable(why) = &row.probe else {
             continue;
         };
@@ -661,16 +719,62 @@ fn render_pending(
         );
         println!("{:<name_w$}  {why}", "");
     }
-    println!();
-    println!(
-        "{} pending · {current} current{}",
-        pending.len(),
-        if unreachable.is_empty() {
-            String::new()
-        } else {
-            format!(" · {} unreachable", unreachable.len())
+    if !ledger.rejected.is_empty() {
+        if drift_table {
+            println!();
         }
+        render_rejected(ledger.rejected);
+    }
+    println!();
+    println!("{}", counts(ledger));
+}
+
+/// Drift a human has already answered. Its own region, below the pending
+/// table: these rows are information, not work, and mixing them into the
+/// list of things to do is how a decided question gets asked again.
+fn render_rejected(rows: &[&Row]) {
+    println!("rejected · a human refused this candidate");
+    let name_w = column(rows.iter().map(|r| r.package.as_str()), "package");
+    println!(
+        "{:<name_w$}  {:<DRIFT_W$}  why",
+        "package", "reviewed → candidate"
     );
+    for row in rows {
+        let Probe::Rejected(candidate) = &row.probe else {
+            continue;
+        };
+        // The note came out of a synced file another host wrote, so it is
+        // neutered and folded like any other text pacrat did not author.
+        let why = match &row.rejected_note {
+            Some(note) => truncate(&visible_line(note).0, 60),
+            None => "—".to_string(),
+        };
+        println!(
+            "{:<name_w$}  {:<DRIFT_W$}  {why}",
+            truncate(&row.package, name_w),
+            drift_cell(&row.reviewed, short_hash(candidate)),
+        );
+    }
+}
+
+/// The tallies under the table. Every row of the ledger half is in exactly
+/// one of them, which is the point: pending plus rejected plus unreachable
+/// plus current is the ledger.
+fn counts(ledger: &Ledger) -> String {
+    let mut line = format!(
+        "{} pending · {} current",
+        ledger.pending.len(),
+        ledger.current
+    );
+    for (n, word) in [
+        (ledger.rejected.len(), "rejected"),
+        (ledger.unreachable.len(), "unreachable"),
+    ] {
+        if n > 0 {
+            line.push_str(&format!(" · {n} {word}"));
+        }
+    }
+    line
 }
 
 /// The upstream half: packages that would update outside curation.
@@ -746,6 +850,10 @@ fn column<'a>(values: impl Iterator<Item = &'a str>, header: &str) -> usize {
 #[derive(Serialize)]
 struct Report<'a> {
     pending: Vec<PendingJson<'a>>,
+    /// Candidates a human refused. Reported rather than dropped: a machine
+    /// reading this has to be able to tell "nothing moved" from "something
+    /// moved and we said no", which are different states of the world.
+    rejected: Vec<RejectedJson<'a>>,
     upstream: Vec<UpstreamJson<'a>>,
     /// Ledger rows whose remote could not be probed. The difference between
     /// "no update" and "could not ask" is the whole reason this verb degrades
@@ -771,6 +879,15 @@ struct PendingJson<'a> {
 }
 
 #[derive(Serialize)]
+struct RejectedJson<'a> {
+    package: &'a str,
+    reviewed: &'a str,
+    candidate: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'a str>,
+}
+
+#[derive(Serialize)]
 struct UpstreamJson<'a> {
     package: &'a str,
     installed: &'a str,
@@ -785,17 +902,31 @@ struct UnreachableJson<'a> {
 }
 
 fn report_json(
-    pending: &[&Row],
-    unreachable: &[&Row],
+    ledger: &Ledger,
     versions: &BTreeMap<String, String>,
-    current: usize,
     upstream: &UpstreamHalf,
 ) -> Result<(), String> {
     let report = Report {
         unchecked: &upstream.unchecked,
-        current,
-        ledger_checked: unreachable.is_empty(),
-        pending: pending
+        current: ledger.current,
+        ledger_checked: ledger.unreachable.is_empty(),
+        rejected: ledger
+            .rejected
+            .iter()
+            .filter_map(|row| {
+                let Probe::Rejected(candidate) = &row.probe else {
+                    return None;
+                };
+                Some(RejectedJson {
+                    package: &row.package,
+                    reviewed: &row.reviewed,
+                    candidate,
+                    note: row.rejected_note.as_deref(),
+                })
+            })
+            .collect(),
+        pending: ledger
+            .pending
             .iter()
             .filter_map(|row| {
                 let Probe::Pending(candidate) = &row.probe else {
@@ -823,7 +954,8 @@ fn report_json(
                 available: &u.available,
             })
             .collect(),
-        unreachable: unreachable
+        unreachable: ledger
+            .unreachable
             .iter()
             .filter_map(|row| {
                 let Probe::Unreachable(error) = &row.probe else {
@@ -1020,21 +1152,19 @@ mod tests {
         assert_eq!(aur_repo("https://aur.archlinux.org/a/b.git"), None);
     }
 
+    fn entry(name: &str) -> SourceEntry {
+        SourceEntry {
+            upstream: format!("https://aur.archlinux.org/{name}.git"),
+            reviewed: "3f9c21ab".into(),
+            role: Role::Vendored,
+            note: None,
+            rejected: None,
+            rejected_note: None,
+        }
+    }
+
     fn ledger(names: &[&str]) -> BTreeMap<String, SourceEntry> {
-        names
-            .iter()
-            .map(|n| {
-                (
-                    (*n).to_string(),
-                    SourceEntry {
-                        upstream: format!("https://aur.archlinux.org/{n}.git"),
-                        reviewed: "3f9c21ab".into(),
-                        role: Role::Vendored,
-                        note: None,
-                    },
-                )
-            })
-            .collect()
+        names.iter().map(|n| ((*n).to_string(), entry(n))).collect()
     }
 
     fn tracked(names: &[&str]) -> BTreeSet<String> {
@@ -1158,32 +1288,25 @@ mod tests {
         }
     }
 
+    fn row(package: &str, aur: Option<&str>, probe: Probe) -> Row {
+        Row {
+            package: package.into(),
+            reviewed: "3f9c21ab".into(),
+            role: Role::Vendored,
+            aur: aur.map(str::to_string),
+            probe,
+            rejected_note: None,
+        }
+    }
+
     #[test]
     fn one_rpc_batch_covers_both_halves_without_asking_twice() {
         let rows = vec![
-            Row {
-                package: "mdcat".into(),
-                reviewed: "3f9c21ab".into(),
-                role: Role::Vendored,
-                aur: Some("mdcat".into()),
-                probe: Probe::Pending("aa".into()),
-            },
+            row("mdcat", Some("mdcat"), Probe::Pending("aa".into())),
             // Current, so its version is never shown and never fetched.
-            Row {
-                package: "pacseek".into(),
-                reviewed: "3f9c21ab".into(),
-                role: Role::Vendored,
-                aur: Some("pacseek".into()),
-                probe: Probe::Current,
-            },
+            row("pacseek", Some("pacseek"), Probe::Current),
             // A non-AUR forge has no name the RPC would recognise.
-            Row {
-                package: "inhouse".into(),
-                reviewed: "3f9c21ab".into(),
-                role: Role::Maintained,
-                aur: None,
-                probe: Probe::Pending("bb".into()),
-            },
+            row("inhouse", None, Probe::Pending("bb".into())),
         ];
         let candidates = vec!["archi".to_string(), "mdcat".to_string()];
         // Sorted, deduped, and `mdcat` — wanted by both halves — asked once.
@@ -1191,6 +1314,75 @@ mod tests {
         assert!(rpc_names(&rows, &[]).contains(&"mdcat".to_string()));
         assert!(rpc_names(&[], &candidates).len() == 2);
         assert!(rpc_names(&[], &[]).is_empty());
+    }
+
+    /// A refusal is about one commit. It silences that candidate and nothing
+    /// else — the moment upstream moves, the question is new and unanswered.
+    #[test]
+    fn a_refusal_covers_the_commit_it_names_until_upstream_moves() {
+        let full = "7d02e4c1aaa2e7f10a7dd6c302256dd373516e56";
+        let moved = "0000000000000000000000000000000000000000";
+        let refused_at = |commit: &str| {
+            let mut e = entry("mdcat");
+            e.rejected = Some(commit.into());
+            e
+        };
+        assert!(refused(&refused_at(full), full));
+        // The ledger is hand-editable, so a short hash names the same commit.
+        assert!(refused(&refused_at("7d02e4c1"), full));
+        assert!(!refused(&refused_at(full), moved));
+        assert!(!refused(&entry("mdcat"), full));
+        // A `rejected` value that names no commit must not silence anything:
+        // an unreadable refusal leaves the row pending, the safe direction.
+        for junk in ["", "0", "zzzzzzzz", "HEAD"] {
+            assert!(!refused(&refused_at(junk), full), "{junk:?} silenced a row");
+        }
+    }
+
+    /// The whole point of recording a refusal: a rejected candidate is drift
+    /// that has been answered, so it is not work, so it is not a 10.
+    #[test]
+    fn a_rejected_candidate_is_not_pending() {
+        assert_eq!(code(outcome(0, 0, 0, false)), 0);
+        let rejected = [row("mdcat", None, Probe::Rejected("7d02e4c1".into()))];
+        let refs: Vec<&Row> = rejected.iter().collect();
+        let ledger = Ledger {
+            pending: &[],
+            rejected: &refs,
+            unreachable: &[],
+            current: 2,
+        };
+        // It is not silence, though: the row is in the report and in the
+        // tallies, where a reader can see the decision that was made.
+        assert!(!ledger.quiet());
+        assert_eq!(counts(&ledger), "0 pending · 2 current · 1 rejected");
+    }
+
+    #[test]
+    fn the_tallies_account_for_every_row() {
+        let pending = [row("a", None, Probe::Pending("aa".into()))];
+        let unreachable = [row("b", None, Probe::Unreachable("no".into()))];
+        let (p, u): (Vec<&Row>, Vec<&Row>) =
+            (pending.iter().collect(), unreachable.iter().collect());
+        assert_eq!(
+            counts(&Ledger {
+                pending: &p,
+                rejected: &[],
+                unreachable: &u,
+                current: 3,
+            }),
+            "1 pending · 3 current · 1 unreachable"
+        );
+        // The quiet ledger says the two numbers that exist and no more.
+        assert_eq!(
+            counts(&Ledger {
+                pending: &[],
+                rejected: &[],
+                unreachable: &[],
+                current: 4,
+            }),
+            "0 pending · 4 current"
+        );
     }
 
     #[test]

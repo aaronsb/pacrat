@@ -478,6 +478,48 @@ fn grade_with(grader: &Grader, dir: &Path, subj: &Subj) -> Outcome {
     }
 }
 
+/// One grading, on pacrat's report. `freshness` says where it came from —
+/// the grader just now, or the cache.
+///
+/// Every field here is the grader's text on pacrat's own report, so it goes
+/// through `visible_line`: neutered *and* flattened, because a newline in a
+/// title would otherwise let a grader write a line that looks exactly like
+/// one of pacrat's.
+fn print_grading(name: &str, report: &GradeReport, freshness: &str) {
+    let mut line = format!(
+        "grade {} of {}-{} · {freshness}",
+        report.grade, report.scale.min, report.scale.max
+    );
+    // Only worth saying when the grader used its own scale.
+    if report.scale != PACRAT_SCALE {
+        line.push_str(&format!(" · pacrat {} of 0-4", report.pacrat_grade()));
+    }
+    println!("result    {line}");
+
+    let (reported, _) = visible_line(&report.grader);
+    if reported != name {
+        println!("reports   as {:?}", truncate(&reported, 40));
+    }
+    if let Some(note) = report.meta.get("note").and_then(|v| v.as_str()) {
+        println!("note      {}", truncate(&visible_line(note).0, 90));
+    }
+
+    for f in report.top_findings(FINDINGS_SHOWN) {
+        let (title, _) = visible_line(&f.title);
+        let span = match &f.span {
+            Some(s) => format!("{} · ", truncate(&visible_line(s).0, 30)),
+            None => String::new(),
+        };
+        println!("finding   [{}] {span}{}", f.level, truncate(&title, 80));
+    }
+    if report.findings.len() > FINDINGS_SHOWN {
+        println!(
+            "          … and {} more finding(s)",
+            report.findings.len() - FINDINGS_SHOWN
+        );
+    }
+}
+
 fn report_outcome(dir: &Path, commit: &str, digest: &str, name: &str, outcome: &Outcome) {
     match outcome {
         Outcome::Graded { report, took } => {
@@ -485,42 +527,7 @@ fn report_outcome(dir: &Path, commit: &str, digest: &str, name: &str, outcome: &
                 None => "cached".to_string(),
                 Some(d) => format!("fresh {:.1}s", d.as_secs_f64()),
             };
-            let mut line = format!(
-                "grade {} of {}-{} · {freshness}",
-                report.grade, report.scale.min, report.scale.max
-            );
-            // Only worth saying when the grader used its own scale.
-            if report.scale != PACRAT_SCALE {
-                line.push_str(&format!(" · pacrat {} of 0-4", report.pacrat_grade()));
-            }
-            println!("result    {line}");
-
-            // Every field below is the grader's text on pacrat's own report,
-            // so it goes through `visible_line`: neutered *and* flattened,
-            // because a newline in a title would otherwise let a grader
-            // write a line that looks exactly like one of pacrat's.
-            let (reported, _) = visible_line(&report.grader);
-            if reported != name {
-                println!("reports   as {:?}", truncate(&reported, 40));
-            }
-            if let Some(note) = report.meta.get("note").and_then(|v| v.as_str()) {
-                println!("note      {}", truncate(&visible_line(note).0, 90));
-            }
-
-            for f in report.top_findings(FINDINGS_SHOWN) {
-                let (title, _) = visible_line(&f.title);
-                let span = match &f.span {
-                    Some(s) => format!("{} · ", truncate(&visible_line(s).0, 30)),
-                    None => String::new(),
-                };
-                println!("finding   [{}] {span}{}", f.level, truncate(&title, 80));
-            }
-            if report.findings.len() > FINDINGS_SHOWN {
-                println!(
-                    "          … and {} more finding(s)",
-                    report.findings.len() - FINDINGS_SHOWN
-                );
-            }
+            print_grading(name, report, &freshness);
         }
         Outcome::Failed { reason, elapsed } => {
             println!(
@@ -624,7 +631,11 @@ fn summarize(ctx: &Ctx, answers: &[Answer]) -> Verdict {
 /// The line the whole command exists to print. The thresholds are named on
 /// it because the same grade is a different verdict on another host: the
 /// number came from the grader, the reading of it is this host's config.
-fn verdict_line(t: &Thresholds, grade: Option<u8>) -> Verdict {
+///
+/// Shared with `review` and `adopt-update`: the verdict a human reads before
+/// deciding has to be the same sentence, computed the same way, as the one
+/// `grade` printed when the gradings were made.
+pub fn verdict_line(t: &Thresholds, grade: Option<u8>) -> Verdict {
     let verdict = t.verdict(grade);
     let named = format!("pacrat thresholds warn≥{} block≥{}", t.warn_at, t.block_at);
     match grade {
@@ -929,20 +940,12 @@ fn record_failure(
     write_cache(path, &format!("{record:#}\n"))
 }
 
-/// Cached gradings for this subject from graders that are not in the config
-/// — the built-in `manual` one, or a grader since removed. Unreadable and
+/// Every cached grading of this subject, by grader name. Unreadable and
 /// stale files are skipped: this is a scan, and a stray file here must not
 /// fail the run.
 ///
-/// These are *evidence*, not answers. See `pacrat_core::grading`'s quorum
-/// rule for what they may and may not do to a verdict.
-fn other_cached(
-    dir: &Path,
-    commit: &str,
-    tree: &str,
-    configured: &[Grader],
-    package: &str,
-) -> Vec<(String, GradeReport)> {
+/// `manual` first, then alphabetical — a human's reading leads.
+fn scan_cached(dir: &Path, commit: &str, tree: &str, package: &str) -> Vec<(String, GradeReport)> {
     let prefix = format!("{commit}.");
     let mut found: Vec<(String, GradeReport)> = fs::read_dir(dir)
         .into_iter()
@@ -956,7 +959,7 @@ fn other_cached(
                 return None;
             }
             let name = file.strip_prefix(&prefix)?.strip_suffix(".json")?;
-            if name.is_empty() || configured.iter().any(|g| g.name == name) {
+            if name.is_empty() {
                 return None;
             }
             match read_cache(&e.path(), package, commit, tree) {
@@ -965,9 +968,136 @@ fn other_cached(
             }
         })
         .collect();
-    // `manual` first, then alphabetical: a human's reading leads.
     found.sort_by(|a, b| (a.0 != MANUAL, &a.0).cmp(&(b.0 != MANUAL, &b.0)));
     found
+}
+
+/// Cached gradings for this subject from graders that are not in the config
+/// — the built-in `manual` one, or a grader since removed.
+///
+/// These are *evidence*, not answers. See `pacrat_core::grading`'s quorum
+/// rule for what they may and may not do to a verdict.
+fn other_cached(
+    dir: &Path,
+    commit: &str,
+    tree: &str,
+    configured: &[Grader],
+    package: &str,
+) -> Vec<(String, GradeReport)> {
+    scan_cached(dir, commit, tree, package)
+        .into_iter()
+        .filter(|(name, _)| !configured.iter().any(|g| &g.name == name))
+        .collect()
+}
+
+// ------------------------------------------------------- reading it back
+//
+// What `review` and `adopt-update` need, and all they need: the record, not
+// the machinery that makes one. Deciding is not grading — a viewer that
+// quietly spawned an LLM would be a surprise with a bill attached — so
+// everything below reads and nothing below runs or writes.
+
+/// One cached grading, and whether it is entitled to answer for this host.
+pub struct Cached {
+    /// The grader's name as the cache filed it.
+    pub grader: String,
+    pub standing: Standing,
+    pub report: GradeReport,
+}
+
+impl Cached {
+    fn contribution(&self) -> Contribution {
+        Contribution::new(self.standing, Some(self.report.pacrat_grade()))
+    }
+}
+
+/// Every cached grading of `package` at `commit` whose recorded tree digest
+/// is `digest`.
+///
+/// The digest is not decoration: a candidate is graded as *bytes*, and these
+/// are the bytes about to be adopted. A grading of the same commit against a
+/// different tree is not a grading of this candidate and does not appear
+/// here — same rule the grade cache applies to itself.
+pub fn cached(ctx: &Ctx, package: &str, commit: &str, digest: &str) -> Result<Vec<Cached>, String> {
+    let commit = check_commit(commit)?;
+    let dir = cache_dir(package)?;
+    Ok(scan_cached(&dir, commit, digest, package)
+        .into_iter()
+        .map(|(grader, report)| Cached {
+            standing: standing_of(&grader, &ctx.config.graders),
+            grader,
+            report,
+        })
+        .collect())
+}
+
+/// A cached grading's standing: whose answer is it, as far as this host is
+/// concerned right now? A grader in the config answered; a human always
+/// answers; anything else on disk is evidence from a tool this host has
+/// since stopped running.
+fn standing_of(name: &str, configured: &[Grader]) -> Standing {
+    if name == MANUAL {
+        Standing::Manual
+    } else if configured.iter().any(|g| g.name == name) {
+        Standing::Configured
+    } else {
+        Standing::Retired
+    }
+}
+
+/// Why a grader has no grading of this subject, if it left a record saying
+/// so. `None` covers both "never asked" and "the record is about other
+/// bytes" — neither of which is a reason to show the reader anything.
+pub fn cached_failure(package: &str, commit: &str, digest: &str, grader: &str) -> Option<String> {
+    let commit = check_commit(commit).ok()?;
+    read_failure(
+        &failed_path(&cache_dir(package).ok()?, commit, grader),
+        digest,
+    )
+}
+
+fn read_failure(path: &Path, digest: &str) -> Option<String> {
+    let record: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    let field = |key: &str| record.get(key)?.as_str();
+    if field("pacrat") != Some(FAILURE_TAG) || field("tree") != Some(digest) {
+        return None;
+    }
+    // A grader's own text about its own failure: neutered like everything
+    // else it says.
+    Some(truncate(&visible_line(field("reason")?).0, 120))
+}
+
+/// Print one cached grading exactly as `pacrat grade` prints a fresh one —
+/// same fields, same neutering, same order. A reviewer reading `review` and
+/// a reviewer reading `grade` must be reading the same report.
+pub fn print_cached(c: &Cached) {
+    let (name, _) = visible_line(&c.grader);
+    println!("grader    {}", truncate(&name, 40));
+    print_grading(&c.grader, &c.report, "cached");
+    if c.standing == Standing::Retired {
+        println!(
+            "standing  {} is not in this host's config — its grade can make this \
+             verdict worse, and can never make one exist",
+            truncate(&name, 40)
+        );
+    }
+}
+
+/// The grade a set of cached gradings answers with: the worst on record if
+/// anybody with standing answered, and `None` — ungraded, which holds — if
+/// nobody did.
+///
+/// Returns the grade rather than the verdict so that a caller feeds it to
+/// [`verdict_line`] and prints the same sentence `grade` prints. Two code
+/// paths that derive a verdict separately are two code paths that can come
+/// to different answers about the same package.
+pub fn cached_grade(gradings: &[Cached]) -> Option<u8> {
+    let contributions: Vec<Contribution> = gradings.iter().map(Cached::contribution).collect();
+    // The quorum rule: only a configured grader or a human answers, and the
+    // worst grade on record — retired ones included — is the answer.
+    has_quorum(&contributions)
+        .then(|| worst_grade(&contributions))
+        .flatten()
 }
 
 // ----------------------------------------------------------------- helpers
@@ -1627,6 +1757,90 @@ mod tests {
             !ok_path(&f.dir, FULL, "broken").exists(),
             "a failure was cached as a grading"
         );
+    }
+
+    // ---- reading it back (what `review` and `adopt-update` gate on) ----
+
+    fn cached_of(standing: Standing, grade: u8) -> Cached {
+        Cached {
+            grader: "x".into(),
+            standing,
+            report: GradeReport::from_json(&report_json("mdcat", FULL, grade)).unwrap(),
+        }
+    }
+
+    #[test]
+    fn standing_follows_this_hosts_config_not_the_file() {
+        let configured = vec![grader("yay-friend", vec!["x".into()])];
+        assert_eq!(standing_of(MANUAL, &configured), Standing::Manual);
+        assert_eq!(standing_of("yay-friend", &configured), Standing::Configured);
+        assert_eq!(standing_of("yay-friend", &[]), Standing::Retired);
+        assert_eq!(standing_of("gone", &configured), Standing::Retired);
+    }
+
+    /// The quorum rule, as the deciding verbs see it: a grading nobody on
+    /// this host would run cannot make a verdict exist, and can still make
+    /// one worse. Same rule as `summarize`, reached by a different door,
+    /// which is exactly why it is pinned here too.
+    #[test]
+    fn cached_gradings_answer_only_when_somebody_with_standing_did() {
+        assert_eq!(cached_grade(&[]), None);
+        assert_eq!(cached_grade(&[cached_of(Standing::Retired, 4)]), None);
+        assert_eq!(cached_grade(&[cached_of(Standing::Manual, 2)]), Some(2));
+        assert_eq!(cached_grade(&[cached_of(Standing::Configured, 0)]), Some(0));
+        // Worst wins across every standing once anyone has answered.
+        assert_eq!(
+            cached_grade(&[
+                cached_of(Standing::Manual, 0),
+                cached_of(Standing::Retired, 3)
+            ]),
+            Some(3)
+        );
+        // And the verdict that comes of it is this host's reading.
+        let t = Thresholds::default();
+        assert_eq!(
+            t.verdict(cached_grade(&[cached_of(Standing::Retired, 4)])),
+            Verdict::Ungraded
+        );
+        assert_eq!(
+            t.verdict(cached_grade(&[cached_of(Standing::Configured, 4)])),
+            Verdict::Block
+        );
+    }
+
+    /// A failure record is only about the bytes it names. Reading one
+    /// against a different tree would explain a candidate's silence with
+    /// another candidate's excuse.
+    #[test]
+    fn a_recorded_failure_is_read_back_only_for_the_bytes_it_is_about() {
+        let f = Fixture::new("failread");
+        let tree = "d".repeat(64);
+        record_failure(
+            &failed_path(&f.dir, FULL, "stub"),
+            "stub",
+            FULL,
+            &tree,
+            "timed out after 300s\x1b[2K",
+        )
+        .unwrap();
+
+        let path = failed_path(&f.dir, FULL, "stub");
+        let reason = read_failure(&path, &tree).unwrap();
+        assert!(reason.contains("timed out after 300s"));
+        // The grader wrote that reason; it does not get to paint with it.
+        assert!(!reason.contains('\x1b'), "{reason}");
+
+        // Another tree's failure explains nothing about these bytes.
+        assert_eq!(read_failure(&path, &"e".repeat(64)), None);
+        // Nor does a grading, or a file that is not there.
+        write_grading(
+            &ok_path(&f.dir, FULL, "stub"),
+            &tree,
+            &report_json("mdcat", FULL, 0),
+        )
+        .unwrap();
+        assert_eq!(read_failure(&ok_path(&f.dir, FULL, "stub"), &tree), None);
+        assert_eq!(read_failure(Path::new("/nonexistent"), &tree), None);
     }
 
     /// An interrupted write must not leave a half-written grading behind:

@@ -13,6 +13,7 @@ mod live;
 mod out;
 mod pacman;
 mod proc;
+mod review;
 mod search;
 mod setup;
 mod status;
@@ -76,7 +77,34 @@ enum Command {
         format: updates::Format,
     },
     /// Review one pending update (diff since reviewed commit + gradings)
+    ///
+    /// Shows and decides nothing: exits 0 whatever the verdict, because
+    /// being shown a BLOCK is not being refused anything. `adopt-update`
+    /// and `build` are the verbs that hold.
     Review { package: String },
+    /// Adopt a reviewed candidate: its tree into the store, its commit into
+    /// the ledger.
+    ///
+    /// Exits 10 when it deliberately does not act — a BLOCK verdict, a
+    /// declined prompt, or a candidate that was rejected before.
+    AdoptUpdate {
+        package: String,
+        /// The candidate you reviewed. Upstream having moved past it is a
+        /// refusal, never a substitution.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Skip the prompt (scripting); also required to re-adopt a
+        /// candidate that was rejected
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Refuse the current candidate, so `updates` stops calling it pending
+    Reject {
+        package: String,
+        /// Why — recorded in the ledger beside the commit
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Record a grading (runs configured graders; --grade N for manual)
     Grade {
         package: String,
@@ -154,6 +182,16 @@ fn main() {
             note.as_deref(),
             refresh,
         ),
+        Some(Command::Review { ref package }) => review::run(&ctx, package),
+        Some(Command::AdoptUpdate {
+            ref package,
+            ref commit,
+            yes,
+        }) => review::adopt(&ctx, package, commit.as_deref(), yes),
+        Some(Command::Reject {
+            ref package,
+            ref note,
+        }) => review::reject(&ctx, package, note.as_deref()),
         Some(Command::Build { ref packages }) => build::run(&ctx, packages),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
