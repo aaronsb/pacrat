@@ -14,10 +14,11 @@ The rat curates the pantry; the little chef does the tasting.
 - **Mascot:** `art/petit-chef.html` — the 38×32 block-character grid the
   about screen renders as half-blocks
 
-Status: scaffold. `pacrat-core` holds the first model types (custody ladder,
-grade→verdict thresholds); `pacrat-cli` holds the clap surface matching the
-mockup's CLI-parity table. Nothing is implemented yet — ADR-001's open
-questions come first.
+Status: the CLI works. `status`, `hosts`, `add`, `setup`, `vendor`, `search`,
+`info`, `build`, `updates`, `grade`, `review`/`adopt-update`/`reject`, and
+`sync` are implemented and tested; the one-shot update loop (`pacrat update`)
+waits on ADR-001's open questions, and the TUI is next. The mockup shows
+where it's all headed.
 
 ## Graders
 
