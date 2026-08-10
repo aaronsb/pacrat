@@ -50,6 +50,14 @@ impl Cmd {
         Self { argv, stdin: None }
     }
 
+    /// A command that is not elevated but still walks the confirmed flow —
+    /// `sync --run`'s plan has `pacrat` and `flatpak` lines beside its sudo
+    /// ones, and a plan half of whose commands skipped the question would
+    /// not be a walked plan.
+    pub fn plain(argv: Vec<String>) -> Self {
+        Self { argv, stdin: None }
+    }
+
     /// Feed the command this file on stdin. Part of the printed line (`<
     /// path`), because a command whose input is hidden is a command the
     /// human cannot judge.
@@ -137,6 +145,10 @@ impl Session {
             return Ok(false);
         }
         Ok(is_yes(&answer))
+    }
+
+    pub fn any_declined(&self) -> bool {
+        self.done.iter().any(|(_, v)| *v == Verdict::Declined)
     }
 
     pub fn any_failed(&self) -> bool {

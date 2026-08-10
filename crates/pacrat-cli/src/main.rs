@@ -181,16 +181,17 @@ enum Command {
     Decisions,
     /// Host-vs-manifest matrix
     Hosts,
-    /// Plan this host toward the manifest (prints commands, runs none)
+    /// Plan this host toward the manifest (prints commands; --run walks
+    /// them, one confirm each)
     ///
     /// There is no <host> argument: sync transport — ssh to remote hosts, or
     /// each host syncing itself — is ADR-001's open question 4 and is not
     /// settled, so pacrat plans only for the machine it runs on. Close another
     /// host's drift by running `pacrat sync` there.
     ///
-    /// Exits 0 when this host matches the store, 10 when a plan was printed
-    /// (deliberately not acted on — the commands are yours to run), and 1 when
-    /// the check itself could not run.
+    /// Exits 0 when this host matches the store (or --run confirmed and ran
+    /// everything), 10 when a plan was printed or anything was declined, and
+    /// 1 when the check — or a confirmed command — failed.
     Sync {
         /// Also print the removals for installed-but-untracked packages
         #[arg(long)]
@@ -198,6 +199,11 @@ enum Command {
         /// One JSON object instead of the report
         #[arg(long)]
         json: bool,
+        /// Walk the plan at the terminal: each command is printed and asked
+        /// about, then run exactly as shown. There is no --yes; headless
+        /// runs keep getting the printed plan.
+        #[arg(long)]
+        run: bool,
     },
     /// Publish a maintained package to its upstream (queues while the AUR is
     /// read-only).
@@ -410,7 +416,7 @@ fn run(ctx: &ctx::Ctx, command: Option<Command>) -> Result<(), String> {
             ref note,
         }) => review::reject(ctx, package, note.as_deref()),
         Some(Command::Build { ref packages }) => build::run(ctx, packages),
-        Some(Command::Sync { prune, json }) => sync::run(ctx, prune, json),
+        Some(Command::Sync { prune, json, run }) => sync::run(ctx, prune, json, run),
         Some(Command::Push {
             ref package,
             retry,

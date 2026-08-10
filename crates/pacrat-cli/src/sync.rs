@@ -1,6 +1,7 @@
 //! `pacrat sync` — this host against the store: what the manifest says should
 //! be installed here, what actually is, and the exact commands that move it
-//! toward the store. It prints them. It runs none of them.
+//! toward the store. It prints them; by default it runs none of them, and
+//! `--run` (ADR-003) walks them one confirmed step at a time.
 //!
 //! *Toward*, not *into line*: a plan is not always one pass. A package that
 //! has to be vendored and built is not installable until those steps have
@@ -18,23 +19,29 @@
 //! installed set would be the wrong answer to a reasonable-looking question,
 //! so the question is not offered.
 //!
-//! ## Why it executes nothing
+//! ## Why the default executes nothing, and what `--run` changes
 //!
 //! `setup` set the precedent for the root-owned half of pacrat: print the
 //! sudo lines, run only what the invoking user could already run unaided.
-//! Sync goes one step further and runs nothing at all — the human reading the
-//! list is the gate, which is the same argument the whole curation model
-//! makes. The one exception it may take for itself: none.
+//! Sync's default goes one step further and runs nothing at all — the human
+//! reading the list is the gate, which is the same argument the whole
+//! curation model makes.
 //!
-//! That is also why the marker contract (ADR-001; `setup.rs`, `MARKER`) never
-//! comes up here — no pacman transaction, so no PreTransaction hook, so
-//! nothing to stand down. **If sync ever grows an `--apply`, the marker must
-//! bracket any pacman invocation it makes**: write `pid=<pid> started=<unix
-//! seconds>` into the repo directory before, remove it after. `pacman -S`
-//! from the curated repo happens to pass the guard on its own (every name it
-//! installs resolves in a sync db, which is exactly what the guard checks) —
-//! but that is a property of *today's* guard, not a licence to skip the
-//! marker, and anything installing a package *file* is aborted without it.
+//! `--run` (ADR-003) does not weaken that gate, it moves it per command:
+//! every plan line walks through `elevate::Session` — printed, confirmed
+//! with a y/n on a real terminal, then executed exactly as printed. The
+//! argv is the plan's own data; the printed line is derived from it, never
+//! the reverse, so what was confirmed is what runs. No terminal, no walk:
+//! the plan prints as always and the commands stay yours. There is no
+//! `--yes`, deliberately — a plan answered by a pipe is the accident the
+//! question exists to catch.
+//!
+//! The marker contract (ADR-001; `setup.rs`, `MARKER`) still never comes up
+//! here: `--run` executes the same commands the human would have pasted,
+//! and those install from sync databases — which is exactly what the guard
+//! checks — never package files. **If sync ever runs anything that hands
+//! pacman a package *file*, the marker must bracket it**: write `pid=<pid>
+//! started=<unix seconds>` into the repo directory before, remove it after.
 //!
 //! ## Exit codes
 //!
@@ -45,6 +52,10 @@
 //! without `--prune` are drift too, so they also earn a 10: the run found
 //! work, it just found work whose resolution is a choice between two
 //! commands rather than one.
+//!
+//! `--run` keeps the same scale: 0 when everything offered was confirmed
+//! and ran, 10 when anything was declined (or there was no terminal to
+//! ask on), 1 when a confirmed command failed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -64,7 +75,14 @@ use crate::setup;
 /// to paste — so this bounds the prose only.
 const CAP: usize = 20;
 
-pub fn run(ctx: &Ctx, prune: bool, json: bool) -> Result<(), String> {
+pub fn run(ctx: &Ctx, prune: bool, json: bool, walk: bool) -> Result<(), String> {
+    if json && walk {
+        return Err(
+            "--run asks questions at a terminal and --json is one object for a machine — \
+             use one or the other"
+                .into(),
+        );
+    }
     let repo = &ctx.config.repo;
     let repo_path = PathBuf::from(&repo.path);
     let ledger = ctx.load_sources()?;
@@ -125,10 +143,43 @@ pub fn run(ctx: &Ctx, prune: bool, json: bool) -> Result<(), String> {
     }
 
     if plan.in_sync() {
-        Ok(())
-    } else {
+        return Ok(());
+    }
+    if !walk {
         std::process::exit(crate::HELD)
     }
+    walk_plan(&commands)
+}
+
+/// `--run`: the printed plan, walked through the confirmed flow — one y/n
+/// per command, executed exactly as shown. Every rule is `elevate`'s; what
+/// belongs here is only the fallback (no terminal: the plan stands, nothing
+/// runs) and the exit code.
+fn walk_plan(commands: &[PlannedCmd]) -> Result<(), String> {
+    println!();
+    if commands.is_empty() {
+        // Drift with no commands — extras without --prune. There is nothing
+        // to walk, and the drift is still drift.
+        std::process::exit(crate::HELD)
+    }
+    let Some(mut flow) = crate::elevate::Session::open() else {
+        println!("run       --run needs a terminal to ask on — nothing was run; the");
+        println!("          commands above are yours.");
+        std::process::exit(crate::HELD)
+    };
+    println!("run       walking the plan — one confirm per command, no way to say");
+    println!("          yes to all of it at once");
+    for cmd in commands {
+        flow.run(crate::elevate::Cmd::plain(cmd.argv.clone()));
+    }
+    flow.report();
+    if flow.any_failed() {
+        return Err("a command failed — see above. `pacrat sync` again shows what is left.".into());
+    }
+    if flow.any_declined() {
+        std::process::exit(crate::HELD)
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ the plan
@@ -308,42 +359,43 @@ impl Plan {
     ///
     /// Pure — `repo` is passed in rather than read from the config, so the
     /// whole rendering stays testable as data.
-    fn commands(&self, repo: &str, prune: bool) -> Vec<String> {
+    fn commands(&self, repo: &str, prune: bool) -> Vec<PlannedCmd> {
         let mut cmds = Vec::new();
         // `vendor` takes one package and prompts for a review of it; there is
         // no batch form to print, and there should not be.
         for package in &self.vendor_first {
-            cmds.push(format!("pacrat vendor {}", shell_quote(package)));
+            cmds.push(PlannedCmd::new(
+                ["pacrat", "vendor"],
+                std::slice::from_ref(package),
+            ));
         }
         if !self.build_first.is_empty() {
-            cmds.push(format!("pacrat build {}", quoted(&self.build_first)));
+            cmds.push(PlannedCmd::new(["pacrat", "build"], &self.build_first));
         }
         if !self.install.is_empty() {
-            cmds.push(format!(
-                "sudo pacman -S --needed -- {}",
-                self.install
-                    .iter()
-                    .map(|p| shell_quote(&self.qualify(repo, p)))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+            let qualified: Vec<String> =
+                self.install.iter().map(|p| self.qualify(repo, p)).collect();
+            cmds.push(PlannedCmd::new(
+                ["sudo", "pacman", "-S", "--needed", "--"],
+                &qualified,
             ));
         }
         if !self.flatpak.is_empty() {
-            cmds.push(format!(
-                "flatpak install -y --noninteractive {}",
-                quoted(&self.flatpak)
+            cmds.push(PlannedCmd::new(
+                ["flatpak", "install", "-y", "--noninteractive"],
+                &self.flatpak,
             ));
         }
         if prune {
             let extra = self.extra_pacman();
             if !extra.is_empty() {
-                cmds.push(format!("sudo pacman -Rns -- {}", quoted(&extra)));
+                cmds.push(PlannedCmd::new(["sudo", "pacman", "-Rns", "--"], &extra));
             }
             let flatpaks = self.extra_flatpak();
             if !flatpaks.is_empty() {
-                cmds.push(format!(
-                    "flatpak uninstall -y --noninteractive {}",
-                    quoted(flatpaks)
+                cmds.push(PlannedCmd::new(
+                    ["flatpak", "uninstall", "-y", "--noninteractive"],
+                    flatpaks,
                 ));
             }
         }
@@ -373,14 +425,32 @@ impl Plan {
     }
 }
 
-/// Every name shell-quoted, space-joined — the argument tail of a command
-/// line. Uncapped on purpose: this is meant to be pasted.
-fn quoted(names: &[String]) -> String {
-    names
-        .iter()
-        .map(|n| shell_quote(n))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// One planned command. The argv is the real thing — `--run` hands exactly
+/// this vector to exec, no shell anywhere — and the printed line is derived
+/// from it, never the reverse, so the plan cannot show one command and run
+/// another.
+#[derive(Debug, PartialEq, Eq)]
+struct PlannedCmd {
+    argv: Vec<String>,
+}
+
+impl PlannedCmd {
+    fn new<const N: usize>(program: [&str; N], args: &[String]) -> Self {
+        let mut argv: Vec<String> = program.iter().map(|s| (*s).to_string()).collect();
+        argv.extend(args.iter().cloned());
+        Self { argv }
+    }
+
+    /// The pasteable line: every element shell-quoted, space-joined, never
+    /// truncated — this is meant to be pasted (or, under `--run`, it is the
+    /// line the confirm question is about).
+    fn line(&self) -> String {
+        self.argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 // ---------------------------------------------------------------- the repo
@@ -440,7 +510,7 @@ fn report_text(
     ctx: &Ctx,
     drifts: &[SourceDrift],
     plan: &Plan,
-    commands: &[String],
+    commands: &[PlannedCmd],
     prune: bool,
     state: &setup::State,
 ) {
@@ -568,9 +638,9 @@ fn report_text(
     }
 
     println!();
-    println!("commands  nothing below has been run — `pacrat sync` only prints");
+    println!("commands  nothing below has been run — bare `pacrat sync` only prints");
     for cmd in commands {
-        println!("  {cmd}");
+        println!("  {}", cmd.line());
     }
     if commands.is_empty() {
         println!("  (none — every item above needs a decision first)");
@@ -644,8 +714,9 @@ struct Report<'a> {
     /// the plan works around; empty is the normal case.
     double_tracked: Vec<DoubleTrackedJson<'a>>,
     repo: RepoJson<'a>,
-    /// Shell-ready, in the order they may be run. Never truncated.
-    commands: &'a [String],
+    /// Shell-ready lines, in the order they may be run. Never truncated.
+    /// Derived from the same argvs `--run` executes.
+    commands: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -729,7 +800,7 @@ fn report_json(
     ctx: &Ctx,
     drifts: &[SourceDrift],
     plan: &Plan,
-    commands: &[String],
+    commands: &[PlannedCmd],
     prune: bool,
     state: &setup::State,
 ) -> Result<(), String> {
@@ -778,7 +849,7 @@ fn report_json(
             serving: state.complete(),
             missing: state.missing(),
         },
-        commands,
+        commands: commands.iter().map(PlannedCmd::line).collect(),
     };
     let text = serde_json::to_string_pretty(&report).map_err(|e| format!("json: {e}"))?;
     println!("{text}");
@@ -941,6 +1012,31 @@ role = "maintained"
 
     // ---- the commands ----
 
+    /// The plan's commands as their printed lines. Most assertions below are
+    /// about the rendering, which is derived from the argvs `--run` executes
+    /// — one direction, so testing the lines tests both.
+    fn lines(p: &Plan, repo: &str, prune: bool) -> Vec<String> {
+        p.commands(repo, prune)
+            .iter()
+            .map(PlannedCmd::line)
+            .collect()
+    }
+
+    /// The other direction, once: the argv really is data — a name that the
+    /// *line* must quote stays exactly one unquoted element of the vector
+    /// exec receives, because there is no shell on the `--run` path at all.
+    #[test]
+    fn the_argv_is_data_and_the_line_is_derived_from_it() {
+        let drifts = vec![sd(Source::Native, &["two words"], &[])];
+        let p = plan(&drifts, &served_set(&[]), &Sources::default());
+        let cmds = p.commands(REPO, false);
+        assert_eq!(
+            cmds[0].argv,
+            ["sudo", "pacman", "-S", "--needed", "--", "two words"]
+        );
+        assert_eq!(cmds[0].line(), "sudo pacman -S --needed -- 'two words'");
+    }
+
     #[test]
     fn commands_run_top_to_bottom_in_dependency_order() {
         let drifts = vec![
@@ -950,7 +1046,7 @@ role = "maintained"
         ];
         let p = plan(&drifts, &served_set(&["mdcat"]), &ledger());
         assert_eq!(
-            p.commands(REPO, true),
+            lines(&p, REPO, true),
             vec![
                 "pacrat vendor pacseek",
                 "pacrat build playtimed",
@@ -968,7 +1064,7 @@ role = "maintained"
         let drifts = vec![sd(Source::Native, &["ripgrep"], &["cowsay"])];
         let p = plan(&drifts, &served_set(&[]), &ledger());
         assert_eq!(
-            p.commands(REPO, false),
+            lines(&p, REPO, false),
             vec!["sudo pacman -S --needed -- ripgrep"]
         );
     }
@@ -979,7 +1075,7 @@ role = "maintained"
     fn uninstallable_names_stay_out_of_the_install_line() {
         let drifts = vec![sd(Source::Aur, &["pacseek", "playtimed"], &[])];
         let p = plan(&drifts, &served_set(&[]), &ledger());
-        let cmds = p.commands(REPO, false);
+        let cmds = lines(&p, REPO, false);
         assert!(!cmds.iter().any(|c| c.contains("pacman -S")), "{cmds:?}");
         assert_eq!(
             cmds,
@@ -993,7 +1089,7 @@ role = "maintained"
         let drifts = vec![sd(Source::Aur, &["a-pkg", "b-pkg", "c-pkg"], &[])];
         let p = plan(&drifts, &served_set(&[]), &Sources::default());
         assert_eq!(
-            p.commands(REPO, false),
+            lines(&p, REPO, false),
             vec![
                 "pacrat vendor a-pkg",
                 "pacrat vendor b-pkg",
@@ -1016,7 +1112,7 @@ role = "maintained"
             &["$(id)", "two words"],
         )];
         let p = plan(&drifts, &served_set(&[]), &Sources::default());
-        let cmds = p.commands(REPO, true);
+        let cmds = lines(&p, REPO, true);
         assert_eq!(
             cmds,
             vec![
@@ -1041,16 +1137,16 @@ role = "maintained"
         let drifts = vec![sd(Source::Native, &["mdcat", "ripgrep"], &[])];
         let p = plan(&drifts, &served_set(&["mdcat"]), &ledger());
         assert_eq!(
-            p.commands(REPO, false),
+            lines(&p, REPO, false),
             vec!["sudo pacman -S --needed -- dotfiles-aur/mdcat ripgrep"]
         );
         // The prefix is the configured repo's, not a constant.
         assert_eq!(
-            p.commands("other-repo", false),
+            lines(&p, "other-repo", false),
             vec!["sudo pacman -S --needed -- other-repo/mdcat ripgrep"]
         );
         // `/` needs no quoting, so the pair stays one readable word.
-        assert!(!p.commands(REPO, false)[0].contains('\''));
+        assert!(!lines(&p, REPO, false)[0].contains('\''));
     }
 
     /// A name in two of this host's lists asked for two different things —
@@ -1072,7 +1168,7 @@ role = "maintained"
             vec![("vv".to_string(), vec![Source::Native, Source::Aur])]
         );
         assert_eq!(
-            p.commands(REPO, false),
+            lines(&p, REPO, false),
             vec!["pacrat vendor vv", "sudo pacman -S --needed -- ripgrep"]
         );
     }
@@ -1089,7 +1185,7 @@ role = "maintained"
         assert_eq!(p.build_first, v(&["playtimed"]));
         assert!(p.install.is_empty());
         assert!(p.curated.is_empty());
-        assert_eq!(p.commands(REPO, false), vec!["pacrat build playtimed"]);
+        assert_eq!(lines(&p, REPO, false), vec!["pacrat build playtimed"]);
     }
 
     /// One name, one list: the ordinary case reports no inconsistency.
@@ -1116,7 +1212,7 @@ role = "maintained"
         )];
         let p = plan(&drifts, &served_set(&[]), &Sources::default());
         assert_eq!(
-            p.commands(REPO, true),
+            lines(&p, REPO, true),
             vec![
                 "flatpak install -y --noninteractive org.gnome.Loupe",
                 "flatpak uninstall -y --noninteractive 'org.evil.$(id)'",
