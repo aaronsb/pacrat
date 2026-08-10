@@ -120,3 +120,29 @@ the environment has stated it.
   supported path. The guard's threat model is unchanged — pacrat still
   holds no credentials and runs nothing as root that was not shown and
   confirmed first.
+
+## Amendment (2026-08-10): the guided flow is the default
+
+Ratified by Aaron after the first run of the shipped `setup`: bare
+`pacrat setup` printed the full homework — the pacman.conf section, both
+guard files inline, four sudo commands to copy-paste — at a terminal that
+could simply have asked. His reading: *good software does not hand the
+user a huge, error-prone task list; the software should handle it.* He is
+right, and the flags invert:
+
+- **On a terminal, bare `pacrat setup` IS the guided flow** — interview,
+  user-owned steps, then each root-owned step through the sudo flow. The
+  `--apply` flag becomes a no-op synonym and stays accepted.
+- **`--print` asks for the wall**: the full sections, file contents, and
+  copy-paste commands, exactly today's output — the audit and
+  documentation mode.
+- **Headless keeps printing**, as ADR-003 already requires: no terminal,
+  no questions, the wall is the only honest output.
+- Per-step display slims to what a confirm needs: the command, the
+  destination, and the staged file's path (readable before answering).
+  The full file contents belong to `--print`; a hundred inline lines of
+  guard script are documentation, not a question.
+
+The declined path stays graceful: any step answered n is reported at the
+end with the exact command to run later, so a partial setup degrades into
+a short list instead of a wall.
