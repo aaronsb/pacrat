@@ -190,6 +190,13 @@ impl Browse {
             });
         }
         self.trouble = trouble;
+        // Arrows drive the focused region, and focus starts on the query
+        // pane — a search that left it there produced a screen where Up and
+        // Down visibly did nothing. The rows are what the reader asked for,
+        // so the cursor goes to them.
+        if !self.rows.is_empty() {
+            self.panes.focus_on(RESULTS);
+        }
     }
 
     fn set_query(&mut self) {
