@@ -5,6 +5,7 @@ mod add;
 mod art;
 mod aur;
 mod build;
+mod config;
 mod ctx;
 mod custody;
 mod decisions;
@@ -222,6 +223,16 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Show or change this host's config (~/.config/pacrat/config.toml)
+    ///
+    /// `list` shows every known key with its effective value and whether the
+    /// file set it; `get` prints one value; `set` proves the changed file
+    /// loads before writing it. Graders appear in `list` but are registered
+    /// by `pacrat setup`, not set here.
+    Config {
+        #[command(subcommand)]
+        action: config::Action,
+    },
     /// The petit chef: the mascot, the version, and where the source lives
     About,
 }
@@ -324,6 +335,7 @@ fn run(ctx: &ctx::Ctx, command: Option<Command>) -> Result<(), String> {
         }) => add::run(ctx, packages, host.as_deref()),
         Some(Command::Untrack { ref packages }) => untrack::run(ctx, packages),
         Some(Command::Setup { apply }) => setup::run(ctx, apply),
+        Some(Command::Config { ref action }) => config::run(ctx, action),
         Some(Command::Updates { format }) => updates::run(ctx, format),
         Some(Command::Vendor {
             ref package,
