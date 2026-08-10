@@ -25,6 +25,10 @@ const ATTENTION: usize = 1;
 const TRACKED: usize = 2;
 const DRIFT: usize = 3;
 
+/// The most rows the attention list may claim before it starts scrolling
+/// like every other region.
+const ATTENTION_CAP: usize = 8;
+
 pub struct Overview {
     pub panes: Panes,
     loaded: bool,
@@ -38,17 +42,17 @@ impl Overview {
                 theme::dim("refreshing…"),
             ])]
         };
-        // The header is a fixed four fields and asks for exactly its rows;
-        // the other three share what is left, in proportion. `Fill` rather
-        // than `Min` on purpose: `Min` outranks `Length` in the solver, so a
-        // short terminal satisfied the lists by collapsing the header to
-        // nothing — losing the two regions a squeezed screen most needs to
-        // keep. Proportional shrinking loses rows from everything instead of
-        // whole regions from the top.
+        // Body rows; `Panes` reserves each region's title rule on top.
+        //
+        // The header asks for exactly its four fields, the two lists divide
+        // whatever is left, and attention is re-sized at load time once its
+        // length is known — it is the region the screen exists for, and it
+        // should not be the one scrolling while a host list has rows to
+        // spare.
         Self {
             panes: Panes::new(vec![
-                Region::new("store & ledger", Constraint::Length(5), refreshing()),
-                Region::new("attention", Constraint::Fill(3), refreshing()),
+                Region::new("store & ledger", Constraint::Length(4), refreshing()),
+                Region::new("attention", Constraint::Length(1), refreshing()),
                 Region::new("tracked lists", Constraint::Fill(4), refreshing()),
                 Region::new("drift", Constraint::Fill(5), refreshing()),
             ]),
@@ -83,6 +87,14 @@ impl Overview {
     /// with a hand-broken list, a `sources.toml` mid-merge-conflict are all
     /// things to *report on the screen*, because the screen is where the
     /// person who can fix them is looking.
+    ///
+    /// Nearly every string below arrives from outside pacrat: package names
+    /// out of the store's lists, paths out of the config, error text out of
+    /// `pacman`. None of it is run through `out::visible` on the way into a
+    /// `Span`, and the reason is that ratatui's buffer already refuses to
+    /// place control characters and zero-width graphemes — see the note in
+    /// `viewport::Region::render`, which is also where the condition on that
+    /// borrowed guarantee is written down.
     pub fn load(&mut self, ctx: &Ctx) {
         self.loaded = true;
         let mut attention: Vec<Line<'static>> = Vec::new();
@@ -297,7 +309,25 @@ impl Overview {
             theme::dim("pending updates and running jobs arrive with [3] and [5] — "),
             theme::dim("`pacrat updates`"),
         ]));
+        // Ask for exactly the rows this holds, so a short list wastes none
+        // and a long one is not the region that scrolls. Capped, because
+        // "every host is drifting" must not push the lists off the screen —
+        // past the cap it scrolls like anything else and says so.
+        //
+        // `Min`, not `Length`, and that is the whole ordering policy of this
+        // screen. The two are identical while there is room; they differ
+        // only when the terminal cannot seat everything, and there `Min`
+        // outranks `Length` in the solver — so the rows that do exist go to
+        // the triage list first and the header yields. At an inner height of
+        // six this is the difference between a screen showing "▲ this host
+        // is not serving [dotfiles-aur] yet" and one showing a store path
+        // the reader already knows. It does not grow past its content on a
+        // tall terminal, because the two `Fill` lists take the surplus.
+        let wanted = attention.len().clamp(1, ATTENTION_CAP) as u16;
         self.set(ATTENTION, attention);
+        if let Some(region) = self.panes.region_mut(ATTENTION) {
+            region.set_height(Constraint::Min(wanted));
+        }
     }
 
     fn set(&mut self, index: usize, lines: Vec<Line<'static>>) {

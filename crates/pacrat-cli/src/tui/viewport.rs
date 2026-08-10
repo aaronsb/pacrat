@@ -43,15 +43,30 @@ pub enum Scroll {
 /// height is not knowable until the layout has run, and the content length
 /// changes under us when a screen reloads. Everything else clamps against
 /// whatever those were last told to be.
+///
+/// **Two offsets, because "where the reader is" and "where that lands" are
+/// different facts.** `desired` is the last position a *gesture* asked for;
+/// `offset` is that position clamped to the content there actually is. A
+/// reload replaces a long list with a one-line "refreshing…" and then puts
+/// the list back, and with a single offset that round trip silently drags
+/// the reader to the top — clamping is not reversible, so the position is
+/// gone by the time the real lines arrive. Keeping the request separate
+/// makes the clamp a *view* of the request rather than a destruction of it,
+/// so content that shrinks and grows again returns the reader where they
+/// were. Any gesture overwrites `desired`, so this never fights the user:
+/// scrolling while the content is short means the short content is what
+/// they were scrolling.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
+    desired: usize,
     offset: usize,
     len: usize,
     height: usize,
 }
 
 impl Viewport {
-    /// Adopt this frame's geometry, keeping the offset in range.
+    /// Adopt this frame's geometry, and re-derive the offset from what the
+    /// reader last asked for.
     ///
     /// Clamping here rather than at each gesture is what makes a shrinking
     /// terminal — or a reload that returns fewer lines — safe: the region
@@ -59,7 +74,7 @@ impl Viewport {
     pub fn fit(&mut self, len: usize, height: usize) {
         self.len = len;
         self.height = height;
-        self.offset = self.offset.min(self.max_offset());
+        self.offset = self.desired.min(self.max_offset());
     }
 
     pub fn offset(&self) -> usize {
@@ -87,8 +102,10 @@ impl Viewport {
         self.height.saturating_sub(1).max(1)
     }
 
+    /// Move. Gestures are relative to what is on screen now, so they start
+    /// from `offset`; where they land becomes the new request.
     pub fn apply(&mut self, scroll: Scroll) {
-        let offset = match scroll {
+        let target = match scroll {
             Scroll::LineUp => self.offset.saturating_sub(1),
             Scroll::LineDown => self.offset.saturating_add(1),
             Scroll::HalfPageUp => self.offset.saturating_sub(self.half_page()),
@@ -98,18 +115,22 @@ impl Viewport {
             Scroll::Top => 0,
             Scroll::Bottom => self.max_offset(),
         };
-        self.offset = offset.min(self.max_offset());
+        self.desired = target.min(self.max_offset());
+        self.offset = self.desired;
     }
 
-    /// The `12/214` indicator, or `None` when everything already fits and
-    /// the number would only be noise.
+    /// The `12/214` indicator, or `None` when there is nothing useful to
+    /// say: everything already fits, or the region has been squeezed to no
+    /// body at all. The second case is why the height is checked — a
+    /// collapsed region reported `0/5`, which reads as a bug rather than as
+    /// "there is no room to show you any of this".
     ///
     /// The first number is the *last line on screen*, not the first: read as
     /// "you have seen this much of that much", it goes to `len` exactly when
     /// there is nothing further down, which is the question a reader asks a
     /// position indicator.
     pub fn progress(&self) -> Option<(usize, usize)> {
-        self.overflows()
+        (self.overflows() && self.height > 0)
             .then(|| ((self.offset + self.height).min(self.len), self.len))
     }
 }
@@ -118,7 +139,8 @@ impl Viewport {
 pub struct Region {
     title: String,
     lines: Vec<Line<'static>>,
-    /// This region's share of its screen's vertical space.
+    /// This region's share of its screen's vertical space, counting **body
+    /// rows only** — the title rule is structural and [`Panes`] reserves it.
     height: Constraint,
     view: Viewport,
 }
@@ -133,14 +155,25 @@ impl Region {
         }
     }
 
-    /// Replace the content, keeping where the reader was looking. A reload
-    /// that jumped every region back to the top would punish the `r` key.
+    /// Replace the content, keeping where the reader was looking.
+    ///
+    /// The promise survives an intermediate state: a reload that shows a
+    /// one-line "refreshing…" and then puts a hundred lines back returns the
+    /// reader to where they were, because [`Viewport`] remembers the
+    /// position they asked for separately from the one the content allowed.
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
         self.lines = lines;
     }
 
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();
+    }
+
+    /// Re-declare how much vertical space to ask for. A screen whose content
+    /// size is only known after a load (the overview's attention list) sizes
+    /// itself here rather than guessing at construction.
+    pub fn set_height(&mut self, height: Constraint) {
+        self.height = height;
     }
 
     pub fn scroll(&mut self, scroll: Scroll) {
@@ -208,11 +241,27 @@ impl Region {
         // lines, and a wrapped line is a different number of rows than the
         // line it came from. Over-wide content is clipped for now; a
         // horizontal viewport is the same component's next job.
+        //
+        // Sanitizing untrusted text is *borrowed* here, not done. These
+        // lines carry package names, store paths and grader output, and what
+        // keeps an `ESC[8m` in one of them from hiding a row is ratatui's
+        // own buffer: `Buffer::set_stringn` drops graphemes containing
+        // control characters and graphemes of zero width
+        // (ratatui-core-0.1.2, src/buffer/buffer.rs:351-353). That is an
+        // implementation detail of a dependency, not a contract pacrat is
+        // owed — so anything that ever writes to the backend directly, or
+        // measures these strings before they reach the buffer, has to run
+        // them through `out::visible` first, the way the CLI verbs do.
         frame.render_widget(
             Paragraph::new(Text::from(self.lines.clone())).scroll((self.view.offset() as u16, 0)),
             text,
         );
         if let Some(bar) = bar {
+            // `new(max_offset)`, not `new(len)`: the argument is the number
+            // of scroll *positions*, not the number of lines. With `len` the
+            // thumb reaches the bottom of its track only when the last line
+            // scrolls off the top — i.e. never — so a fully scrolled region
+            // shows a thumb hovering short of the end.
             let mut state =
                 ScrollbarState::new(self.view.max_offset()).position(self.view.offset());
             frame.render_stateful_widget(
@@ -280,11 +329,61 @@ impl Panes {
         if self.regions.is_empty() {
             return;
         }
-        let constraints: Vec<Constraint> = self.regions.iter().map(|r| r.height).collect();
-        let slots = Layout::vertical(constraints).split(inner);
+        let slots = self.slots(inner);
         for (index, region) in self.regions.iter_mut().enumerate() {
             region.render(frame, outer, slots[index], index == self.focus);
         }
+    }
+
+    /// Divide the screen, giving every region its title rule before anyone
+    /// gets a body row.
+    ///
+    /// The reserve is the whole point. Handing the declared constraints
+    /// straight to the solver means that when the terminal is short *some
+    /// region gets zero rows and vanishes* — not shrinks, vanishes, with no
+    /// rule and no hint that it was ever there. Which one disappears is
+    /// decided by the solver's priority order rather than by anything about
+    /// the screen: `Min` outranks `Length`, so the first version of this
+    /// code answered a squeezed overview by deleting the header and the
+    /// attention list, the two regions a cramped screen most needs.
+    ///
+    /// ratatui has no single constraint meaning "one row, then a share of
+    /// what is left", so the floor is taken out first and only the surplus
+    /// is solved for. What a short terminal costs is then rows, everywhere,
+    /// and never a region.
+    fn slots(&self, inner: Rect) -> Vec<Rect> {
+        let rules = self.regions.len() as u16;
+        let row = |y: u16, height: u16| Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height,
+        };
+        // Below one row each there is nothing left to be fair with: the
+        // terminal is shorter than this screen's list of titles.
+        if inner.height <= rules {
+            return (0..self.regions.len())
+                .map(|index| {
+                    let index = index as u16;
+                    row(
+                        inner.y + index.min(inner.height),
+                        u16::from(index < inner.height),
+                    )
+                })
+                .collect();
+        }
+        let constraints: Vec<Constraint> =
+            self.regions.iter().map(|region| region.height).collect();
+        let bodies = Layout::vertical(constraints).split(row(inner.y, inner.height - rules));
+        let mut y = inner.y;
+        bodies
+            .iter()
+            .map(|body| {
+                let slot = row(y, body.height + 1);
+                y += slot.height;
+                slot
+            })
+            .collect()
     }
 }
 
@@ -379,8 +478,40 @@ mod tests {
         );
         v.apply(Scroll::PageDown);
         assert_eq!(v.offset(), 2);
+        // …and it says nothing about position, because `0/100` in a region
+        // with no body reads as a bug rather than as "there is no room".
+        assert_eq!(v.progress(), None);
         v.fit(100, 200);
         assert_eq!(v.offset(), 0);
+    }
+
+    /// The reload path, and the reason the request and the clamp are stored
+    /// separately: `r` swaps a hundred lines for one line of "refreshing…"
+    /// and then swaps them back, and the reader must not be dragged to the
+    /// top by the round trip.
+    #[test]
+    fn a_transient_shrink_does_not_cost_the_reader_their_place() {
+        let mut v = tall();
+        v.apply(Scroll::Bottom);
+        assert_eq!(v.offset(), 90);
+        v.fit(1, 10); // "refreshing…"
+        assert_eq!(v.offset(), 0, "there is nowhere else to be at one line");
+        v.fit(100, 10); // the real lines come back
+        assert_eq!(v.offset(), 90, "and the reader is back where they were");
+    }
+
+    /// The other half of that bargain: a gesture is the reader speaking, so
+    /// it replaces the remembered position instead of being overridden by
+    /// it. Scrolling while the content is short means the short content is
+    /// what they meant to scroll.
+    #[test]
+    fn a_gesture_while_shrunk_replaces_the_remembered_place() {
+        let mut v = tall();
+        v.apply(Scroll::Bottom);
+        v.fit(12, 10);
+        v.apply(Scroll::Top);
+        v.fit(100, 10);
+        assert_eq!(v.offset(), 0, "the last thing the reader asked for wins");
     }
 
     #[test]
@@ -419,5 +550,84 @@ mod tests {
         panes.cycle(true);
         panes.scroll(Scroll::Bottom);
         assert_eq!(panes.focus_position(), (1, 0));
+    }
+
+    fn four_regions() -> Panes {
+        Panes::new(vec![
+            Region::new("header", Constraint::Length(4), Vec::new()),
+            Region::new("attention", Constraint::Length(3), Vec::new()),
+            Region::new("list", Constraint::Fill(4), Vec::new()),
+            Region::new("list", Constraint::Fill(5), Vec::new()),
+        ])
+    }
+
+    fn inner(height: u16) -> Rect {
+        Rect {
+            x: 1,
+            y: 1,
+            width: 80,
+            height,
+        }
+    }
+
+    /// The floor: whatever the terminal does, every region keeps the row its
+    /// title rule is drawn on, and the slots tile the area exactly with no
+    /// gap and no overlap.
+    #[test]
+    fn no_region_is_ever_squeezed_out_of_existence() {
+        let panes = four_regions();
+        for height in 4..40u16 {
+            let slots = panes.slots(inner(height));
+            assert_eq!(slots.len(), 4);
+            for (index, slot) in slots.iter().enumerate() {
+                assert!(
+                    slot.height >= 1,
+                    "region {index} vanished at inner height {height}"
+                );
+            }
+            assert_eq!(
+                slots.iter().map(|s| s.height).sum::<u16>(),
+                height,
+                "the slots do not add up at inner height {height}"
+            );
+            for pair in slots.windows(2) {
+                assert_eq!(
+                    pair[0].y + pair[0].height,
+                    pair[1].y,
+                    "a gap or an overlap at inner height {height}"
+                );
+            }
+        }
+    }
+
+    /// The declared constraints still govern once every rule is paid for: a
+    /// tall screen gives the header exactly its four lines and lets the two
+    /// lists divide what is left 4:5.
+    #[test]
+    fn the_surplus_is_shared_by_the_declared_weights() {
+        let slots = four_regions().slots(inner(40));
+        let bodies: Vec<u16> = slots.iter().map(|slot| slot.height - 1).collect();
+        assert_eq!(bodies[0], 4, "a Length region gets exactly what it asks");
+        assert_eq!(bodies[1], 3);
+        let (short, long) = (bodies[2], bodies[3]);
+        assert_eq!(short + long, 40 - 4 - 4 - 3, "the rest goes to the lists");
+        assert!(long > short, "the heavier weight took the bigger share");
+    }
+
+    /// Past the floor there is nothing left to be fair with, and the only
+    /// requirement is that it does not panic or draw outside the area.
+    #[test]
+    fn a_screen_shorter_than_its_own_titles_stays_inside_the_area() {
+        for height in 0..=4u16 {
+            let slots = four_regions().slots(inner(height));
+            assert_eq!(slots.len(), 4);
+            assert_eq!(slots.iter().map(|s| s.height).sum::<u16>(), height);
+            for slot in &slots {
+                assert!(
+                    slot.y + slot.height <= inner(height).y + height,
+                    "a slot ran past the bottom of the area at height {height}"
+                );
+            }
+        }
     }
 }

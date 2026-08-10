@@ -36,3 +36,12 @@ ratatui = { version = "0.30", default-features = false, features = [
     "underline-color",
 ] }
 crossterm = "0.29"
+# Already on the graph underneath crossterm; direct because the TUI has its
+# own reason to care. A SIGTERM or SIGHUP with no handler kills the process
+# between `enable_raw_mode` and the `Drop` that would undo it, and the user
+# is left with a terminal that does not echo — the exact wreckage the panic
+# hook exists to prevent, arriving by a different door. `default-features =
+# false` because only `flag` and `low_level` are wanted, not the iterator
+# machinery (features are additive, so this neither adds to nor subtracts
+# from what crossterm already turns on).
+signal-hook = { version = "0.3", default-features = false }

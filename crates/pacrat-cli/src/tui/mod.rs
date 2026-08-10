@@ -10,10 +10,27 @@
 //! mode and the alternate screen are global state on a device the user owns;
 //! a TUI that exits without undoing them leaves a shell that does not echo
 //! and does not scroll, and the user's next move is to close the window. So
-//! restoration hangs off three independent hooks — `Drop` for the ordinary
-//! return, `Drop` again for the `?` that bails mid-loop, and a panic hook
-//! for the case where neither runs in time to matter — and [`restore`] never
-//! short-circuits: each step is attempted whatever the last one did.
+//! every way out of this module runs [`restore`], and there are four of
+//! them:
+//!
+//! 1. `Drop` on the ordinary return,
+//! 2. `Drop` again for a `?` that bails out mid-loop,
+//! 3. the panic hook, for when a `Drop` will not run or will run too late to
+//!    put the message somewhere readable,
+//! 4. a signal handler for `TERM`, `HUP` and `INT`, because the default
+//!    disposition for those is to end the process where it stands — between
+//!    `enable_raw_mode` and the `Drop` that undoes it — and a `Drop` that is
+//!    never reached restores nothing. It restores from inside the handler
+//!    rather than raising a flag for the loop, for a reason worth reading
+//!    before changing it: see `install_signal_handlers`.
+//!
+//! [`restore`] itself never short-circuits: each step is attempted whatever
+//! the last one did.
+//!
+//! The one exit with nothing on it is `SIGKILL`, which is uncatchable. That
+//! is why `ctrl-c` is bound as a *key* (raw mode means it is one, not a
+//! signal): a reflex that appears to do nothing is what sends somebody to
+//! `kill -9`.
 
 use std::io::{self, IsTerminal, Stdout};
 use std::sync::Once;
@@ -131,9 +148,24 @@ struct Session {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
+/// The three that mean "stop", and whose default disposition would end the
+/// process where it stands, unwinding nothing. `INT` is here even though raw
+/// mode means `ctrl-c` never becomes one: `kill -INT` from another terminal
+/// is the same request, and covering only the signals a keyboard cannot send
+/// would be a strange place to draw the line.
+const STOPPING: [i32; 3] = [
+    signal_hook::consts::SIGTERM,
+    signal_hook::consts::SIGHUP,
+    signal_hook::consts::SIGINT,
+];
+
 impl Session {
     fn open() -> Result<Self, String> {
         install_panic_hook();
+        // Registered before raw mode, so there is no window in which the
+        // terminal is altered and nothing is listening for the signal that
+        // would leave it that way.
+        install_signal_handlers()?;
         enable_raw_mode().map_err(|e| format!("entering raw mode: {e}"))?;
         // From here on every failure path has to restore, because raw mode
         // is already on.
@@ -150,6 +182,49 @@ impl Session {
             }
         }
     }
+}
+
+/// Restore and leave from inside the handler itself.
+///
+/// **Why not a flag the event loop polls.** That was the first design and it
+/// is the safer-looking one: set an atomic, notice it at the top of the next
+/// turn, unwind normally. It works for `kill -TERM`, and it does nothing at
+/// all for the case `SIGHUP` actually names — because when the terminal goes
+/// away, the loop stops turning. On a hung-up tty `read(2)` returns `Ok(0)`
+/// forever, and crossterm reads a zero-length read as "nothing yet": the
+/// inner loop in `try_read` neither breaks on it nor consults its timeout
+/// (crossterm-0.29.0, src/event/source/unix/mio.rs:96-104), so `event::poll`
+/// never returns. The process spins at 100% CPU with the flag set and nobody
+/// left to read it — which is what the first version of this code did, and
+/// how this comment came to be written. A guarantee that holds only while
+/// the terminal is healthy is not the one a hangup handler is for.
+///
+/// **What it costs.** `restore` is not in the async-signal-safe subset:
+/// crossterm keeps the pre-raw-mode termios behind a `parking_lot` mutex,
+/// and writing the escape sequences locks stdout. Both are held for
+/// microseconds, twice in a run, by the only thread this process has — and
+/// stdout's lock is re-entrant on that thread regardless. Weighed against a
+/// terminal left in raw mode or an orphan spinning forever, that window is
+/// worth taking. `low_level::exit` is `_exit(2)`: no atexit hooks, no
+/// destructors, nothing on the way out that could block.
+fn install_signal_handlers() -> Result<(), String> {
+    for signal in STOPPING {
+        // SAFETY: the handler calls `restore` and then `_exit`. See above
+        // for why that is not the signal-safe subset, and why it is still
+        // the right trade.
+        let registered = unsafe {
+            signal_hook::low_level::register(signal, move || {
+                restore();
+                // 128+N: the shell's convention for "ended by this signal".
+                signal_hook::low_level::exit(128 + signal);
+            })
+        };
+        // Failing here is an exhausted process, not a routine condition, and
+        // carrying on would mean running with the guarantee this function
+        // exists to provide quietly missing.
+        registered.map_err(|e| format!("listening for signal {signal}: {e}"))?;
+    }
+    Ok(())
 }
 
 impl Drop for Session {
@@ -295,16 +370,16 @@ impl App {
         self.reload_pending = false;
         match self.tab {
             Tab::Overview => self.overview.load(ctx),
-            // Placeholders hold no live data except the config screen's
-            // settings, which are cheap enough to rebuild wholesale.
+            // In place, never rebuilt: replacing the `Panes` would silently
+            // throw away the reader's focus and scroll positions along with
+            // the stale lines.
             tab => {
-                let rebuilt = placeholder::build(tab, ctx);
-                if let Some(slot) = self
+                if let Some((_, panes)) = self
                     .placeholders
                     .iter_mut()
                     .find(|(candidate, _)| *candidate == tab)
                 {
-                    slot.1 = rebuilt;
+                    placeholder::refresh(panes, tab, ctx);
                 }
             }
         }
@@ -313,15 +388,19 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         // Help is modal: while it covers the screen the only keys that mean
         // anything are the ones that uncover it. Scrolling a pane the reader
-        // cannot see is worse than doing nothing.
+        // cannot see is worse than doing nothing. ctrl-c is the exception —
+        // "get me out" must not need to be pressed twice, or it is not the
+        // escape hatch it is there to be.
         if self.help {
-            if matches!(action_for(key), Some(Action::Quit | Action::ToggleHelp)) {
-                self.help = false;
+            match action_for(key) {
+                Some(Action::Quit | Action::ToggleHelp) => self.help = false,
+                Some(Action::Interrupt) => self.quit = true,
+                _ => {}
             }
             return;
         }
         match action_for(key) {
-            Some(Action::Quit) => self.quit = true,
+            Some(Action::Quit | Action::Interrupt) => self.quit = true,
             Some(Action::ToggleHelp) => self.help = true,
             Some(Action::Screen(tab)) => self.tab = tab,
             Some(Action::Focus(forward)) => self.panes_mut().cycle(forward),

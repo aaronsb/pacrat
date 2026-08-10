@@ -19,6 +19,9 @@ use crate::tui::Tab;
 /// The task that turns these five into real screens.
 const SCREENS_TASK: &str = "task #20";
 
+/// Where the config screen's live values live, when it has them.
+const SETTINGS: usize = 1;
+
 pub fn build(tab: Tab, ctx: &Ctx) -> Panes {
     let mut regions = vec![Region::new(
         format!("{} — {}", tab.title(), tab.question()),
@@ -35,6 +38,26 @@ pub fn build(tab: Tab, ctx: &Ctx) -> Panes {
         ));
     }
     Panes::new(regions)
+}
+
+/// `r` on one of these screens.
+///
+/// Only the lines are replaced, never the `Panes`. Rebuilding the screen
+/// wholesale is the obvious way to refresh it and it quietly throws away
+/// everything the reader had arranged — which region had focus, how far
+/// each was scrolled — so a key that means "ask again" would also mean
+/// "start over". With one region and two of them static that costs nothing
+/// today; with task #20's five-region screens it would be the difference
+/// between a usable refresh and one nobody presses twice.
+pub fn refresh(panes: &mut Panes, tab: Tab, ctx: &Ctx) {
+    // Everything else on these screens is prose about work not yet done.
+    // It cannot have changed since the last frame, so re-rendering it would
+    // be motion without information.
+    if tab == Tab::Config {
+        if let Some(region) = panes.region_mut(SETTINGS) {
+            region.set_lines(settings(ctx));
+        }
+    }
 }
 
 fn lands_here(tab: Tab) -> Vec<Line<'static>> {

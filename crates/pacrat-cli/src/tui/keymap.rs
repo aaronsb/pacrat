@@ -15,7 +15,18 @@ use super::Tab;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// `q`/`esc` — the mockup's "back/quit": it closes an overlay if one is
+    /// open, and leaves only when there is nothing left to back out of.
     Quit,
+    /// `ctrl-c` — out, from wherever, no questions.
+    ///
+    /// Distinct from `Quit` because the two answer different questions. In
+    /// raw mode the terminal's ISIG processing is off, so this keystroke is
+    /// never a SIGINT: it arrives as an ordinary key and means nothing
+    /// unless something here gives it meaning. A reflex key that does
+    /// nothing sends the user to `kill`, which is the one exit with no
+    /// restoration on it.
+    Interrupt,
     ToggleHelp,
     Screen(Tab),
     /// Move focus to the next region (`true`) or the previous one.
@@ -108,16 +119,23 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "?",
         what: "this help",
-        of: |key| (key.code == KeyCode::Char('?')).then_some(Action::ToggleHelp),
+        of: |key| {
+            (matches!(key.code, KeyCode::Char('?')) && !modified(key)).then_some(Action::ToggleHelp)
+        },
     },
     Binding {
         keys: "q / esc",
-        what: "quit",
+        what: "back, then quit",
         of: |key| {
             let quit = matches!(key.code, KeyCode::Esc)
                 || (matches!(key.code, KeyCode::Char('q')) && !modified(key));
             quit.then_some(Action::Quit)
         },
+    },
+    Binding {
+        keys: "ctrl-c",
+        what: "quit from anywhere",
+        of: |key| ctrl(key, 'c').then_some(Action::Interrupt),
     },
 ];
 
@@ -195,7 +213,7 @@ mod tests {
     /// test is what keeps that true when somebody adds one.
     #[test]
     fn a_control_chord_never_falls_through_to_the_bare_letter() {
-        for c in ['j', 'k', 'g', 'q', 'r', '1'] {
+        for c in ['j', 'k', 'g', 'q', 'r', '1', 'c', '?'] {
             let chord = with_ctrl(c);
             let bare = press(KeyCode::Char(c));
             assert!(
@@ -213,6 +231,28 @@ mod tests {
         assert_eq!(press(KeyCode::Char('?')), Some(Action::ToggleHelp));
         assert_eq!(press(KeyCode::Char('q')), Some(Action::Quit));
         assert_eq!(press(KeyCode::Esc), Some(Action::Quit));
+    }
+
+    /// Raw mode turns off the terminal's ISIG processing, so this keystroke
+    /// reaches the application instead of becoming a SIGINT. If nothing here
+    /// answers it, the user's reflex for "get me out" does nothing at all
+    /// and their next move is `kill` — the one exit that runs no
+    /// restoration and leaves the terminal wrecked.
+    #[test]
+    fn ctrl_c_is_bound_because_raw_mode_makes_it_a_key_and_not_a_signal() {
+        assert_eq!(with_ctrl('c'), Some(Action::Interrupt));
+        // Its own action, not a synonym for `q`: `q` backs out of an
+        // overlay first, and ctrl-c must not have to be pressed twice.
+        assert_ne!(with_ctrl('c'), press(KeyCode::Char('q')));
+        // A bare `c` is not an exit — nothing is bound to it at all.
+        assert_eq!(press(KeyCode::Char('c')), None);
+    }
+
+    /// Chords are not accidental synonyms for the letters in them.
+    #[test]
+    fn a_modified_question_mark_is_not_the_help_key() {
+        assert_eq!(with_ctrl('?'), None);
+        assert_eq!(press(KeyCode::Char('?')), Some(Action::ToggleHelp));
     }
 
     #[test]
