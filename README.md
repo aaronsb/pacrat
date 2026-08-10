@@ -16,9 +16,9 @@ The rat curates the pantry; the little chef does the tasting.
 
 Status: the CLI works. `status`, `hosts`, `add`, `setup`, `vendor`, `search`,
 `info`, `build`, `updates`, `grade`, `review`/`adopt-update`/`reject`, `sync`,
-the one-shot loop (`update`) and the decision ledger (`decisions`) are
-implemented and tested; the TUI is next. The mockup shows where it's all
-headed.
+`push`, the one-shot loop (`update`) and the decision ledger (`decisions`) are
+implemented and tested, and the TUI shell is up. The mockup shows where it's
+all headed.
 
 ## The update loop
 
@@ -43,6 +43,32 @@ a human, because one `y` would answer a whole run.
 Exits 0 when there was nothing to do or everything pending was adopted and
 built, 10 when anything was held, and 1 when the run could not do its job.
 `--format json` puts one object on stdout and every human line on stderr.
+
+## Publishing
+
+`pacrat push <package>` publishes a **maintained** package's store tree to its
+upstream — clone, mirror the store over it, regenerate `.SRCINFO`, show the
+diff, ask, commit, push. Never a force-push, and never a `vendored` package:
+that role is pull-only.
+
+What goes out is exactly the store's tree plus a freshly generated `.SRCINFO`
+— stated to git rather than discovered by it, so an ignore rule cannot
+silently drop a patch from the publish and a side effect of reading the
+PKGBUILD cannot silently join it.
+
+Two things it will not do quietly. If the upstream is the AUR it asks first
+whether the AUR is accepting publishes (`ssh aur@aur.archlinux.org help`,
+read-only) and, when the answer is no, records the errand in a publish queue
+instead — `pacrat push` with no arguments probes again and works the queue,
+and `pacrat status` carries a line while anything is waiting. A blocked probe
+says *which* kind of blocked: a refused ssh key is your setup, not an outage.
+And if a checksum has changed for a source of an **already-published
+version**, it stops: an immutable tag whose tarball changed is an incident,
+not a re-sum. It also says how many sources it was able to compare, because a
+silent alarm and a blind one look identical otherwise.
+
+Exit codes: 0 published (or already current), 10 queued/blocked/declined, 1
+the alarm or a failure.
 
 ## Graders
 

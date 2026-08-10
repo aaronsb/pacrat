@@ -726,8 +726,7 @@ fn an_override_needs_a_commit_and_a_reason_and_leaves_a_record() {
     ]);
     assert_eq!(wrong_door.code, 1, "{}", wrong_door.text());
     assert!(
-        wrong_door.stderr.contains("nothing to override")
-            && wrong_door.stderr.contains("UNGRADED"),
+        wrong_door.stderr.contains("nothing to override") && wrong_door.stderr.contains("UNGRADED"),
         "{}",
         wrong_door.stderr
     );

@@ -30,3 +30,33 @@ jobs:
       # is not, and is not needed — the harness fakes it.
       - name: contrib graders
         run: ./contrib/graders/test-yay-friend-grade.sh
+
+  # The publish path needs makepkg, which is Arch's, so on ubuntu-latest the
+  # `pacrat push` tests skip themselves and the job above goes green having
+  # never exercised the one verb that writes to somebody else's repository.
+  # This job is where they actually run. `PACRAT_REQUIRE_MAKEPKG=1` makes a
+  # skip here a failure — the whole point of the job is that these run, so
+  # "skipped" is a broken container, not a pass.
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      # base-devel carries makepkg; jq and python are the contrib harness's.
+      # Rust comes from pacman rather than rustup: the container is already a
+      # rolling release, and one package manager is enough.
+      - name: dependencies
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust jq python
+      - uses: actions/checkout@v4
+      # makepkg refuses to run as root, and a container is root by default.
+      # A plain user with a writable checkout is the smallest fix; `nobody`
+      # would need a home directory for git's config.
+      - name: unprivileged user
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+      - name: test
+        run: |
+          su builder -c 'PACRAT_REQUIRE_MAKEPKG=1 cargo test --workspace'
+        env:
+          CARGO_TERM_COLOR: always

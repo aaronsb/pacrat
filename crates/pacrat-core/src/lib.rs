@@ -7,6 +7,8 @@ pub mod decisions;
 pub mod grading;
 pub mod hash;
 pub mod pkg;
+pub mod pkgbuild;
+pub mod queue;
 pub mod sources;
 pub mod version;
 

@@ -174,6 +174,13 @@ pub fn epoch_date(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// The time of day a timestamp falls at, UTC. Shared by the two renderings
+/// below so they cannot disagree about what hour it is.
+fn hms(secs: i64) -> (i64, i64, i64) {
+    let day = secs.rem_euclid(86_400);
+    (day / 3_600, (day % 3_600) / 60, day % 60)
+}
+
 /// A unix timestamp as `YYYY-MM-DDTHH:MM:SSZ` — the one spelling the
 /// decision ledger accepts ([`pacrat_core::decisions::valid_timestamp`]).
 ///
@@ -182,14 +189,8 @@ pub fn epoch_date(secs: i64) -> String {
 /// answer a question that has no timezone in it: pacrat records when
 /// something happened in UTC, and reading it back is a string comparison.
 pub fn epoch_rfc3339(secs: i64) -> String {
-    let day = secs.rem_euclid(86_400);
-    format!(
-        "{}T{:02}:{:02}:{:02}Z",
-        epoch_date(secs),
-        day / 3_600,
-        (day % 3_600) / 60,
-        day % 60
-    )
+    let (h, m, s) = hms(secs);
+    format!("{}T{h:02}:{m:02}:{s:02}Z", epoch_date(secs))
 }
 
 /// Now, as the ledger writes it.
@@ -198,6 +199,20 @@ pub fn now_rfc3339() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     epoch_rfc3339(secs as i64)
+}
+
+/// A unix timestamp as `YYYY-MM-DD HH:MM UTC`.
+///
+/// [`epoch_date`] with the time of day, for the publish queue: "queued
+/// 2026-08-10" and "probed 2026-08-10" are the same line twice, and the pair
+/// of facts a maintainer wants is how long an errand has waited and how
+/// recently it was asked about.
+///
+/// Seconds are dropped rather than shown: a queue is read in minutes and
+/// hours, and the ledger's [`epoch_rfc3339`] is the precise spelling.
+pub fn epoch_stamp(secs: i64) -> String {
+    let (h, m, _) = hms(secs);
+    format!("{} {h:02}:{m:02} UTC", epoch_date(secs))
 }
 
 /// Make untrusted text safe to show a reviewer, and say how much was hidden.
