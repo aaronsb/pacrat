@@ -853,7 +853,7 @@ impl Updates {
             reviewed.digest.clone(),
             reviewed.grade,
         );
-        decisions::record_override(ctx, &package, &commit, grade, reason)?;
+        decisions::record_override(ctx, &package, &commit, &digest, grade, reason)?;
 
         let mut lines = vec![
             Line::from(vec![

@@ -352,7 +352,7 @@ fn execute_adopt(
     // declined prompt is not a decision, and a ledger that filled up with
     // overrides nobody went through with would be a ledger nobody believes.
     if let Some(reason) = overriding {
-        decisions::record_override(ctx, package, &cand.commit, grade, reason)?;
+        decisions::record_override(ctx, package, &cand.commit, &cand.digest, grade, reason)?;
         say!(
             "recorded  {} · {package} @ {} · override-block",
             store_rel(ctx, &ctx.decisions_path()),

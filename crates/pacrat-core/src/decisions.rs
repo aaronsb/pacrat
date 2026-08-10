@@ -38,6 +38,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::grading::PACRAT_SCALE;
+use crate::hash::valid_digest;
 use crate::pkg::valid_name;
 use crate::sources::valid_commit;
 
@@ -97,6 +98,25 @@ pub struct Decision {
     pub package: String,
     /// The candidate this was decided about.
     pub commit: String,
+    /// The candidate tree's content digest — the *bytes* that were accepted.
+    ///
+    /// The commit is a name upstream chose for a tree and can choose again:
+    /// `git commit --amend` leaves every byte alone and renames them, and a
+    /// rebase or a moved tag does the same. pacrat already refuses to key a
+    /// grading on that name for exactly this reason ([`crate::grading`] is
+    /// about bytes), and an acceptance is the same kind of claim — "a human
+    /// read this and took the risk" is about what they read.
+    ///
+    /// So this is what makes an entry checkable later: given the ledger and
+    /// the store, a reader can ask whether the tree in front of them is the
+    /// tree somebody signed off, and the commit id alone cannot answer that.
+    ///
+    /// Optional, because absence is a real answer and not a defect: entries
+    /// written before this field existed have no digest, and inventing one
+    /// for them at parse time would be pacrat claiming to know which bytes a
+    /// past decision was about. Every entry pacrat writes now carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     /// The verdict's worst grade at the moment of the decision, when there
     /// was one. `None` is a real answer — an override of a BLOCK that came
     /// from a grade is not the same event as one recorded against a subject
@@ -143,6 +163,18 @@ impl Decision {
                  as `git rev-parse` prints them",
                 self.commit
             ));
+        }
+        // Held to the same standard as the commit, and for the same reason:
+        // this is a synced file whose values are printed and compared, and a
+        // field that can hold anything eventually reaches somewhere its
+        // shape matters.
+        if let Some(digest) = &self.digest {
+            if !valid_digest(digest) {
+                return Err(format!(
+                    "digest {digest:?} is not a tree digest — expected 64 lowercase \
+                     hex characters as `pacrat` computes them"
+                ));
+            }
         }
         if let Some(grade) = self.grade {
             if !PACRAT_SCALE.contains(grade) {
@@ -270,6 +302,7 @@ mod tests {
             kind: Kind::OverrideBlock,
             package: "mdcat".into(),
             commit: "5a4705a4aaa2e7f10a7dd6c302256dd373516e56".into(),
+            digest: Some("b".repeat(64)),
             grade: Some(4),
             reason: "upstream's new post_install is the packaging fix I asked for".into(),
             host: "north".into(),
@@ -344,6 +377,53 @@ mod tests {
         // At the cap is fine, and a reason in Greek is not half a reason.
         d.reason = "é".repeat(REASON_MAX);
         assert!(d.validate().is_ok());
+    }
+
+    /// The digest is what makes an entry checkable against bytes later, and
+    /// it is optional because absence is a real answer — an entry written
+    /// before the field existed is not an entry about a tree nobody can
+    /// name, it is an entry from before pacrat recorded which.
+    #[test]
+    fn a_digest_roundtrips_and_its_absence_writes_no_key() {
+        let mut ledger = Decisions::default();
+        ledger.push(decision()).unwrap();
+        let text = ledger.to_toml();
+        assert!(text.contains("digest"), "{text}");
+        assert_eq!(Decisions::from_toml(&text).unwrap(), ledger);
+
+        let mut older = decision();
+        older.digest = None;
+        let ledger = Decisions {
+            decisions: vec![older],
+        };
+        let text = ledger.to_toml();
+        assert!(!text.contains("digest"), "{text}");
+        assert_eq!(Decisions::from_toml(&text).unwrap(), ledger);
+    }
+
+    /// A tree digest reaches a comparison against `fstree::digest` output and
+    /// is printed, so it is held to the same standard as the commit beside
+    /// it. An entry whose digest is not one would be an entry that reads as
+    /// checkable and is not.
+    #[test]
+    fn a_digest_that_is_not_a_digest_fails_to_parse() {
+        for bad in [
+            "../../../../PWNED",
+            "",
+            "abc",
+            &"B".repeat(64), // uppercase: not how pacrat writes them
+            &"a".repeat(63),
+            &"a".repeat(65),
+            "5a4705a4aaa2e7f10a7dd6c302256dd373516e56", // a commit, not a tree
+        ] {
+            let mut d = decision();
+            d.digest = Some(bad.to_string());
+            let err = match d.validate() {
+                Ok(()) => panic!("digest {bad:?} should have been rejected"),
+                Err(e) => e,
+            };
+            assert!(err.contains("digest"), "unhelpful error for {bad:?}: {err}");
+        }
     }
 
     /// The same hostile values `sources` refuses, refused here: this file is
