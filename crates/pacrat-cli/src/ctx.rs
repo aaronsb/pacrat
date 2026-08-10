@@ -52,6 +52,33 @@ impl Ctx {
         })
     }
 
+    /// Root maintenance mode's context (ADR-003, amended): everything is
+    /// the OPERATOR's — the human `SUDO_USER` names — never root's own.
+    /// Their config is read from its default spelling under their home
+    /// (their `XDG_CONFIG_HOME`, if they set one, did not survive sudo, and
+    /// root's own environment must not stand in for it). The store path is
+    /// resolved the same way and then never used: root neither reads nor
+    /// writes the store, and unlike [`Ctx::resolve`] this does not require
+    /// it to exist.
+    pub fn resolve_for_operator(operator: &str) -> Result<Self, String> {
+        let home = home_of(operator)?;
+        let config_path = home.join(".config").join("pacrat").join("config.toml");
+        let config = match fs::read_to_string(&config_path) {
+            Ok(text) => {
+                Config::from_toml(&text).map_err(|e| format!("{}: {e}", config_path.display()))?
+            }
+            Err(_) => Config::default(),
+        };
+        let store = env::var_os("DOTFILES_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".dotfiles"));
+        Ok(Self {
+            store,
+            host: hostname(),
+            config,
+        })
+    }
+
     pub fn sources_path(&self) -> PathBuf {
         self.store.join("aur").join("sources.toml")
     }
@@ -278,6 +305,32 @@ pub fn state_dir() -> Result<PathBuf, String> {
     Ok(base.join("pacrat"))
 }
 
+/// A user's home directory, from /etc/passwd. Root mode needs the
+/// operator's home and cannot trust the environment for it (sudo rewrites
+/// HOME). Known limit: users that only NSS knows — LDAP and the like — are
+/// not in the file; a fleet of personal Arch machines is.
+fn home_of(user: &str) -> Result<PathBuf, String> {
+    let passwd = fs::read_to_string("/etc/passwd").map_err(|e| format!("/etc/passwd: {e}"))?;
+    passwd_home(&passwd, user).ok_or_else(|| {
+        format!("{user} has no /etc/passwd entry with a home directory — cannot find their config")
+    })
+}
+
+/// The parse itself, pure: `name:pw:uid:gid:gecos:home:shell`, first match
+/// wins, an empty home field is no answer.
+fn passwd_home(passwd: &str, user: &str) -> Option<PathBuf> {
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next() != Some(user) {
+            return None;
+        }
+        fields
+            .nth(4)
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
 fn hostname() -> String {
     if let Ok(name) = fs::read_to_string("/etc/hostname") {
         let name = name.trim();
@@ -408,6 +461,32 @@ mod tests {
             "a refused write still touched the file"
         );
         let _ = fs::remove_dir_all(&ctx.store);
+    }
+
+    /// The passwd parse root mode leans on: exact-name match, the sixth
+    /// field, first entry wins — and no answer beats a wrong answer for a
+    /// name that is missing, malformed, or a prefix of the one asked for.
+    #[test]
+    fn passwd_home_reads_the_sixth_field_of_the_exact_user() {
+        let passwd = "root:x:0:0::/root:/bin/bash\n\
+                      aaron:x:1000:1000:Aaron:/home/aaron:/bin/zsh\n\
+                      aaronb:x:1001:1001::/home/aaronb:/bin/sh\n\
+                      broken:x:1002\n\
+                      homeless:x:1003:1003:::/bin/sh\n";
+        assert_eq!(
+            passwd_home(passwd, "aaron"),
+            Some(PathBuf::from("/home/aaron"))
+        );
+        assert_eq!(
+            passwd_home(passwd, "aaronb"),
+            Some(PathBuf::from("/home/aaronb")),
+            "a longer name must not match its prefix"
+        );
+        assert_eq!(passwd_home(passwd, "root"), Some(PathBuf::from("/root")));
+        assert_eq!(passwd_home(passwd, "nobody-here"), None);
+        assert_eq!(passwd_home(passwd, "broken"), None, "too few fields");
+        assert_eq!(passwd_home(passwd, "homeless"), None, "empty home field");
+        assert_eq!(passwd_home("", "aaron"), None);
     }
 
     /// A host name is printed into commands and into a padded column, so it
