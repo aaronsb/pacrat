@@ -12,9 +12,18 @@
 //! What the readings are *for* is the tamper alarm ([`changed_sums`]),
 //! generalised from clicue's publish script: a checksum that changed for a
 //! source of an already-published version is not a re-sum, it is an incident.
-//! The reading being partial is safe in that direction — a form this module
-//! does not recognise yields no comparison and therefore no false alarm,
-//! while every form it does recognise is the form the alarm was written for.
+//!
+//! **Being a partial reader is a real limitation, not a safe one.** A form
+//! this module cannot read yields no comparison — which produces no false
+//! alarm, and also no true one. The dangerous direction is the miss: a
+//! generated `source+=(…)`, an array built in a loop, a checksum assembled
+//! from variables, and the alarm is quietly silent on a package it never
+//! actually checked. That is why [`comparable_sources`] exists beside
+//! `changed_sums` and why callers are expected to *show* the count: silence
+//! from this module means "nothing was compared", and only the caller can
+//! tell a reader whether that is the same as "nothing changed". A fuller
+//! answer would mean evaluating the file, which is the one thing pacrat will
+//! not do to decide whether to trust it.
 
 use std::collections::BTreeMap;
 
@@ -207,6 +216,25 @@ pub fn sums_by_source(text: &str) -> BTreeMap<String, BTreeMap<String, String>> 
     out
 }
 
+/// How many sources the alarm can actually say something about: those
+/// declared with a checksum on **both** sides.
+///
+/// The number a caller shows so that a quiet alarm can be told apart from a
+/// blind one. Zero means [`changed_sums`] examined nothing — which it reports
+/// the same way it reports finding nothing wrong.
+pub fn comparable_sources(published: &str, now: &str) -> usize {
+    let before = sums_by_source(published);
+    let after = sums_by_source(now);
+    before
+        .iter()
+        .filter(|(source, old_sums)| {
+            after
+                .get(*source)
+                .is_some_and(|new_sums| old_sums.keys().any(|algo| new_sums.contains_key(algo)))
+        })
+        .count()
+}
+
 /// A checksum that changed for a source that was already published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SumChange {
@@ -366,6 +394,35 @@ sha256sums_x86_64=('dddd')
         // Hex case is not a change.
         let upper = "pkgver=1.0\nsource=('x-1.0.tar.gz')\nsha256sums=('AAAA')\n";
         assert!(changed_sums(published, upper).is_empty());
+    }
+
+    /// The count that makes silence readable. `changed_sums` returning
+    /// nothing means "no contradiction found", which is worth very little
+    /// when nothing was examined — and a PKGBUILD whose sources this module
+    /// cannot read is exactly that case.
+    #[test]
+    fn the_comparable_count_distinguishes_clear_from_blind() {
+        let published = "pkgver=1.0\nsource=('x-1.0.tar.gz')\nsha256sums=('aaaa')\n";
+        assert_eq!(comparable_sources(published, published), 1);
+
+        // A source array this reader cannot see: appended at runtime. Zero
+        // comparisons, and `changed_sums` is quiet about it either way.
+        let generated = "pkgver=1.0\nsource=()\nsource+=(\"x-1.0.tar.gz\")\nsha256sums+=('bbbb')\n";
+        assert_eq!(comparable_sources(published, generated), 0);
+        assert!(changed_sums(published, generated).is_empty());
+
+        // SKIP is not a claim, so it is not comparable either.
+        let skipped = "pkgver=1.0\nsource=('x-1.0.tar.gz')\nsha256sums=('SKIP')\n";
+        assert_eq!(comparable_sources(published, skipped), 0);
+
+        // A source in common but no algorithm in common: nothing to compare.
+        let other_algo = "pkgver=1.0\nsource=('x-1.0.tar.gz')\nb2sums=('cccc')\n";
+        assert_eq!(comparable_sources(published, other_algo), 0);
+
+        // Two sources, one shared: one comparison.
+        let two = "pkgver=1.0\nsource=('x-1.0.tar.gz'\n        'new.patch')\n\
+                   sha256sums=('aaaa'\n            'dddd')\n";
+        assert_eq!(comparable_sources(published, two), 1);
     }
 
     /// Ordinary maintenance is not an alarm: a new patch, a source dropped, a

@@ -66,6 +66,7 @@ use pacrat_core::pkg::valid_name;
 use pacrat_core::pkgbuild;
 use pacrat_core::queue::Queue;
 use pacrat_core::sources::Role;
+use pacrat_core::version::is_newer;
 
 use crate::ctx::{self, Ctx};
 use crate::fstree;
@@ -128,6 +129,39 @@ enum Outcome {
     Held,
 }
 
+/// Why a publish did not happen, in the one distinction the drain needs.
+///
+/// A drain works several packages, and the two kinds of bad news want
+/// opposite handling. A [`Failure::Fault`] is about one package — its remote
+/// refused the connection, its PKGBUILD will not parse — and the other
+/// errands are still perfectly runnable, so it is reported under that
+/// package and the loop goes on. A [`Failure::Alarm`] is the tamper alarm,
+/// and it stops everything: "investigate before republishing" is advice
+/// nobody reads at the top of a wall of successful publishes, and the
+/// possibility being raised is that something is wrong with the *store* or
+/// with what is on the other end, which is not a per-package problem.
+#[derive(Debug)]
+enum Failure {
+    Alarm(String),
+    Fault(String),
+}
+
+impl Failure {
+    fn message(&self) -> &str {
+        match self {
+            Failure::Alarm(m) | Failure::Fault(m) => m,
+        }
+    }
+}
+
+/// Every plain error inside a publish is that package's fault, not the run's.
+/// The alarm is constructed deliberately and is the only thing that is not.
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Failure::Fault(message)
+    }
+}
+
 // -------------------------------------------------------------- one package
 
 fn one(ctx: &Ctx, package: &str, yes: bool) -> Result<Outcome, String> {
@@ -151,12 +185,12 @@ fn one(ctx: &Ctx, package: &str, yes: bool) -> Result<Outcome, String> {
     if remote.aur {
         let probe = probe_aur();
         probe.report();
-        if !probe.open {
-            return block(package, &curated, &probe.answer).map(|()| Outcome::Held);
+        if !probe.open() {
+            return block(package, &curated, &probe).map(|()| Outcome::Held);
         }
     }
 
-    let outcome = publish(package, &curated, &remote, yes)?;
+    let outcome = publish(package, &curated, &remote, yes).map_err(|f| f.message().to_string())?;
     if matches!(outcome, Outcome::Published | Outcome::Current) {
         // The errand is done; a queue entry for it is now a lie.
         unqueue(package)?;
@@ -248,20 +282,116 @@ impl Remote {
 
 // --------------------------------------------------------------- the probe
 
-/// What the AUR said when asked whether it is accepting anything.
+/// What the AUR said when asked whether it is accepting anything, and what
+/// that means.
+///
+/// The distinction is the point. "The AUR is not accepting publishes" is a
+/// statement about a *service*, and it is only pacrat's to make when a
+/// reachable server said so. An unregistered ssh key, a missing `ssh`
+/// binary and a name that will not resolve are three different problems on
+/// *this* machine, and telling their owner that the AUR is read-only sends
+/// them to check a status page while their own setup stays broken. Every one
+/// of them still queues — the errand is real either way — but the sentence
+/// on screen has to match the diagnosis.
 struct AurProbe {
-    open: bool,
+    verdict: Verdict,
+    /// The server's or ssh's own words, verbatim.
     answer: String,
 }
 
+#[derive(PartialEq, Eq)]
+enum Verdict {
+    /// The key works and the service answered.
+    Open,
+    /// A reachable server declined: maintenance, read-only, a policy.
+    Refusing,
+    /// The key is not one this server accepts.
+    KeyRejected,
+    /// Nothing was reached: DNS, routing, a firewall, a timeout.
+    Unreachable,
+    /// ssh itself could not be run.
+    NoSsh,
+}
+
 impl AurProbe {
+    fn open(&self) -> bool {
+        self.verdict == Verdict::Open
+    }
+
+    /// The one line, matched to the diagnosis.
     fn report(&self) {
-        if self.open {
-            println!("probe     write access ok — {}", self.answer);
-        } else {
-            println!("probe     blocked — {}", self.answer);
+        let (label, gloss) = match self.verdict {
+            Verdict::Open => ("write access ok", ""),
+            Verdict::Refusing => (
+                "blocked",
+                "  (the AUR is reachable and is not accepting publishes)",
+            ),
+            Verdict::KeyRejected => (
+                "key refused",
+                "  (this is your ssh setup, not the AUR's state — the key this host \
+                 offered is not registered with your AUR account, or the agent does \
+                 not have it)",
+            ),
+            Verdict::Unreachable => (
+                "unreachable",
+                "  (nothing answered — DNS, the network, or a firewall; the AUR's own \
+                 state is unknown from here)",
+            ),
+            Verdict::NoSsh => (
+                "cannot ask",
+                "  (ssh could not be run on this host — install openssh)",
+            ),
+        };
+        println!("probe     {label} — {}", self.answer);
+        if !gloss.is_empty() {
+            println!("        {gloss}");
         }
     }
+
+    /// How the queue and the summary line describe it.
+    fn summary(&self) -> &'static str {
+        match self.verdict {
+            Verdict::Open => "open",
+            Verdict::Refusing => "the remote is not accepting publishes",
+            Verdict::KeyRejected => "the AUR refused this host's ssh key",
+            Verdict::Unreachable => "the AUR could not be reached from this host",
+            Verdict::NoSsh => "ssh could not be run on this host",
+        }
+    }
+}
+
+/// Read a probe's outcome out of what ssh did and said.
+///
+/// ssh's exit code is nearly useless on its own — 255 covers everything from
+/// a refused key to a DNS failure — so the text is what gets classified, and
+/// only after the cases that never reached a server are excluded. Anything
+/// unrecognised is `Refusing`: the conservative reading, since it means a
+/// server said something pacrat does not have a rule for, and the summary
+/// then defers to the server's own words which are printed beside it.
+fn classify(status_ok: bool, text: &str) -> Verdict {
+    if status_ok {
+        return Verdict::Open;
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("permission denied")
+        || lower.contains("publickey")
+        || lower.contains("too many authentication failures")
+        || lower.contains("no supported authentication methods")
+    {
+        return Verdict::KeyRejected;
+    }
+    if lower.contains("could not resolve")
+        || lower.contains("name or service not known")
+        || lower.contains("connection refused")
+        || lower.contains("connection timed out")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("connection closed by")
+        || lower.contains("connection reset")
+    {
+        return Verdict::Unreachable;
+    }
+    Verdict::Refusing
 }
 
 /// Ask the AUR whether it is open, without changing anything.
@@ -300,17 +430,22 @@ fn probe_aur() -> AurProbe {
     cmd.args(argv);
     match proc::run_with_timeout(cmd, PROBE_TIMEOUT) {
         Err(e) => AurProbe {
-            open: false,
+            verdict: Verdict::NoSsh,
             answer: format!("ssh could not be run: {e}"),
         },
+        // A timeout reached nothing it can quote, which is the definition of
+        // unreachable from here — never evidence about the service itself.
         Ok(ran) if ran.timed_out => AurProbe {
-            open: false,
+            verdict: Verdict::Unreachable,
             answer: format!("no answer within {}s", PROBE_TIMEOUT.as_secs()),
         },
-        Ok(ran) => AurProbe {
-            open: ran.status.success(),
-            answer: said(&ran),
-        },
+        Ok(ran) => {
+            let answer = said(&ran);
+            AurProbe {
+                verdict: classify(ran.status.success(), &answer),
+                answer,
+            }
+        }
     }
 }
 
@@ -349,6 +484,19 @@ pub fn load_queue() -> Result<Queue, String> {
 /// Write the queue atomically — the argument `Ctx::save_sources` makes about
 /// the ledger, made about host state: a crash mid-write must not leave a
 /// half-parsed record of what is still owed.
+///
+/// **There is no lock, and that is a decision rather than an omission.** Two
+/// pacrats writing this file at once — a `pacrat push mdcat` in one terminal
+/// while a `pacrat push` drains in another — is a read-modify-write race, and
+/// the loser's change is lost. What bounds the damage is that the rename is
+/// atomic (nobody ever reads a torn queue) and that the queue is a *reminder*
+/// rather than a record of record: the worst case is one forgotten errand,
+/// recovered by running `pacrat push <package>` again, which is the command
+/// the maintainer was going to run anyway. Against that, an flock adds a
+/// stale-lock failure mode to a single-user tool on a single host — a
+/// mechanism whose own failures are harder to explain than the problem it
+/// prevents. Revisit if pacrat ever grows a daemon (ADR-001 decision 3 says
+/// it will not).
 fn save_queue(queue: &Queue) -> Result<(), String> {
     let path = queue_path()?;
     let dir = path
@@ -371,10 +519,16 @@ fn now() -> i64 {
 }
 
 /// Record a publish the remote would not accept.
-fn block(package: &str, curated: &review::Curated, answer: &str) -> Result<(), String> {
+fn block(package: &str, curated: &review::Curated, probe: &AurProbe) -> Result<(), String> {
     let digest = fstree::digest(&curated.tree)?;
     let mut queue = load_queue()?;
-    queue.block(package, &curated.entry.reviewed, &digest, now(), answer);
+    queue.block(
+        package,
+        &curated.entry.reviewed,
+        &digest,
+        now(),
+        &probe.answer,
+    );
     save_queue(&queue)?;
 
     println!();
@@ -382,12 +536,17 @@ fn block(package: &str, curated: &review::Curated, answer: &str) -> Result<(), S
         "queued    {package} @ {}",
         short_hash(&curated.entry.reviewed)
     );
-    println!("answer    {}", visible_line(answer).0);
+    println!("answer    {}", visible_line(&probe.answer).0);
     println!("queue     {}", queue_path()?.display());
     println!();
+    // Queued whatever the diagnosis — a publish that could not happen is a
+    // real errand either way — but described by what actually went wrong, so
+    // that a key which needs registering is not reported as an outage the
+    // maintainer can only wait out.
     println!(
-        "not published — the remote is not accepting publishes. The errand is on \
-         file; `pacrat push` (no arguments) probes again and works the queue"
+        "not published — {}. The errand is on file; `pacrat push` (no arguments) \
+         probes again and works the queue",
+        probe.summary()
     );
     Ok(())
 }
@@ -464,13 +623,14 @@ fn drain(ctx: &Ctx, yes: bool) -> Result<(), String> {
     if bound_for_aur(ctx, &queue)? {
         let probe = probe_aur();
         probe.report();
-        if !probe.open {
+        if !probe.open() {
             queue.probed(now(), &probe.answer);
             save_queue(&queue)?;
             show_queue(&queue);
             println!();
             println!(
-                "still blocked — {} publish{} waiting",
+                "{} — {} publish{} waiting",
+                probe.summary(),
                 queue.len(),
                 if queue.len() == 1 { "" } else { "es" }
             );
@@ -478,64 +638,116 @@ fn drain(ctx: &Ctx, yes: bool) -> Result<(), String> {
         }
     }
 
+    // One package's bad day is not the queue's. The order here is stable
+    // (a BTreeMap over names), so a package that fails and stops the loop
+    // stops the *same* later packages on every run — a single wedged errand
+    // would silently hold back every alphabetically later publish forever.
+    // So each one is worked in its own right and the failures are collected.
     let packages: Vec<String> = queue.pushes.keys().cloned().collect();
+    let mut faulted: Vec<String> = Vec::new();
     for package in &packages {
         println!();
         println!("── {package} ──");
-        match eligible(ctx, package)? {
-            Eligibility::Gone(why) => {
-                let mut queue = load_queue()?;
-                queue.pushes.remove(package);
-                save_queue(&queue)?;
-                println!("dropped   {why}");
+        match work(ctx, package, yes) {
+            Ok(()) => {}
+            // The alarm is the exception, and stops the run where it stands:
+            // it is a claim that something is wrong beyond this package, and
+            // burying it under later successes is how it gets ignored.
+            Err(Failure::Alarm(message)) => {
+                println!();
+                println!(
+                    "stopped   the tamper alarm ends the run — the rest of the queue is \
+                     untouched and will be there after you have looked"
+                );
+                return Err(message);
             }
-            Eligibility::Moved {
-                curated,
-                digest,
-                why,
-            } => {
-                let mut queue = load_queue()?;
-                if let Some(entry) = queue.pushes.get_mut(package) {
-                    entry.commit.clone_from(&curated.entry.reviewed);
-                    entry.digest = digest;
-                    entry.note = Some(why.clone());
-                }
-                save_queue(&queue)?;
-                // Not published: what was queued is not what is in the store
-                // now, and "publish the newer thing instead" is a decision
-                // nobody made. Re-queued against the new bytes so the next
-                // run — or an explicit `pacrat push <package>` — sees them.
-                println!("re-queued {why}");
-            }
-            Eligibility::Ready(curated) => {
-                let remote = Remote::derive(&curated.entry.upstream, package)?;
-                println!("remote    {}", visible_line(&remote.url).0);
-                match publish(package, &curated, &remote, yes)? {
-                    Outcome::Published | Outcome::Current => {
-                        let mut queue = load_queue()?;
-                        queue.pushes.remove(package);
-                        save_queue(&queue)?;
-                    }
-                    Outcome::Held => {}
-                }
+            Err(Failure::Fault(message)) => {
+                println!("failed    {message}");
+                faulted.push(package.clone());
             }
         }
     }
 
     let left = load_queue()?;
+    if !left.is_empty() {
+        show_queue(&left);
+    }
+    println!();
+    if !faulted.is_empty() {
+        println!(
+            "{} publish{} failed: {}",
+            faulted.len(),
+            if faulted.len() == 1 { "" } else { "es" },
+            list_preview(&faulted, 12)
+        );
+        // A failure outranks a hold: exit 10 says "ran fine, deliberately did
+        // not act", and something here did not run fine.
+        return Err(format!(
+            "{} of {} queued publish{} could not be attempted — see the reports above",
+            faulted.len(),
+            packages.len(),
+            if packages.len() == 1 { "" } else { "es" }
+        ));
+    }
     if left.is_empty() {
-        println!();
         println!("publish queue empty");
         return Ok(());
     }
-    show_queue(&left);
-    println!();
     println!(
         "{} publish{} still queued",
         left.len(),
         if left.len() == 1 { "" } else { "es" }
     );
     std::process::exit(HELD);
+}
+
+/// One queued errand, start to finish. Its errors belong to it.
+fn work(ctx: &Ctx, package: &str, yes: bool) -> Result<(), Failure> {
+    match eligible(ctx, package)? {
+        Eligibility::Gone(why) => {
+            let mut queue = load_queue()?;
+            queue.pushes.remove(package);
+            save_queue(&queue)?;
+            println!("dropped   {why}");
+        }
+        Eligibility::Unavailable(why) => {
+            // The errand stands; this host simply cannot act on it right now.
+            // Dropping it here is how an unmounted store during a sync turns
+            // a pending publish into one nobody remembers.
+            println!("kept      {why}");
+        }
+        Eligibility::Moved {
+            curated,
+            digest,
+            why,
+        } => {
+            let mut queue = load_queue()?;
+            if let Some(entry) = queue.pushes.get_mut(package) {
+                entry.commit.clone_from(&curated.entry.reviewed);
+                entry.digest = digest;
+                entry.note = Some(why.clone());
+            }
+            save_queue(&queue)?;
+            // Not published: what was queued is not what is in the store now,
+            // and "publish the newer thing instead" is a decision nobody made.
+            // Re-queued against the new bytes so the next run — or an explicit
+            // `pacrat push <package>` — sees them.
+            println!("re-queued {why}");
+        }
+        Eligibility::Ready(curated) => {
+            let remote = Remote::derive(&curated.entry.upstream, package)?;
+            println!("remote    {}", visible_line(&remote.url).0);
+            match publish(package, &curated, &remote, yes)? {
+                Outcome::Published | Outcome::Current => {
+                    let mut queue = load_queue()?;
+                    queue.pushes.remove(package);
+                    save_queue(&queue)?;
+                }
+                Outcome::Held => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Is any queued publish going to the AUR?
@@ -561,7 +773,10 @@ enum Eligibility {
         digest: String,
         why: String,
     },
+    /// The errand has been *withdrawn*: forget it.
     Gone(String),
+    /// The errand stands but this host cannot act on it now: keep it.
+    Unavailable(String),
 }
 
 /// Is this queued errand still the errand it was?
@@ -572,23 +787,53 @@ enum Eligibility {
 /// would go out while the ledger may say nothing at all. ADR-001 settled this
 /// for gradings ("a grading is about bytes, not about a commit") and it is the
 /// same question here, asked days later instead of seconds.
-fn eligible(ctx: &Ctx, package: &str) -> Result<Eligibility, String> {
+///
+/// **Only two answers delete a queue entry**, and both are a human's decision
+/// rather than a machine's weather: the package is no longer in the ledger,
+/// or its role is no longer `maintained`. Everything else — a store that is
+/// not mounted, a tree that vanished mid-sync, an unreadable file — is a
+/// reason this host cannot answer *right now*, and forgetting a pending
+/// publish over a transient condition is the one outcome the queue exists to
+/// prevent. Those keep the entry and say so.
+fn eligible(ctx: &Ctx, package: &str) -> Result<Eligibility, Failure> {
     let queue = load_queue()?;
     let Some(entry) = queue.pushes.get(package).cloned() else {
         return Ok(Eligibility::Gone("no longer in the queue".into()));
     };
-    let curated = match review::curated(ctx, package) {
-        Ok(c) => c,
-        Err(e) => return Ok(Eligibility::Gone(e)),
+
+    // Asked of the ledger directly rather than inferred from `curated`'s
+    // error, which cannot tell "withdrawn" from "the disk is not there".
+    let sources = ctx.load_sources()?;
+    let Some(row) = sources.packages.get(package) else {
+        return Ok(Eligibility::Gone(format!(
+            "{package} is no longer in the ledger — the claim that made this errand \
+             ours has been withdrawn"
+        )));
     };
-    if curated.entry.role != Role::Maintained {
+    if row.role != Role::Maintained {
         return Ok(Eligibility::Gone(format!(
             "{package} is {} in the ledger now — push is for maintained packages",
-            role_word(curated.entry.role)
+            role_word(row.role)
         )));
     }
 
-    let digest = fstree::digest(&curated.tree)?;
+    let curated = match review::curated(ctx, package) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(Eligibility::Unavailable(format!(
+                "{e} — the errand stays queued; nothing about it has been withdrawn"
+            )))
+        }
+    };
+
+    let digest = match fstree::digest(&curated.tree) {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(Eligibility::Unavailable(format!(
+                "the store tree cannot be read ({e}) — the errand stays queued"
+            )))
+        }
+    };
     if digest != entry.digest {
         let why = if curated.entry.reviewed == entry.commit {
             format!(
@@ -630,7 +875,7 @@ fn publish(
     curated: &review::Curated,
     remote: &Remote,
     yes: bool,
-) -> Result<Outcome, String> {
+) -> Result<Outcome, Failure> {
     let scratch = vendor::scratch_dir("push", package)?;
     let clone = scratch.join("remote");
     let outcome = staged(package, curated, remote, &clone, yes);
@@ -652,7 +897,7 @@ fn staged(
     remote: &Remote,
     clone: &Path,
     yes: bool,
-) -> Result<Outcome, String> {
+) -> Result<Outcome, Failure> {
     Git::new([
         OsStr::new("clone"),
         OsStr::new("--"),
@@ -669,9 +914,9 @@ fn staged(
 
     let store_files = fstree::files(&curated.tree)?;
     if !store_files.iter().any(|f| f == "PKGBUILD") {
-        return Err(format!(
+        return Err(Failure::Fault(format!(
             "the store tree for {package} has no PKGBUILD — there is nothing to publish"
-        ));
+        )));
     }
     let store_pkgbuild = read_text(&curated.tree.join("PKGBUILD"))?;
     fstree::mirror(&curated.tree, &store_files, clone)?;
@@ -688,6 +933,19 @@ fn staged(
         println!(
             "note      the store's .SRCINFO differs from the one regenerated here; \
              what is published is the regenerated one"
+        );
+    }
+
+    // What is being published, named before it is staged: the store's tree
+    // plus the .SRCINFO just generated from it, and nothing else. Anything
+    // else in the directory is a side effect of having sourced a shell script.
+    let mut intended: BTreeSet<String> = store_files.iter().cloned().collect();
+    intended.insert(".SRCINFO".to_string());
+    let swept = sweep(clone, &intended)?;
+    if !swept.is_empty() {
+        println!(
+            "swept     {} — left behind by makepkg reading the PKGBUILD, not published",
+            list_preview(&safe_names(&swept), 12)
         );
     }
 
@@ -709,6 +967,10 @@ fn staged(
         return Ok(Outcome::Current);
     }
     println!("changing  {}", list_preview(&changed, 12));
+    // After the nothing-to-do exit, deliberately: telling someone their
+    // re-push will not reach any host is alarming and useless when the answer
+    // is that there is no re-push.
+    warn_if_no_bump(&published, &version);
     let diff = diff(clone)?;
     render_diff(&diff);
 
@@ -814,9 +1076,21 @@ impl Published {
     }
 }
 
-/// A package version as it will be published.
+/// A package version as it will be published: `[epoch:]pkgver-pkgrel`.
+///
+/// The epoch is carried rather than dropped because it is not decoration —
+/// it is the field that outranks every other, and it exists precisely for the
+/// case where a version number went *backwards*. A publish flow that read
+/// `pkgver` and `pkgrel` and ignored `epoch` would print the wrong version in
+/// its commit message, would call an epoch bump "no update" in the warning
+/// below, and would ask the alarm to compare two releases that pacman
+/// considers different packages entirely.
 #[derive(Debug, PartialEq, Eq)]
 struct Version {
+    /// Absent when the PKGBUILD declares none, which is the common case;
+    /// `Some("0")` and absent mean the same thing to pacman and are rendered
+    /// the same way here.
+    epoch: Option<String>,
     pkgver: String,
     pkgrel: String,
 }
@@ -829,20 +1103,38 @@ impl Version {
     /// function has a real version there and a shell fragment in the PKGBUILD.
     /// The text is the fallback for the case where makepkg said nothing.
     fn read(srcinfo: &str, pkgbuild: &str) -> Self {
-        let pick = |key: &str, default: &str| {
+        let pick = |key: &str| {
             srcinfo_field(srcinfo, key)
                 .or_else(|| pkgbuild::field(pkgbuild, key))
                 .map(|v| truncate(&visible_line(&v).0, 60))
-                .unwrap_or_else(|| default.to_string())
         };
         Self {
-            pkgver: pick("pkgver", "0"),
-            pkgrel: pick("pkgrel", "1"),
+            epoch: pick("epoch").filter(|e| e != "0"),
+            pkgver: pick("pkgver").unwrap_or_else(|| "0".to_string()),
+            pkgrel: pick("pkgrel").unwrap_or_else(|| "1".to_string()),
         }
     }
 
+    /// The whole version, in the spelling pacman and `vercmp` use.
     fn full(&self) -> String {
-        format!("{}-{}", self.pkgver, self.pkgrel)
+        match &self.epoch {
+            Some(epoch) => format!("{epoch}:{}-{}", self.pkgver, self.pkgrel),
+            None => format!("{}-{}", self.pkgver, self.pkgrel),
+        }
+    }
+
+    /// What the alarm means by "the same version".
+    ///
+    /// Epoch and pkgver, without pkgrel: a `pkgrel` bump is ordinary
+    /// maintenance at the *same upstream release*, and the tarball behind
+    /// that release is supposed to be the same bytes either way — which is
+    /// the whole thing the alarm is watching. An epoch bump is not
+    /// maintenance: it says upstream's numbering restarted, so the tarball
+    /// behind `1.0` after the bump is a different artifact than the one
+    /// behind `1.0` before it, and comparing their checksums would alarm on
+    /// a rename.
+    fn release(&self) -> (Option<&str>, &str) {
+        (self.epoch.as_deref(), self.pkgver.as_str())
     }
 }
 
@@ -884,29 +1176,40 @@ fn srcinfo(clone: &Path) -> Result<String, String> {
 
 /// The tamper alarm.
 ///
-/// Only asked of two files at the same `pkgver`, which is the version an
-/// upstream tag names. A `pkgrel` bump at the same `pkgver` is ordinary
-/// maintenance — a patch, a dependency fix — and must still not come with a
-/// different tarball, so the alarm deliberately ignores `pkgrel`.
-fn alarm(published: &Published, version: &Version, store_pkgbuild: &str) -> Result<(), String> {
+/// Only asked of two files at the same *release* — the same epoch and pkgver
+/// (see [`Version::release`]) — because that is the pair that names one
+/// upstream artifact.
+///
+/// It says how many sources it was able to compare, and that line is not
+/// decoration. The failure mode worth fearing here is not a false alarm, it
+/// is a **miss**: a PKGBUILD written in a form [`pkgbuild`] cannot read
+/// yields zero comparisons and therefore silence, which looks exactly like
+/// "checked, all clear". `compared 0 sources` on the screen is the
+/// difference between those two, and the only signal a reader gets that the
+/// gate did not actually run.
+fn alarm(published: &Published, version: &Version, store_pkgbuild: &str) -> Result<(), Failure> {
     let (Some(prev), Some(prev_pkgbuild)) = (&published.version, &published.pkgbuild) else {
         return Ok(());
     };
-    if prev.pkgver != version.pkgver {
+    if prev.release() != version.release() {
         return Ok(());
     }
 
+    let compared = pkgbuild::comparable_sources(prev_pkgbuild, store_pkgbuild);
     let changes = pkgbuild::changed_sums(prev_pkgbuild, store_pkgbuild);
+    println!(
+        "compared  {compared} source{} with checksums on both sides of {}",
+        if compared == 1 { "" } else { "s" },
+        version.full()
+    );
+    if compared == 0 {
+        println!(
+            "warning   nothing to compare — the tamper check could not read a checksummed \
+             source out of either PKGBUILD, so it is silent here rather than clear. Read \
+             the diff yourself before answering"
+        );
+    }
     if changes.is_empty() {
-        if prev.pkgrel == version.pkgrel {
-            // Not an alarm, and not nothing: pacman compares versions, so a
-            // changed tree at an unchanged version reaches nobody's machine.
-            println!(
-                "warning   republishing {} with neither pkgver nor pkgrel bumped — \
-                 pacman will not see this as an update, so no host will pick it up",
-                version.full()
-            );
-        }
         return Ok(());
     }
 
@@ -924,24 +1227,124 @@ fn alarm(published: &Published, version: &Version, store_pkgbuild: &str) -> Resu
         );
         println!("            now       {}", visible_line(&change.now).0);
     }
-    Err(format!(
+    Err(Failure::Alarm(format!(
         "not published — {} is already published and the bytes behind one of its \
          sources have changed. An immutable tag whose tarball changed is an incident, \
          never a silent re-sum: someone or something rewrote it. Investigate before \
-         republishing — if the change is legitimate (a re-cut release), publish it \
-         under a new pkgver",
+         republishing — if the change is legitimate, it is a different artifact and \
+         needs a version that says so: a new pkgver, or a new epoch if upstream \
+         re-cut the release under a number it had already used",
         version.full()
-    ))
+    )))
 }
 
-/// Stage everything and report what moved, as file names.
+/// Would anyone's machine see this publish as an update?
+///
+/// Asked only once there is something to publish, and asked through core's
+/// pacman-compatible comparison rather than by comparing fields: an epoch
+/// bump *is* an update even when pkgver goes backwards, which is the entire
+/// reason epoch exists, and a hand-rolled "did pkgver or pkgrel change"
+/// would call that a no-op and be exactly wrong.
+fn warn_if_no_bump(published: &Published, version: &Version) {
+    let Some(prev) = &published.version else {
+        return;
+    };
+    if is_newer(&prev.full(), &version.full()) {
+        return;
+    }
+    println!(
+        "warning   publishing {} over {} — pacman does not rank it higher, so no host \
+         will pick it up as an update. Bump pkgrel (or pkgver, or epoch) if this is \
+         meant to reach machines",
+        version.full(),
+        prev.full()
+    );
+}
+
+/// Reduce the clone's working tree to exactly `intended`, and say what was
+/// swept away.
+///
+/// Everything not in the intended set goes, whatever it is and however it got
+/// there. In practice it got there one way: `makepkg --printsrcinfo` sources
+/// the PKGBUILD, and a PKGBUILD is shell — a top-level `mkdir`, a stray
+/// `curl`, a `.pkg.tar.zst` from an interrupted earlier run in a tree the
+/// remote already carried. None of that is what the maintainer meant to
+/// publish, and staging it because it happened to be in the directory is how
+/// a build artifact ends up in somebody's AUR repository.
+///
+/// Its own walk rather than [`fstree::files`], because this one must be able
+/// to remove what that one refuses to describe: a side effect that dropped a
+/// symlink into the tree needs deleting, not an error.
+fn sweep(clone: &Path, intended: &BTreeSet<String>) -> Result<Vec<String>, String> {
+    let mut swept = Vec::new();
+    sweep_dir(clone, clone, intended, &mut swept)?;
+    swept.sort();
+    Ok(swept)
+}
+
+fn sweep_dir(
+    root: &Path,
+    dir: &Path,
+    intended: &BTreeSet<String>,
+    swept: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        // The clone's history is how the publish happens.
+        if rel == ".git" {
+            continue;
+        }
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // Not `is_dir()`: that follows symlinks, and descending through one
+        // would sweep whatever it points at.
+        if kind.is_dir() {
+            sweep_dir(root, &path, intended, swept)?;
+            // A directory the intended set never mentions is left only if
+            // something intended still lives under it.
+            let _ = fs::remove_dir(&path);
+        } else if !intended.contains(&rel) {
+            fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            swept.push(rel);
+        }
+    }
+    Ok(())
+}
+
+/// Stage exactly the intended set, and report what moved.
+///
+/// `--force` is the load-bearing flag, and it is here because of a real way
+/// to lose a file: `git add` honours ignore rules, and the AUR's own
+/// recommended `.gitignore` for package repositories ignores everything and
+/// re-includes a handful of names. A `fix-cve.patch` in the store is then
+/// silently not added — absent from the staged set, absent from the diff the
+/// maintainer is shown, absent from the publish, and the command exits 0.
+/// The ignore file need not even be in the tree: `core.excludesFile` puts it
+/// in the user's own config, where nothing about this package can be read to
+/// predict it.
+///
+/// So the set is decided by pacrat and stated to git, rather than discovered
+/// by git and accepted by pacrat. `--force` defeats the ignore rules,
+/// [`sweep`] has already removed anything outside the set, and `--all` still
+/// stages the deletions of files the remote carried and the store no longer
+/// has.
 fn stage_all(clone: &Path) -> Result<Vec<String>, String> {
     Git::new([
         OsStr::new("-C"),
         clone.as_os_str(),
         OsStr::new("add"),
         OsStr::new("--all"),
+        OsStr::new("--force"),
         OsStr::new("--"),
+        OsStr::new("."),
     ])
     .text()?;
     let names = Git::new([
@@ -1051,6 +1454,15 @@ fn confirmed(package: &str, version: &Version, yes: bool) -> Result<bool, String
     Ok(true)
 }
 
+/// File names as fields on pacrat's report: neutered and clipped one by one,
+/// because a name is written by whatever put the file there.
+fn safe_names(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|n| truncate(&visible_line(n).0, 60))
+        .collect()
+}
+
 /// Read a file we are about to publish; invalid UTF-8 is shown lossily rather
 /// than failing, the way `vendor` reads a tree it is reviewing.
 fn read_text(path: &Path) -> Result<String, String> {
@@ -1111,6 +1523,58 @@ mod tests {
         assert!(!line.iter().any(|a| a.contains("force") || a == "+HEAD"));
     }
 
+    /// The AUR being down and this host's key not being registered are two
+    /// different problems, and only one of them is worth waiting out. Telling
+    /// a maintainer with an unregistered key that the AUR is read-only sends
+    /// them to a status page while their own setup stays broken.
+    #[test]
+    fn a_blocked_probe_says_which_kind_of_blocked() {
+        let cases = [
+            (
+                "The AUR is down due to maintenance. We will be back soon.",
+                Verdict::Refusing,
+            ),
+            ("Permission denied (publickey).", Verdict::KeyRejected),
+            (
+                "Received disconnect from 2a01::1 port 22: Too many authentication failures",
+                Verdict::KeyRejected,
+            ),
+            (
+                "ssh: Could not resolve hostname aur.archlinux.org: Name or service not known",
+                Verdict::Unreachable,
+            ),
+            (
+                "ssh: connect to host aur.archlinux.org port 22: Connection refused",
+                Verdict::Unreachable,
+            ),
+            (
+                "ssh: connect to host aur.archlinux.org port 22: Network is unreachable",
+                Verdict::Unreachable,
+            ),
+            // Something a server said that pacrat has no rule for: read as
+            // the server refusing, with its own words printed beside it.
+            ("Repository is read-only for now", Verdict::Refusing),
+        ];
+        for (answer, want) in cases {
+            assert!(classify(false, answer) == want, "misclassified: {answer:?}");
+        }
+        assert!(classify(true, "Welcome to AUR, aaronsb!") == Verdict::Open);
+
+        // Only a reachable server's refusal may be described as the AUR not
+        // accepting publishes; nothing else may claim to know its state.
+        for verdict in [Verdict::KeyRejected, Verdict::Unreachable, Verdict::NoSsh] {
+            let probe = AurProbe {
+                verdict,
+                answer: String::new(),
+            };
+            assert!(
+                !probe.summary().contains("not accepting"),
+                "claimed the AUR is read-only on the wrong evidence: {}",
+                probe.summary()
+            );
+        }
+    }
+
     #[test]
     fn a_version_prefers_what_makepkg_evaluated() {
         // The VCS case: the PKGBUILD holds a function, .SRCINFO holds the
@@ -1123,6 +1587,40 @@ mod tests {
         assert_eq!(Version::read("", pkgbuild).full(), "0.0.0-1");
         // Neither: named rather than crashed on.
         assert_eq!(Version::read("", "").full(), "0-1");
+    }
+
+    /// The epoch is carried, rendered pacman's way, and `epoch=0` is written
+    /// as no epoch at all — which is what it means.
+    #[test]
+    fn an_epoch_is_part_of_the_version_and_of_the_release() {
+        let v = Version::read("", "epoch=2\npkgver=1.0\npkgrel=3\n");
+        assert_eq!(v.full(), "2:1.0-3");
+        assert_eq!(v.release(), (Some("2"), "1.0"));
+        assert_eq!(Version::read("", "epoch=0\npkgver=1.0\n").full(), "1.0-1");
+        // .SRCINFO wins here too.
+        let v = Version::read(
+            "pkgbase = x\n\tepoch = 5\n\tpkgver = 9\n",
+            "epoch=1\npkgver=9\n",
+        );
+        assert_eq!(v.full(), "5:9-1");
+    }
+
+    /// An epoch bump means upstream's numbering restarted: the tarball behind
+    /// `1.0` after it is a different artifact than the one behind `1.0`
+    /// before, so comparing their checksums would alarm on what is really a
+    /// renumbering.
+    #[test]
+    fn an_epoch_bump_is_a_different_release_and_does_not_alarm() {
+        let prev = "epoch=1\npkgver=1.0\npkgrel=1\nsource=('x.tar.gz')\nsha256sums=('aaaa')\n";
+        let published = Published {
+            pkgbuild: Some(prev.to_string()),
+            version: Some(Version::read("", prev)),
+        };
+        let recut = "epoch=2\npkgver=1.0\npkgrel=1\nsource=('x.tar.gz')\nsha256sums=('bbbb')\n";
+        assert!(alarm(&published, &Version::read("", recut), recut).is_ok());
+        // Same epoch, same pkgver, changed sum: still the alarm.
+        let same = "epoch=1\npkgver=1.0\npkgrel=9\nsource=('x.tar.gz')\nsha256sums=('bbbb')\n";
+        assert!(alarm(&published, &Version::read("", same), same).is_err());
     }
 
     /// A version reaches pacrat's own report and a commit message. It is read
@@ -1154,6 +1652,11 @@ mod tests {
 
         let rewritten = "pkgver=1.0\npkgrel=2\nsource=('x-1.0.tar.gz')\nsha256sums=('bbbb')\n";
         let err = alarm(&published, &Version::read("", rewritten), rewritten).unwrap_err();
+        assert!(
+            matches!(err, Failure::Alarm(_)),
+            "the alarm must stop a drain"
+        );
+        let err = err.message().to_string();
         assert!(err.contains("incident"), "{err}");
         assert!(err.contains("1.0-2"), "{err}");
 

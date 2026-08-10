@@ -106,7 +106,11 @@ impl Sandbox {
     /// output: a queue entry is a claim about bytes, and a test that got the
     /// claim from the thing it is testing would agree with a bug.
     fn digest(&self) -> String {
-        let dir = self.root.join("store/aur/packages/mdcat");
+        self.digest_of("mdcat")
+    }
+
+    fn digest_of(&self, package: &str) -> String {
+        let dir = self.root.join("store/aur/packages").join(package);
         let mut names: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -187,13 +191,40 @@ impl Sandbox {
             .collect()
     }
 
+    /// An `ssh` that says what the test needs the AUR to have said.
+    ///
+    /// The write probe is the one place pacrat asks a question whose *answer*
+    /// changes what it tells the operator, and the answers worth testing —
+    /// maintenance, a refused key, a name that will not resolve — cannot be
+    /// arranged against the real service. So the service is faked at the
+    /// process boundary, which leaves everything above it real: the argv,
+    /// the classification, the wording, the queue entry.
+    fn fake_ssh(&self, stdout: &str, stderr: &str, code: i32) {
+        let path = self.write(
+            "bin/ssh",
+            &format!(
+                "#!/bin/sh\n\
+                 [ -n \"{stdout}\" ] && printf '%s\\n' \"{stdout}\"\n\
+                 [ -n \"{stderr}\" ] && printf '%s\\n' \"{stderr}\" >&2\n\
+                 exit {code}\n"
+            ),
+        );
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&path, perms).unwrap();
+    }
+
     fn pacrat(&self, args: &[&str]) -> (i32, String) {
+        // The sandbox's own bin first, so a `fake_ssh` wins over the real one.
+        // Nothing else is shadowed: the directory holds only what a test put
+        // there, and does not exist at all for tests that never call it.
+        let path = format!("{}/bin:/usr/bin:/bin", self.root.display());
         let out = Command::new(env!("CARGO_BIN_EXE_pacrat"))
             .args(args)
             // Cleared, not extended: an inherited DOTFILES_DIR or XDG path
             // would let the developer's own store and queue answer.
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", path)
             .env("HOME", &self.root)
             .env("DOTFILES_DIR", self.root.join("store"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -220,16 +251,34 @@ impl Drop for Sandbox {
     }
 }
 
+/// Is `binary` on PATH? Asked of PATH rather than of `/usr/bin`, because a
+/// container image, a Nix profile or a `~/.local/bin` install all put it
+/// somewhere else — and a skip that fires because the lookup was too narrow
+/// is a test that quietly stopped running.
 fn have(binary: &str) -> bool {
-    Path::new("/usr/bin").join(binary).exists()
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(binary).is_file()))
+        .unwrap_or(false)
 }
 
 /// Publishing needs makepkg (`--printsrcinfo`), which is Arch's.
+///
+/// A skip is the right answer on a machine that cannot run makepkg at all —
+/// and the wrong one on a machine that was *supposed* to be able to, where a
+/// silent skip means the publish path went untested and the run was still
+/// green. `PACRAT_REQUIRE_MAKEPKG=1` turns the skip into a failure, and CI's
+/// Arch job sets it: that job exists precisely to run these, so a skip there
+/// is a broken job rather than a tolerable one.
 fn can_publish() -> bool {
     if have("makepkg") {
         return true;
     }
-    eprintln!("skipping: makepkg is not installed (publishing is Arch-only)");
+    assert!(
+        std::env::var_os("PACRAT_REQUIRE_MAKEPKG").is_none(),
+        "PACRAT_REQUIRE_MAKEPKG is set but makepkg is not on PATH — this run was \
+         supposed to exercise the publish path and would otherwise have skipped it"
+    );
+    eprintln!("skipping: makepkg is not on PATH (publishing is Arch-only)");
     false
 }
 
@@ -443,6 +492,69 @@ fn a_queued_publish_shows_up_in_status_and_in_the_drain() {
     assert!(queue.contains("mdcat"));
 }
 
+/// Every blocked probe queues the errand — and says something different
+/// about why, because "the AUR is not accepting publishes" is a claim about a
+/// service and only one of these is evidence for it. A maintainer whose key
+/// is not registered must not be sent to wait for an outage to end.
+#[test]
+fn a_blocked_probe_queues_but_names_the_right_problem() {
+    let cases = [
+        (
+            "The AUR is down due to maintenance. We will be back soon.",
+            "",
+            1,
+            "the remote is not accepting publishes",
+            "blocked",
+        ),
+        (
+            "",
+            "Permission denied (publickey).",
+            255,
+            "the AUR refused this host's ssh key",
+            "key refused",
+        ),
+        (
+            "",
+            "ssh: Could not resolve hostname aur.archlinux.org: Name or service not known",
+            255,
+            "the AUR could not be reached from this host",
+            "unreachable",
+        ),
+    ];
+    for (stdout, stderr, code, summary, label) in cases {
+        let sb = Sandbox::new("probe");
+        sb.ledger("maintained", "https://aur.archlinux.org/mdcat.git");
+        sb.tree("1.0", "1", &"a".repeat(64));
+        sb.fake_ssh(stdout, stderr, code);
+
+        let (exit, out) = sb.pacrat(&["push", "mdcat", "--yes"]);
+        assert_eq!(exit, 10, "{out}");
+        assert!(out.contains(&format!("probe     {label}")), "{out}");
+        assert!(out.contains(summary), "wrong diagnosis: {out}");
+        // The errand is real whichever it was.
+        assert!(sb.queue_text().contains("mdcat"), "not queued: {out}");
+        // And the server's own words are what got recorded.
+        let said = if stdout.is_empty() { stderr } else { stdout };
+        assert!(sb.queue_text().contains(said.trim()), "{}", sb.queue_text());
+    }
+
+    // The *open* path has no test here on purpose: past the probe, push
+    // clones the derived `ssh://aur@aur.archlinux.org/…` URL, and a test that
+    // got that far would be talking to the real AUR. What happens after an
+    // open probe is what every local-remote test above already covers, since
+    // those take the same path with no probe in front of it.
+    //
+    // Only a reachable server's refusal may be reported as the AUR being
+    // read-only. The other two must not say it at all.
+    let sb = Sandbox::new("probe-nokey");
+    sb.ledger("maintained", "https://aur.archlinux.org/mdcat.git");
+    sb.tree("1.0", "1", &"a".repeat(64));
+    sb.fake_ssh("", "Permission denied (publickey).", 255);
+    let (_, out) = sb.pacrat(&["push", "mdcat", "--yes"]);
+    assert!(!out.contains("not accepting publishes"), "{out}");
+    assert!(out.contains("your ssh setup"), "{out}");
+}
+
 /// An empty queue is not a failure and not a probe: there is nothing to ask
 /// about.
 #[test]
@@ -458,6 +570,255 @@ fn draining_an_empty_queue_asks_nobody_anything() {
         !out.contains("run       ssh"),
         "it probed an empty queue: {out}"
     );
+}
+
+/// THE staging bug. `git add` honours ignore rules, and the AUR's own
+/// recommended `.gitignore` for package repositories ignores everything and
+/// re-includes a few names — so a patch in the store was silently not
+/// published, was absent from the diff the maintainer confirmed, and the
+/// command exited 0.
+#[test]
+fn an_ignore_file_cannot_drop_a_store_file_from_the_publish() {
+    if !can_publish() {
+        return;
+    }
+    let sb = Sandbox::new("gitignore");
+    let remote = sb.remote();
+    sb.ledger("maintained", &format!("file://{}", remote.display()));
+    sb.tree("1.0", "1", &"a".repeat(64));
+    // The .gitignore the AUR wiki recommends: ignore everything, re-include
+    // the tracked names by hand.
+    sb.write(
+        "store/aur/packages/mdcat/.gitignore",
+        "*\n!.gitignore\n!.SRCINFO\n!PKGBUILD\n",
+    );
+    sb.write(
+        "store/aur/packages/mdcat/fix-cve.patch",
+        "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-bad\n+good\n",
+    );
+
+    let (code, out) = sb.pacrat(&["push", "mdcat", "--yes"]);
+    assert_eq!(code, 0, "{out}");
+    // Shown to the human before they answered...
+    assert!(
+        out.contains("fix-cve.patch"),
+        "the patch was never mentioned: {out}"
+    );
+    // ...and actually published.
+    assert!(
+        sb.published("fix-cve.patch").is_some(),
+        "an ignored store file was silently dropped from the publish"
+    );
+    assert!(sb.published(".gitignore").is_some());
+    assert!(sb.published("PKGBUILD").is_some());
+    assert!(sb.published(".SRCINFO").is_some());
+}
+
+/// A PKGBUILD is shell, and `makepkg --printsrcinfo` sources it. Whatever
+/// that leaves in the directory is not part of the publish.
+#[test]
+fn a_pkgbuild_side_effect_is_swept_rather_than_published() {
+    if !can_publish() {
+        return;
+    }
+    let sb = Sandbox::new("side-effect");
+    let remote = sb.remote();
+    sb.ledger("maintained", &format!("file://{}", remote.display()));
+    // Top-level shell that runs the moment makepkg sources the file.
+    sb.write(
+        "store/aur/packages/mdcat/PKGBUILD",
+        "pkgname=mdcat\npkgver=1.0\npkgrel=1\narch=('any')\n\
+         printf 'leaked\\n' > sneaky.txt\nmkdir -p build/deep\n\
+         printf 'x\\n' > build/deep/artifact.o\n\
+         package() { :; }\n",
+    );
+
+    let (code, out) = sb.pacrat(&["push", "mdcat", "--yes"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("swept"), "the sweep was silent: {out}");
+    assert!(out.contains("sneaky.txt"), "{out}");
+    assert!(
+        sb.published("sneaky.txt").is_none(),
+        "a side effect of sourcing the PKGBUILD was published"
+    );
+    assert!(sb.published("build/deep/artifact.o").is_none());
+    assert!(sb.published("PKGBUILD").is_some());
+}
+
+/// Publishing twice in a row must be a no-op the second time. It is the
+/// property that both bugs above broke: a dropped file and a swept-in side
+/// effect each make the remote disagree with the store forever, so every
+/// later push finds "changes" and commits them again.
+#[test]
+fn publishing_converges() {
+    if !can_publish() {
+        return;
+    }
+    let sb = Sandbox::new("converge");
+    let remote = sb.remote();
+    sb.ledger("maintained", &format!("file://{}", remote.display()));
+    sb.tree("1.0", "1", &"a".repeat(64));
+    sb.write(
+        "store/aur/packages/mdcat/.gitignore",
+        "*\n!.gitignore\n!.SRCINFO\n!PKGBUILD\n",
+    );
+    sb.write("store/aur/packages/mdcat/extra.patch", "patch\n");
+
+    assert_eq!(sb.pacrat(&["push", "mdcat", "--yes"]).0, 0);
+    let first = sb.log().len();
+    let (code, out) = sb.pacrat(&["push", "mdcat", "--yes"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("already current"), "{out}");
+    assert_eq!(
+        sb.log().len(),
+        first,
+        "a second publish made another commit"
+    );
+}
+
+/// The epoch is the field that outranks every other, and a publish flow that
+/// dropped it would print the wrong version and misjudge what is an update.
+#[test]
+fn an_epoch_is_carried_into_the_version_everywhere() {
+    if !can_publish() {
+        return;
+    }
+    let sb = Sandbox::new("epoch");
+    let remote = sb.remote();
+    sb.ledger("maintained", &format!("file://{}", remote.display()));
+    sb.write(
+        "store/aur/packages/mdcat/PKGBUILD",
+        "pkgname=mdcat\nepoch=2\npkgver=1.0\npkgrel=1\narch=('any')\npackage() { :; }\n",
+    );
+
+    let (code, out) = sb.pacrat(&["push", "mdcat", "--yes"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("published mdcat 2:1.0-1"), "{out}");
+    assert_eq!(sb.log(), ["mdcat 2:1.0-1"]);
+
+    // Upstream renumbered: a *lower* pkgver at a higher epoch is an update,
+    // and must not be warned about as if nothing had moved.
+    sb.write(
+        "store/aur/packages/mdcat/PKGBUILD",
+        "pkgname=mdcat\nepoch=3\npkgver=0.9\npkgrel=1\narch=('any')\npackage() { :; }\n",
+    );
+    let (code, out) = sb.pacrat(&["push", "mdcat", "--yes"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("published mdcat 3:0.9-1"), "{out}");
+    assert!(
+        !out.contains("no host will pick it up"),
+        "an epoch bump was called a no-op: {out}"
+    );
+
+    // Going backwards is what the warning is for.
+    sb.write(
+        "store/aur/packages/mdcat/PKGBUILD",
+        "pkgname=mdcat\nepoch=3\npkgver=0.9\npkgrel=1\narch=('any')\n# nudge\npackage() { :; }\n",
+    );
+    let (code, out) = sb.pacrat(&["push", "mdcat", "--yes"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("no host will pick it up"), "{out}");
+}
+
+/// One package's bad day must not wedge the queue. With a stable order, a
+/// failure that stopped the loop would hold back the same later packages on
+/// every run, forever.
+#[test]
+fn a_failing_entry_does_not_wedge_the_rest_of_the_queue() {
+    if !can_publish() {
+        return;
+    }
+    let sb = Sandbox::new("wedge");
+    let remote = sb.remote();
+    // `aaa-broken` sorts first and its remote does not exist; `mdcat` is fine.
+    sb.write(
+        "store/aur/sources.toml",
+        &format!(
+            "[packages.aaa-broken]\n\
+             upstream = \"file://{}/nonexistent.git\"\n\
+             reviewed = \"{REVIEWED}\"\n\
+             role = \"maintained\"\n\
+             \n\
+             [packages.mdcat]\n\
+             upstream = \"file://{}\"\n\
+             reviewed = \"{REVIEWED}\"\n\
+             role = \"maintained\"\n",
+            sb.root.display(),
+            remote.display()
+        ),
+    );
+    sb.write(
+        "store/aur/packages/aaa-broken/PKGBUILD",
+        "pkgname=aaa-broken\npkgver=1.0\npkgrel=1\narch=('any')\npackage() { :; }\n",
+    );
+    sb.tree("1.0", "1", &"a".repeat(64));
+
+    let broken_digest = sb.digest_of("aaa-broken");
+    let mdcat_digest = sb.digest_of("mdcat");
+    sb.write(
+        "state/pacrat/pushes/queue.toml",
+        &format!(
+            "[pushes.aaa-broken]\ncommit = \"{REVIEWED}\"\ndigest = \"{broken_digest}\"\n\
+             queued_at = 1754784000\nlast_probe = 1754870400\nlast_answer = \"blocked\"\n\
+             \n\
+             [pushes.mdcat]\ncommit = \"{REVIEWED}\"\ndigest = \"{mdcat_digest}\"\n\
+             queued_at = 1754784000\nlast_probe = 1754870400\nlast_answer = \"blocked\"\n"
+        ),
+    );
+
+    let (code, out) = sb.pacrat(&["push", "--retry", "--yes"]);
+    // Non-zero, because something genuinely did not run...
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("failed"), "{out}");
+    // ...and the healthy one behind it was published anyway.
+    assert!(out.contains("published mdcat 1.0-1"), "{out}");
+    assert!(sb.published("PKGBUILD").is_some());
+    let queue = sb.queue_text();
+    assert!(
+        queue.contains("aaa-broken"),
+        "the failing errand was lost: {queue}"
+    );
+    assert!(
+        !queue.contains("mdcat"),
+        "the published errand survived: {queue}"
+    );
+}
+
+/// A store that is not there right now is not a withdrawn claim. Deleting the
+/// errand over a transient condition is the one thing the queue exists to
+/// prevent.
+#[test]
+fn a_store_tree_that_vanished_keeps_its_errand() {
+    if !can_publish() {
+        return;
+    }
+    let sb = Sandbox::new("moved-aside");
+    let remote = sb.remote();
+    sb.ledger("maintained", &format!("file://{}", remote.display()));
+    sb.tree("1.0", "1", &"a".repeat(64));
+    let digest = sb.digest();
+    sb.queue("mdcat", REVIEWED, &digest);
+
+    // As if the store were unmounted mid-sync: the ledger still claims it.
+    let tree = sb.root.join("store/aur/packages/mdcat");
+    let aside = sb.root.join("mdcat-aside");
+    fs::rename(&tree, &aside).unwrap();
+
+    let (code, out) = sb.pacrat(&["push", "--retry", "--yes"]);
+    assert_eq!(code, 10, "{out}");
+    assert!(out.contains("kept"), "{out}");
+    assert!(out.contains("stays queued"), "{out}");
+    assert!(
+        sb.queue_text().contains("mdcat"),
+        "a transient store problem deleted the errand"
+    );
+
+    // Put it back: the errand runs.
+    fs::rename(&aside, &tree).unwrap();
+    let (code, out) = sb.pacrat(&["push", "--retry", "--yes"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("published mdcat 1.0-1"), "{out}");
+    assert!(!sb.queue_text().contains("mdcat"));
 }
 
 /// The drain's other half: a queued errand whose bytes are still the bytes
