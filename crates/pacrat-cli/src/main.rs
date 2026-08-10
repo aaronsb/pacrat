@@ -24,6 +24,7 @@ mod setup;
 mod status;
 mod sync;
 mod tui;
+mod untrack;
 mod update;
 mod updates;
 mod vendor;
@@ -61,6 +62,15 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Drop packages from this host's tracked list (tracked → unmanaged) —
+    /// add's exact inverse.
+    ///
+    /// A manifest-only edit: nothing is uninstalled and no removal command
+    /// is printed, because pacman owns the machine's package state. A
+    /// package untracked while still installed appears in `pacrat sync
+    /// --prune`'s plan, which is where the uninstall always lived. Names
+    /// tracked nowhere on this host are refused.
+    Untrack { packages: Vec<String> },
     /// Vendor a package's build tree into the store (tracked → vendored)
     Vendor {
         /// Package name (also names the default AUR repo)
@@ -294,6 +304,7 @@ fn dispatch(command: Option<Command>) -> Result<(), String> {
             ref packages,
             ref host,
         }) => add::run(&ctx, packages, host.as_deref()),
+        Some(Command::Untrack { ref packages }) => untrack::run(&ctx, packages),
         Some(Command::Setup { apply }) => setup::run(&ctx, apply),
         Some(Command::Updates { format }) => updates::run(&ctx, format),
         Some(Command::Vendor {
