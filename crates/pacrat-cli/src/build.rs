@@ -193,8 +193,15 @@ pub fn run(ctx: &Ctx, packages: &[String]) -> Result<(), String> {
         println!("served    {}", list_preview(&built, 12));
     }
     if !plan.no_tree.is_empty() {
+        // In a mixed run a failure owns the exit code, so name the code only
+        // when a hold is actually what the caller will see.
+        let exit_note = if failed == 0 {
+            format!(" and exit {HELD} reports that;")
+        } else {
+            String::from(" (a failure owns the exit code);")
+        };
         println!(
-            "held      {} — not built, and exit {HELD} reports that; whatever is",
+            "held      {} — not built,{exit_note} whatever is",
             list_preview(&plan.no_tree, 12)
         );
         println!("          listed as served above is in the repo regardless");
@@ -395,7 +402,11 @@ fn build_one(
     // what it produces — `package()` has not run yet and cannot have edited
     // the PKGBUILD to widen it.
     let declared = packagelist(&src, &build, &out)?;
-    println!("declares  {}", list_preview(&sorted(&declared), 8));
+    // makepkg's pkgname lint makes these names tame today; routing them
+    // through the same escape as every other untrusted print keeps the rule
+    // uniform instead of resting on an upstream lint staying put.
+    let (declared_shown, _) = visible(&list_preview(&sorted(&declared), 8));
+    println!("declares  {declared_shown}");
 
     let mut makepkg = makepkg_in(&src, &build, &out);
     makepkg.args(MAKEPKG_ARGV);
@@ -706,7 +717,12 @@ fn place(from: &Path, dest: &Path) -> Result<Placed, String> {
     let stamp = std::process::id();
     let tmp = dir.join(format!(".pacrat-{name}.{stamp}.new"));
 
-    fs::copy(from, &tmp).map_err(|e| format!("{}: {e}", safe(&tmp)))?;
+    if let Err(e) = fs::copy(from, &tmp) {
+        // A partial temp copy is inert (pacman reads the db, not the dir),
+        // but the other error arms clean up after themselves — match them.
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", safe(&tmp)));
+    }
     let backup = if dest.exists() {
         let backup = dir.join(format!(".pacrat-{name}.{stamp}.old"));
         if let Err(e) = fs::rename(dest, &backup) {
