@@ -210,9 +210,15 @@ that motivated dotfiles-cli ADR-200.)
 
 ### Dependencies
 
-clap + ratatui in the CLI crate; core stays dependency-free (serde/toml when
-the sources model lands). git, makepkg, aurutils, and graders are subprocesses
-with argv logging — the dotfiles-tui split, kept deliberately.
+clap + ratatui in the CLI crate; core stays thin — serde/toml for the models,
+serde_json for the grading contract, sha2 for the tree digest. "Thin" is not
+"none", and the digest is where that distinction got tested: a hand-written
+SHA-256 would have kept core's dependency list shorter while putting bespoke
+crypto in the part of pacrat that decides what to trust, which is the exact
+trade this whole ADR argues against making. Curated upstream over bespoke,
+including when it costs us ten crates on the lock. git, makepkg, aurutils and
+graders remain subprocesses with argv logging — the dotfiles-tui split, kept
+deliberately.
 
 ## Consequences
 

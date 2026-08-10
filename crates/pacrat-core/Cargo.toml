@@ -14,3 +14,13 @@ toml = "0.8"
 # the CLI. serde_json is already on the lock for the AUR RPC, at the same
 # version, so this adds nothing new to build. Core still does no I/O.
 serde_json = "1"
+# The grade cache's tree digest. This one is a dependency *on purpose*, and
+# the ten crates it puts on the lock (digest, block-buffer, crypto-common,
+# generic-array, typenum, cpufeatures, libc, cfg-if, version_check) are the
+# price: pacrat's whole argument is that curated upstream code beats bespoke
+# code, and a hand-written SHA-256 in the part of pacrat that decides what to
+# trust would contradict that however well it passed its vectors. RustCrypto's
+# is audited, is what the ecosystem already depends on, and keeps receiving
+# fixes nobody here would have written. 0.10 rather than 0.11 for the same
+# reason — it is the line with the most eyes on it.
+sha2 = "0.10"
