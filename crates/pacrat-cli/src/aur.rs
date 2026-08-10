@@ -59,6 +59,53 @@ pub fn info_url(package: &str) -> String {
     format!("{BASE}/info?arg[]={}", encode(package))
 }
 
+/// Longest URL a batched `info` may build. The AUR rejects requests over
+/// roughly 8k, and a shorter ceiling costs nothing: one extra round trip per
+/// ~150 packages, against the alternative of a whole batch coming back 414.
+const MAX_URL: usize = 4000;
+
+/// The `info` URLs covering `packages` — a multiinfo query per chunk.
+///
+/// Split out from the fetch so a caller can print every argv before the first
+/// one runs (ADR-001), which is the whole reason this returns URLs rather
+/// than doing the work.
+pub fn info_urls(packages: &[String]) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut url = String::new();
+    for package in packages {
+        let arg = format!("&arg[]={}", encode(package));
+        if url.is_empty() {
+            url = format!("{BASE}/info?arg[]={}", encode(package));
+            continue;
+        }
+        if url.len() + arg.len() > MAX_URL {
+            urls.push(std::mem::take(&mut url));
+            url = format!("{BASE}/info?arg[]={}", encode(package));
+            continue;
+        }
+        url.push_str(&arg);
+    }
+    if !url.is_empty() {
+        urls.push(url);
+    }
+    urls
+}
+
+/// Records for many packages at once. Names the AUR does not have are simply
+/// absent from the reply — the RPC does not error on them — so callers must
+/// treat a missing name as "not on the AUR", not as a failed lookup.
+///
+/// All-or-nothing across chunks: a partial answer here would look exactly
+/// like "these packages are not on the AUR", and silently under-reporting
+/// drift is the one failure this verb must not have.
+pub fn info_many(packages: &[String]) -> Result<Vec<AurPkg>, String> {
+    let mut all = Vec::new();
+    for url in info_urls(packages) {
+        all.extend(fetch(&url)?);
+    }
+    Ok(all)
+}
+
 /// The exact command a fetch runs, written so it can be pasted back into a
 /// shell — the URL carries `?`, `&` and `[]`, all of which a shell would eat.
 pub fn argv(url: &str) -> String {
@@ -136,5 +183,37 @@ mod tests {
             info_url("mdcat"),
             "https://aur.archlinux.org/rpc/v5/info?arg[]=mdcat"
         );
+    }
+
+    #[test]
+    fn a_batch_that_fits_is_one_url() {
+        assert!(info_urls(&[]).is_empty());
+        assert_eq!(
+            info_urls(&["mdcat".into()]),
+            ["https://aur.archlinux.org/rpc/v5/info?arg[]=mdcat"]
+        );
+        assert_eq!(
+            info_urls(&["mdcat".into(), "a b".into()]),
+            ["https://aur.archlinux.org/rpc/v5/info?arg[]=mdcat&arg[]=a%20b"]
+        );
+    }
+
+    #[test]
+    fn a_batch_too_long_for_one_url_is_split_and_complete() {
+        let packages: Vec<String> = (0..500).map(|i| format!("package-name-{i}")).collect();
+        let urls = info_urls(&packages);
+        assert!(urls.len() > 1, "500 names should not fit one URL");
+        for url in &urls {
+            assert!(url.len() <= MAX_URL, "{} chars", url.len());
+            assert!(url.starts_with("https://aur.archlinux.org/rpc/v5/info?arg[]="));
+        }
+        // Every name, once, in order: a split that drops or duplicates a
+        // package reads as "not on the AUR" downstream, or asks twice.
+        let carried: Vec<&str> = urls
+            .iter()
+            .flat_map(|u| u.split("arg[]=").skip(1))
+            .map(|arg| arg.trim_end_matches('&'))
+            .collect();
+        assert_eq!(carried, packages);
     }
 }

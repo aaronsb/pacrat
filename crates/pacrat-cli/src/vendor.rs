@@ -30,8 +30,7 @@ use pacrat_core::sources::{Role, SourceEntry, Sources};
 
 use crate::ctx::Ctx;
 use crate::fstree;
-use crate::out::{list_preview, visible};
-use crate::HELD;
+use crate::out::{list_preview, short_hash, visible};
 
 /// The ledger `Role` as a CLI flag; core owns the model, clap owns the words.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -188,7 +187,7 @@ pub fn run(
         Ok(Outcome::Declined) => {
             let _ = fs::remove_dir_all(&plan.clone);
             println!("not vendored");
-            std::process::exit(HELD);
+            std::process::exit(crate::HELD);
         }
         Err(e) if plan.clone.exists() => Err(format!(
             "{e}\n       clone kept at {}",
@@ -245,7 +244,7 @@ fn execute(ctx: &Ctx, plan: &Plan) -> Result<Outcome, String> {
 
     render_review(&plan.clone, &files)?;
 
-    if !plan.yes && !confirm(plan.package, short(&commit))? {
+    if !plan.yes && !confirm(plan.package, short_hash(&commit))? {
         return Ok(Outcome::Declined);
     }
 
@@ -391,7 +390,7 @@ fn commit_to_store(ctx: &Ctx, plan: &Plan, files: &[String], commit: &str) -> Re
         "ledger    {} · {} @ {} ({})",
         store_rel(&ctx.store, &ctx.sources_path()),
         plan.package,
-        short(commit),
+        short_hash(commit),
         plan.role.name()
     );
     println!();
@@ -443,10 +442,6 @@ fn git<const N: usize>(argv: [&OsStr; N]) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn short(commit: &str) -> &str {
-    &commit[..commit.len().min(8)]
 }
 
 /// A store path as the user thinks of it: relative to the store root.
@@ -548,12 +543,5 @@ mod tests {
             source_lines("source_x86_64=('u')\n"),
             vec!["source_x86_64=('u')"]
         );
-    }
-
-    #[test]
-    fn short_is_safe_on_odd_lengths() {
-        assert_eq!(short("abc"), "abc");
-        assert_eq!(short("0123456789abcdef"), "01234567");
-        assert_eq!(short(""), "");
     }
 }

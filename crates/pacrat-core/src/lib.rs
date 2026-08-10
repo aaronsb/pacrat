@@ -7,6 +7,7 @@ pub mod grading;
 pub mod hash;
 pub mod pkg;
 pub mod sources;
+pub mod version;
 
 /// Where a package sits on the custody ladder (mockup §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

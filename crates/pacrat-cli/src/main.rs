@@ -12,16 +12,12 @@ mod info;
 mod live;
 mod out;
 mod pacman;
+mod proc;
 mod search;
 mod setup;
 mod status;
+mod updates;
 mod vendor;
-
-/// Exit code for "ran fine, deliberately did not act". ADR-001 gives 10 this
-/// meaning for the headless update loop (0 clean, 10 holds present, 1
-/// failure), and every verb that can decline shares it so that
-/// `pacrat grade x && pacrat build x` cannot read a hold as a go.
-pub const HELD: i32 = 10;
 
 /// pacrat — store-backed package curation for Arch.
 ///
@@ -70,7 +66,15 @@ enum Command {
     /// One-shot update loop: detect → grade → decide → build
     Update,
     /// List pending updates with grades
-    Updates,
+    ///
+    /// Exits 0 when nothing is pending, 10 when there are updates to look at,
+    /// and 1 when the check itself could not run — so a timer can tell
+    /// "all quiet" from "I could not ask" (ADR-001).
+    Updates {
+        /// Output format
+        #[arg(long, value_enum, default_value_t = updates::Format::Text)]
+        format: updates::Format,
+    },
     /// Review one pending update (diff since reviewed commit + gradings)
     Review { package: String },
     /// Record a grading (runs configured graders; --grade N for manual)
@@ -109,6 +113,12 @@ enum Command {
     About,
 }
 
+/// Exit code for "ran fine, deliberately did not act". ADR-001 gives 10 that
+/// meaning across the update loop — 0 clean, 10 held, 1 failure — and every
+/// verb that can decline shares it: a refused review and a pending update are
+/// the same kind of answer to a script or a timer.
+pub const HELD: i32 = 10;
+
 fn main() {
     let cli = Cli::parse();
     let result = ctx::Ctx::resolve().and_then(|ctx| match cli.command {
@@ -122,6 +132,7 @@ fn main() {
             ref host,
         }) => add::run(&ctx, packages, host.as_deref()),
         Some(Command::Setup { apply }) => setup::run(&ctx, apply),
+        Some(Command::Updates { format }) => updates::run(&ctx, format),
         Some(Command::Vendor {
             ref package,
             ref upstream,
