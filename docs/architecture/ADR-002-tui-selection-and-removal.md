@@ -162,3 +162,19 @@ What this deletes from the design above:
   "tracked here, not installed here" — so the screen's job is to say what
   the drift means on the detail pane of such a row: removed by hand?
   untrack accepts that; `pacrat sync` reinstalls it.
+
+### Selection serves both directions
+
+Ratified in the same conversation: the `+` cell — installed here, in
+nobody's manifest — is the *tracking* surface, the mirror image of `✗`,
+with its own two resolving acts: `add` accepts the package into the
+manifest, or the operator uninstalls it and `sync --prune`'s plan was
+already saying so. One selection, two reconciling actions.
+
+Consequently the hosts screen's `A` stops merely suggesting `pacrat add …`
+and becomes a real apply, symmetric with untrack in every particular: the
+naming confirm over the accumulated selection, the write through `add`'s
+own writer, the selection cleared, the matrix reloaded so the columns show
+the new manifest. Both actions are manifest-only edits — the only kind of
+write pacrat makes — and both leave the machine's package state to the
+operator and pacman.
