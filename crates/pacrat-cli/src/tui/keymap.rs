@@ -62,10 +62,23 @@ pub enum Local {
     Reject,
     /// updates `o` — reveal the override childlock for a held candidate.
     Override,
-    /// hosts `space` — add or remove the row from the selection.
+    /// hosts `space` — mark the cursor row, or unmark it.
     Select,
-    /// hosts `A` · `s` — adopt the selection · plan this host.
+    /// hosts `*` · `-` · `!` — the whole-screen selection ops: mark all,
+    /// mark none, invert the marks. ADR-002's candidate keys, adopted as-is:
+    /// nothing global answers any of the three, and the decision there is
+    /// that a future selecting screen claims the same trio — one selection
+    /// language, spoken per screen.
+    SelectAll,
+    SelectNone,
+    SelectInvert,
+    /// hosts `A` · `x` — the two manifest applies over the marks (ADR-002
+    /// amendment): add accepts installed-but-untracked reality, untrack
+    /// accepts a removal that already happened. Both ask first, naming
+    /// every package.
     AdoptSelection,
+    UntrackSelection,
+    /// hosts `s` — plan this host.
     Sync,
     /// jobs `p` — probe the AUR write path.
     Probe,
@@ -173,19 +186,36 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "space",
-        what: "select a row",
+        what: "mark a row",
         scope: Scope::On(Tab::Hosts),
         of: |key| bare(key, ' ').then_some(Action::Local(Local::Select)),
     },
     Binding {
-        keys: "A / s",
-        what: "adopt the selection · sync this host — the command to run",
+        keys: "* / - / !",
+        what: "mark all · none · invert the marks",
+        scope: Scope::On(Tab::Hosts),
+        of: |key| match key.code {
+            _ if bare(key, '*') => Some(Action::Local(Local::SelectAll)),
+            _ if bare(key, '-') => Some(Action::Local(Local::SelectNone)),
+            _ if bare(key, '!') => Some(Action::Local(Local::SelectInvert)),
+            _ => None,
+        },
+    },
+    Binding {
+        keys: "A / x",
+        what: "add · untrack the marks in this host's manifest — asks first",
         scope: Scope::On(Tab::Hosts),
         of: |key| match key.code {
             _ if bare(key, 'A') => Some(Action::Local(Local::AdoptSelection)),
-            _ if bare(key, 's') => Some(Action::Local(Local::Sync)),
+            _ if bare(key, 'x') => Some(Action::Local(Local::UntrackSelection)),
             _ => None,
         },
+    },
+    Binding {
+        keys: "s",
+        what: "sync this host — the command to run",
+        scope: Scope::On(Tab::Hosts),
+        of: |key| bare(key, 's').then_some(Action::Local(Local::Sync)),
     },
     Binding {
         keys: "p",
@@ -565,6 +595,63 @@ mod tests {
             Some(Action::Local(Local::Select))
         );
         assert_eq!(on(Tab::Updates, KeyCode::Char(' ')), None);
+
+        // The selection trio belongs to the screen that selects, and to no
+        // other — ADR-002's rule is that the keys are the *same* wherever
+        // selection exists, so a second selecting screen extends this test
+        // rather than choosing new letters.
+        for (key, action) in [
+            ('*', Local::SelectAll),
+            ('-', Local::SelectNone),
+            ('!', Local::SelectInvert),
+        ] {
+            assert_eq!(
+                on(Tab::Hosts, KeyCode::Char(key)),
+                Some(Action::Local(action))
+            );
+            for tab in Tab::ALL {
+                if tab != Tab::Hosts {
+                    assert_eq!(
+                        on(tab, KeyCode::Char(key)),
+                        None,
+                        "{key} leaked onto {}",
+                        tab.title()
+                    );
+                }
+            }
+        }
+        // `*` and `!` arrive shifted on most keyboards, and shift is not a
+        // modifier here — it is how those characters are typed.
+        assert_eq!(
+            action_for(
+                KeyEvent::new(KeyCode::Char('*'), KeyModifiers::SHIFT),
+                Tab::Hosts
+            ),
+            Some(Action::Local(Local::SelectAll))
+        );
+
+        // `x` means two different things on two screens — reject a
+        // candidate on updates, untrack the marks on hosts — and nothing
+        // anywhere else. The scope is what keeps one letter two verbs.
+        assert_eq!(
+            on(Tab::Hosts, KeyCode::Char('x')),
+            Some(Action::Local(Local::UntrackSelection))
+        );
+        assert_eq!(
+            on(Tab::Updates, KeyCode::Char('x')),
+            Some(Action::Local(Local::Reject))
+        );
+        assert_eq!(press(KeyCode::Char('x')), None);
+        // And the applies sit beside the plain suggestion: `A` applies,
+        // `s` still only shows commands.
+        assert_eq!(
+            on(Tab::Hosts, KeyCode::Char('A')),
+            Some(Action::Local(Local::AdoptSelection))
+        );
+        assert_eq!(
+            on(Tab::Hosts, KeyCode::Char('s')),
+            Some(Action::Local(Local::Sync))
+        );
 
         // `enter` means two different things on two screens, which is the
         // case the scope exists for.

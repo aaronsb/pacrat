@@ -59,7 +59,7 @@ use prompt::{Prompt, Typed};
 use screens::about::About;
 use screens::browse::{Browse, Rung};
 use screens::config::Config;
-use screens::hosts::Hosts;
+use screens::hosts::{Hosts, Reconcile};
 use screens::jobs::Jobs;
 use screens::overview::Overview;
 use screens::updates::Updates;
@@ -70,6 +70,7 @@ mod joblog;
 mod keymap;
 mod prompt;
 mod screens;
+mod select;
 mod theme;
 mod viewport;
 
@@ -453,6 +454,13 @@ enum Work {
     /// The override, once the friction has been paid: a write to the
     /// store's decision ledger, through the CLI's own writer.
     Override(String),
+    /// hosts `A`/`x`, once the confirm is answered: a manifest edit over
+    /// the named packages, through the CLI verbs' own writers.
+    ///
+    /// The names are snapshotted here rather than read back from the
+    /// selection at apply time: the confirm named exactly these packages,
+    /// and what was confirmed is what must be applied.
+    Reconcile(Reconcile, Vec<String>),
 }
 
 /// What is in front of the screen, if anything.
@@ -467,6 +475,21 @@ enum Overlay {
     Asking(Prompt, Asking),
     /// The hold-to-confirm bar. See [`childlock`].
     Childlock(Hold),
+    /// The apply step's question: a yes/no over a named set.
+    Confirm(Confirm),
+}
+
+/// A manifest apply waiting for its answer.
+///
+/// Its own overlay rather than a [`Prompt`], because the two collect
+/// different things: a prompt collects text, this collects a decision.
+/// It names every package the screen has room for and owns up to the
+/// rest ("… and N more") — ADR-002's guard for an *accumulated*
+/// selection is a confirm the reader can check against what they think
+/// they marked, and a silent clip is exactly the check removed.
+struct Confirm {
+    direction: Reconcile,
+    names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +606,7 @@ impl App {
                 Ok("detail".to_string())
             }
             Work::Override(reason) => self.updates.record_override(ctx, &reason),
+            Work::Reconcile(direction, names) => self.hosts.apply(ctx, direction, &names),
         };
         self.log.finish(handle, outcome);
     }
@@ -592,6 +616,7 @@ impl App {
             Overlay::Help => return self.on_help_key(key),
             Overlay::Asking(..) => return self.on_prompt_key(key),
             Overlay::Childlock(_) => return self.on_childlock_key(key, flooded),
+            Overlay::Confirm(_) => return self.on_confirm_key(key),
             Overlay::None => {}
         }
         match action_for(key, self.tab) {
@@ -657,7 +682,11 @@ impl App {
             Local::Reject => self.updates.suggest_reject(),
             Local::Override => self.open_childlock(),
             Local::Select => self.hosts.toggle(),
-            Local::AdoptSelection => self.hosts.suggest_adopt(),
+            Local::SelectAll => self.hosts.select_all(),
+            Local::SelectNone => self.hosts.select_none(),
+            Local::SelectInvert => self.hosts.select_invert(),
+            Local::AdoptSelection => self.open_apply(Reconcile::Add),
+            Local::UntrackSelection => self.open_apply(Reconcile::Untrack),
             Local::Sync => self.hosts.suggest_sync(),
             Local::Probe => self.jobs.suggest_probe(),
             Local::Retry => self.jobs.suggest_retry(),
@@ -728,6 +757,51 @@ impl App {
                     Asking::Justification => self.queue(Work::Override(value), "override"),
                 }
             }
+        }
+    }
+
+    /// `A` or `x` on hosts: open the naming confirm, or say why there is
+    /// nothing to apply.
+    ///
+    /// The screen decides what the apply would touch — the marks, or the
+    /// cursor row when nothing is marked — and refuses in the detail pane
+    /// with the data it already holds, before anyone is asked to confirm
+    /// an apply the writer would refuse anyway.
+    fn open_apply(&mut self, direction: Reconcile) {
+        match self.hosts.apply_candidates(direction) {
+            Err(why) => self.hosts.refuse_apply(&why),
+            Ok(names) => self.overlay = Overlay::Confirm(Confirm { direction, names }),
+        }
+    }
+
+    fn on_confirm_key(&mut self, key: KeyEvent) {
+        // ctrl-c first and unconditionally, the modal rule every overlay
+        // follows: a question must never be the only way out.
+        if action_for(key, self.tab) == Some(Action::Interrupt) {
+            self.quit = true;
+            return;
+        }
+        let Overlay::Confirm(confirm) = &self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let (direction, names) = (confirm.direction, confirm.names.clone());
+                self.overlay = Overlay::None;
+                let what = format!(
+                    "{} {} package{}",
+                    direction.verb(),
+                    names.len(),
+                    if names.len() == 1 { "" } else { "s" }
+                );
+                self.queue(Work::Reconcile(direction, names), &what);
+            }
+            // `q` closes the question, not the program — the same reading
+            // `Quit` has everywhere: back out of what is in front first.
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+            }
+            _ => {}
         }
     }
 
@@ -814,6 +888,7 @@ impl App {
             Overlay::Help => render_help(frame, area, self.tab),
             Overlay::Asking(prompt, _) => render_prompt(frame, area, prompt),
             Overlay::Childlock(hold) => render_childlock(frame, area, hold),
+            Overlay::Confirm(confirm) => render_confirm(frame, area, confirm),
         }
     }
 
@@ -997,6 +1072,103 @@ fn render_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt) {
     );
 }
 
+/// The naming confirm: what a manifest apply is about to edit, every name
+/// of it (ADR-002 amendment).
+///
+/// The guard the amendment keeps for a selection that was *accumulated*
+/// rather than typed: before anything is written, the reader sees the
+/// count, the list as far as the screen holds it, and a last line owning
+/// up to whatever did not fit. Both applies are manifest-only edits — the
+/// sentence under the question says what is and is not about to happen to
+/// the machine.
+fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
+    let n = confirm.names.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let (question, aside) = match confirm.direction {
+        Reconcile::Add => (
+            format!("Add {n} package{plural} to this host's tracked lists?"),
+            "a manifest edit in the store — the packages are already installed \
+             here, and committing the store is what shares it with the fleet",
+        ),
+        Reconcile::Untrack => (
+            format!("Untrack {n} package{plural} from this host's tracked lists?"),
+            "a manifest edit only — nothing is uninstalled, and anything still \
+             installed here appears in `pacrat sync --prune`'s plan",
+        ),
+    };
+    let mut lines = vec![
+        Line::default(),
+        Line::from(vec![theme::plain("  "), theme::plain(question)]),
+    ];
+    lines.extend(
+        screens::wrap(aside, 72)
+            .into_iter()
+            .map(|chunk| Line::from(vec![theme::plain("  "), theme::dim(chunk)])),
+    );
+    lines.push(Line::default());
+    // Every name, neutered on the way to the screen: these came out of
+    // tracked lists and pacman queries, not out of pacrat.
+    //
+    // The overlay is clamped to the frame, so past a screenful the list
+    // would clip silently — and a silent clip is exactly the check this
+    // overlay exists to be. The last line owns up instead: the reader sees
+    // how many names they are answering for without reading them.
+    let chrome = lines.len() + 4;
+    let budget = (area.height as usize).saturating_sub(chrome).max(3);
+    let (shown, hidden) = name_lines(&confirm.names, 70, budget);
+    lines.extend(
+        shown
+            .into_iter()
+            .map(|chunk| Line::from(vec![theme::plain("  "), theme::tinted(theme::INFO, chunk)])),
+    );
+    if hidden > 0 {
+        lines.push(Line::from(vec![
+            theme::plain("  "),
+            theme::dim(format!(
+                "… and {hidden} more — the count above is the whole selection"
+            )),
+        ]));
+    }
+    lines.push(Line::default());
+
+    let rect = centred(area, 76, lines.len() as u16 + 2);
+    overlay(
+        frame,
+        rect,
+        Line::from(vec![
+            theme::dim("─ "),
+            theme::accent(format!("{} the marks", confirm.direction.verb())),
+            theme::dim(" "),
+        ]),
+        Line::from(vec![theme::dim("─ enter or y applies · esc cancels ")]),
+        lines,
+    );
+}
+
+/// The marked names as comma-joined lines: at most `budget` lines of at
+/// most `width` characters, each name neutered, and the count of names
+/// that did not fit. Pure, so the no-silent-clip rule is a test rather
+/// than a screenshot.
+fn name_lines(names: &[String], width: usize, budget: usize) -> (Vec<String>, usize) {
+    let mut lines: Vec<String> = Vec::new();
+    for (shown, name) in names.iter().enumerate() {
+        let safe = out::visible_line(name).0;
+        match lines.last_mut() {
+            Some(last) if last.chars().count() + 2 + safe.chars().count() <= width => {
+                last.push_str(", ");
+                last.push_str(&safe);
+            }
+            _ => {
+                if lines.len() == budget {
+                    return (lines, names.len() - shown);
+                }
+                lines.push(safe);
+            }
+        }
+    }
+    (lines, 0)
+}
+
 /// The hold-to-confirm bar (ADR-001 decision 2).
 ///
 /// The bar is the whole affordance: there is no key that overrides a BLOCK,
@@ -1059,6 +1231,38 @@ fn render_childlock(frame: &mut Frame, area: Rect, hold: &Hold) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_list_that_fits_shows_every_name_and_hides_none() {
+        let (lines, hidden) = name_lines(&names(&["fd", "ripgrep", "bat"]), 70, 5);
+        assert_eq!(lines, ["fd, ripgrep, bat"]);
+        assert_eq!(hidden, 0);
+    }
+
+    /// The no-silent-clip rule: past the budget, the hidden count is the
+    /// names not shown — every marked package is either on screen or in
+    /// that number.
+    #[test]
+    fn an_overflowing_list_owns_up_to_exactly_what_it_hid() {
+        let many: Vec<String> = (0..40).map(|i| format!("package-{i:02}")).collect();
+        let (lines, hidden) = name_lines(&many, 24, 3);
+        assert_eq!(lines.len(), 3);
+        let shown: usize = lines.iter().map(|l| l.matches("package-").count()).sum();
+        assert_eq!(shown + hidden, many.len());
+        assert!(hidden > 0);
+        assert!(lines.iter().all(|l| l.chars().count() <= 24));
+    }
+
+    #[test]
+    fn a_hostile_name_is_neutered_before_the_overlay_draws_it() {
+        let (lines, _) = name_lines(&names(&["fd\x1b[31mred"]), 70, 5);
+        assert!(!lines[0].contains('\x1b'), "{:?}", lines[0]);
+        assert!(lines[0].contains('␛'));
+    }
 
     /// The number keys, the tab titles and the screen list are three views
     /// of one set; a tab that lost its digit would be unreachable.

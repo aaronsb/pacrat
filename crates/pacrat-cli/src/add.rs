@@ -1,19 +1,67 @@
 //! `pacrat add` — adopt installed packages into the manifest: the
 //! unmanaged → tracked rung of the custody ladder. Writes the host's
 //! tracked list in the store; committing the store is the user's act.
+//!
+//! [`adopt`] is the whole edit and [`run`] is only its mouth: the TUI's
+//! bulk-adopt apply calls `adopt` unchanged (the `record_override`
+//! precedent — one writer, two surfaces), and both directions of the
+//! ladder go through [`crate::ctx::Ctx::save_tracked`], so `add` and
+//! `untrack` cannot disagree about the file.
 
-use std::fs;
+use std::path::PathBuf;
 
-use pacrat_core::pkg::Source;
+use pacrat_core::pkg::{valid_name, Source};
 
 use crate::ctx::Ctx;
 use crate::live;
+use crate::out::visible_line;
+
+/// One tracked list edited: which source, which names, and the counts a
+/// reader checks the edit by. Shared with `untrack`, whose changes are the
+/// same shape in the other direction.
+#[derive(Debug)]
+pub struct Change {
+    pub source: Source,
+    /// The names this edit added or removed, in list order.
+    pub packages: Vec<String>,
+    pub before: usize,
+    pub after: usize,
+    /// The list file that was written.
+    pub path: PathBuf,
+}
 
 pub fn run(ctx: &Ctx, packages: &[String], host: Option<&str>) -> Result<(), String> {
     let host = host.unwrap_or(&ctx.host);
+    let changes = adopt(ctx, host, packages)?;
+    if changes.is_empty() {
+        println!("already tracked on {host} — the manifest is unchanged");
+        return Ok(());
+    }
+    for c in &changes {
+        println!(
+            "{}: tracked {} on {host} ({} → {} packages) — {}",
+            c.source.name(),
+            c.packages.join(", "),
+            c.before,
+            c.after,
+            c.path.strip_prefix(&ctx.store).unwrap_or(&c.path).display()
+        );
+    }
+    println!("note: commit the store to sync this to other hosts");
+    Ok(())
+}
+
+/// Adopt `packages` into `host`'s tracked lists, and say what changed.
+///
+/// Names already tracked are not an error and not a change — adopting is
+/// idempotent, and an empty answer means the manifest already said all of
+/// this. A name that is not installed here at all *is* an error, because
+/// adopt records reality rather than intent.
+pub fn adopt(ctx: &Ctx, host: &str, packages: &[String]) -> Result<Vec<Change>, String> {
     if packages.is_empty() {
         return Err("nothing to add".into());
     }
+    check_names(packages)?;
 
     // Where is each package actually installed? Source is detected, not
     // guessed: a package must be present in exactly one live set.
@@ -47,6 +95,7 @@ pub fn run(ctx: &Ctx, packages: &[String], host: Option<&str>) -> Result<(), Str
         }
     }
 
+    let mut changes = Vec::new();
     for source in Source::ALL {
         let adds: Vec<&str> = planned
             .iter()
@@ -58,29 +107,59 @@ pub fn run(ctx: &Ctx, packages: &[String], host: Option<&str>) -> Result<(), Str
         }
         let mut list = ctx.tracked(host, source)?;
         let before = list.len();
+        let mut recorded: Vec<String> = Vec::new();
         for pkg in &adds {
             if !list.iter().any(|t| t == pkg) {
                 list.push(pkg.to_string());
+                recorded.push(pkg.to_string());
             }
         }
         if list.len() == before {
-            println!("{}: already tracked on {host}", source.name());
             continue;
         }
-        list.sort();
-        let dir = ctx.packages_dir().join(host);
-        fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let path = dir.join(format!("{}.txt", source.name()));
-        fs::write(&path, list.join("\n") + "\n").map_err(|e| format!("{}: {e}", path.display()))?;
-        println!(
-            "{}: tracked {} on {host} ({} → {} packages) — {}",
-            source.name(),
-            adds.join(", "),
+        let path = ctx.save_tracked(host, source, &list)?;
+        changes.push(Change {
+            source,
+            packages: recorded,
             before,
-            list.len(),
-            path.strip_prefix(&ctx.store).unwrap_or(&path).display()
-        );
+            after: list.len(),
+            path,
+        });
     }
-    println!("note: commit the store to sync this to other hosts");
+    Ok(changes)
+}
+
+/// The grammar, checked at the door: these names are compared against
+/// lists and printed back in refusals, and the report of a hostile name
+/// must not itself be hostile. Shared with `untrack` — the two directions
+/// of the ladder guard the same door.
+pub fn check_names(packages: &[String]) -> Result<(), String> {
+    if let Some(bad) = packages.iter().find(|p| !valid_name(p)) {
+        let (shown, _) = visible_line(bad);
+        return Err(format!(
+            "{shown:?} is not a package name — expected letters, digits and \
+             @._+- (no leading hyphen or dot)"
+        ));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hostile_name_is_refused_and_neutered_on_the_way_out() {
+        let err = check_names(&["fd\x1b[31mred".to_string()]).unwrap_err();
+        assert!(err.contains("is not a package name"), "{err}");
+        assert!(!err.contains('\x1b'), "raw escape survived: {err:?}");
+        assert!(err.contains('␛'), "{err}");
+    }
+
+    #[test]
+    fn ordinary_names_pass_the_door() {
+        let names = ["fd", "ripgrep", "lib32-glibc", "python-pip"];
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        assert_eq!(check_names(&names), Ok(()));
+    }
 }

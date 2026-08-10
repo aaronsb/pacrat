@@ -171,6 +171,49 @@ impl Ctx {
         hosts
     }
 
+    /// Write one host's tracked list for one source, and return the path.
+    ///
+    /// The one writer, shared by both directions of the ladder: `add` and
+    /// `untrack` are exact inverses (ADR-002 amendment), and that is only
+    /// true if they cannot disagree about the file. This function alone
+    /// decides its shape — sorted, deduplicated, one name per line, a
+    /// trailing newline, and an emptied list is an empty file rather than a
+    /// lone blank line.
+    ///
+    /// Names pass the same grammar [`Ctx::tracked`] guards on the way out,
+    /// for the same reason: a writer that accepted a name the reader will
+    /// refuse would wedge the whole list behind one bad entry. And the
+    /// write is atomic, `save_sources`' rule — a crash mid-write must not
+    /// leave a host's manifest half there.
+    pub fn save_tracked(
+        &self,
+        host: &str,
+        source: Source,
+        list: &[String],
+    ) -> Result<PathBuf, String> {
+        if let Some(bad) = list.iter().find(|name| !valid_name(name)) {
+            let (shown, _) = visible_line(bad);
+            return Err(format!(
+                "{shown:?} is not a package name — refusing to write it into \
+                 {host}'s {} list",
+                source.name()
+            ));
+        }
+        let mut sorted: Vec<&str> = list.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let body = match sorted.is_empty() {
+            true => String::new(),
+            false => sorted.join("\n") + "\n",
+        };
+        let path = self
+            .packages_dir()
+            .join(host)
+            .join(format!("{}.txt", source.name()));
+        self.write_atomic(&path, &body)?;
+        Ok(path)
+    }
+
     /// A host's tracked list for one source; a missing file is an empty list.
     ///
     /// Every name is checked against the package grammar here, at the door,
@@ -312,6 +355,60 @@ mod tests {
     fn one_bad_name_takes_the_whole_list_down() {
         let (ctx, _) = store_with("partial", Source::Native, "fd\n../escape\nripgrep\n");
         assert!(ctx.tracked("north", Source::Native).is_err());
+        let _ = fs::remove_dir_all(&ctx.store);
+    }
+
+    /// The writer and the reader are two halves of one contract: what
+    /// `save_tracked` writes, `tracked` reads back — normalized, so the
+    /// round trip is also the proof the shape agrees.
+    #[test]
+    fn save_tracked_writes_what_tracked_reads_back() {
+        let (ctx, path) = store_with("writer", Source::Native, "fd\n");
+        let written = ctx
+            .save_tracked(
+                "north",
+                Source::Native,
+                &["zoxide".into(), "fd".into(), "zoxide".into()],
+            )
+            .unwrap();
+        assert_eq!(written, path);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "fd\nzoxide\n",
+            "sorted, deduplicated, one name per line"
+        );
+        assert_eq!(
+            ctx.tracked("north", Source::Native).unwrap(),
+            vec!["fd".to_string(), "zoxide".to_string()]
+        );
+
+        // An emptied list is an empty file, which reads as an empty list —
+        // not a lone blank line, and not a missing file.
+        ctx.save_tracked("north", Source::Native, &[]).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        assert!(ctx.tracked("north", Source::Native).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&ctx.store);
+    }
+
+    /// The writer guards the same door the reader does: a name the reader
+    /// would refuse never reaches the file, and the refusal cannot itself
+    /// carry the escape it is refusing.
+    #[test]
+    fn save_tracked_refuses_a_name_the_reader_would_refuse() {
+        let (ctx, path) = store_with("writer-bad", Source::Aur, "fd\n");
+        let err = ctx
+            .save_tracked("north", Source::Aur, &["fd\u{1b}[8m".into()])
+            .unwrap_err();
+        assert!(
+            !err.contains('\u{1b}'),
+            "the report re-emitted ESC: {err:?}"
+        );
+        assert!(err.contains("not a package name"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "fd\n",
+            "a refused write still touched the file"
+        );
         let _ = fs::remove_dir_all(&ctx.store);
     }
 

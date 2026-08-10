@@ -52,7 +52,7 @@ use crate::tui::theme;
 use crate::tui::viewport::{Panes, Region};
 use crate::{aur, decisions, grade, pacman, review, updates};
 
-use super::{bad, command, field, note, refreshing, verdict_span};
+use super::{bad, command, field, note, refreshing, verdict_span, wrap};
 
 const PENDING: usize = 0;
 const UPSTREAM: usize = 1;
@@ -965,30 +965,6 @@ fn drift_cell(reviewed: &str, candidate: &str) -> String {
     format!("{shown} → {candidate}")
 }
 
-/// Break a sentence into lines that fit, on spaces.
-///
-/// The regions do not wrap, on purpose — the viewport counts content lines
-/// and a wrapped line is a different number of rows than the line it came
-/// from — so prose that has to fit is folded here, where the width is known
-/// and the count stays right.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
-            lines.push(std::mem::take(&mut current));
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
 fn mark(level: u8) -> &'static str {
     match level {
         0 => "✓",
@@ -1101,22 +1077,6 @@ mod tests {
                 })
             })
             .collect()
-    }
-
-    /// Prose that has to fit is folded here, because the regions deliberately
-    /// do not wrap — the viewport counts content lines, and a wrapped line is
-    /// a different number of rows than the line it came from.
-    #[test]
-    fn wrapping_folds_on_spaces_and_never_loses_a_word() {
-        let text = "a human already refused this candidate and said why";
-        let folded = wrap(text, 20);
-        assert!(folded.iter().all(|line| line.chars().count() <= 20));
-        assert_eq!(folded.join(" "), text);
-        assert!(wrap("", 20).is_empty());
-        // A word longer than the width goes on a line of its own rather than
-        // being cut in half or looping forever.
-        let long = wrap("short aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa short", 10);
-        assert_eq!(long, ["short", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "short"]);
     }
 
     /// Everything that can go in the verdict cell fits the width reserved

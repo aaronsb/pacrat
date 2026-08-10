@@ -21,6 +21,18 @@ pub const WARN: Color = Color::Yellow;
 pub const BAD: Color = Color::Red;
 /// Values worth the eye landing on: hosts, package names, paths.
 pub const INFO: Color = Color::Blue;
+/// The selection tint: painted behind a marked row (ADR-002).
+///
+/// An indexed cube colour, and the exception to the named-colour rule above
+/// is argued rather than slipped in. The named palette is sixteen *inks*,
+/// each chosen by the user to sit legibly on their background — nothing in
+/// it is promised to work as a background itself, under both a light
+/// theme's near-black ink and a dark theme's near-white one. Cube colour 60
+/// (a muted slate, #5f5f87) is mid-luminance by construction, so either ink
+/// stays readable on it. On a terminal without 256-colour support the tint
+/// simply does not paint, which is why a marked row also keeps its marker
+/// glyph — the same rule the verdict marks follow.
+pub const SELECT: Color = Color::Indexed(60);
 
 pub fn plain(s: impl Into<String>) -> Span<'static> {
     Span::raw(s.into())
