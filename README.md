@@ -7,6 +7,12 @@ control, so plain `yay` just works and can't bypass curation.
 
 The rat curates the pantry; the little chef does the tasting.
 
+![pacrat: status, vendor, grade, build, then the update loop closing itself](docs/demo/pacrat.gif)
+
+The whole loop in about a minute — a real `makepkg`, a real pacman repo, and a
+grader that gets a vote. `make demo` re-records it; everything in it happens in
+a throwaway store under `/tmp` and never touches yours.
+
 - **Design:** `docs/architecture/ADR-001-store-backed-package-curation.md`
 - **Grading contract:** `docs/grading-contract.md` — the `pacrat-grade/v1`
   spec, for anyone writing a grader
@@ -107,6 +113,7 @@ pacrat's side is tested against a generic fake grader in
     contrib/graders      adapters from other tools to pacrat-grade/v1
     docs/architecture    ADRs
     docs/design          mockups
+    docs/demo            the recording above, and the script that makes it
     art                  petit chef
 
 Nested in the dotfiles store like dotfiles-tui: its own repo, gitignored by
