@@ -9,6 +9,7 @@ mod ctx;
 mod custody;
 mod decisions;
 mod fstree;
+mod gate;
 mod git;
 mod grade;
 mod hosts;
@@ -292,28 +293,45 @@ fn main() {
 }
 
 fn dispatch(command: Option<Command>) -> Result<(), String> {
-    ctx::Ctx::resolve().and_then(|ctx| match command {
+    let ctx = ctx::Ctx::resolve()?;
+    // The setup gate (ADR-003). `setup` is the only verb that can open it,
+    // and `about` was dispatched before the store was even looked for; every
+    // other verb — bare `pacrat` and the TUI included — waits until this
+    // host is actually on the serving model.
+    if !matches!(command, Some(Command::Setup { .. }) | Some(Command::About)) {
+        let env = std::env::var("PACRAT_SETUP_GATE").ok();
+        match gate::decide(&setup::state(&ctx.config.repo), env.as_deref()) {
+            gate::Gate::Open => {}
+            gate::Gate::Bypassed { announce } => gate::announce(&announce),
+            gate::Gate::Refused { line } => return Err(line),
+        }
+    }
+    run(&ctx, command)
+}
+
+fn run(ctx: &ctx::Ctx, command: Option<Command>) -> Result<(), String> {
+    match command {
         // Bare `pacrat` is the only command that asks the config what to be.
-        None => tui::run_default(&ctx),
-        Some(Command::Tui) => tui::run(&ctx),
-        Some(Command::Status) => status::run(&ctx),
-        Some(Command::Hosts) => hosts::run(&ctx),
-        Some(Command::Search { ref term }) => search::run(&ctx, term),
-        Some(Command::Info { ref package }) => info::run(&ctx, package),
+        None => tui::run_default(ctx),
+        Some(Command::Tui) => tui::run(ctx),
+        Some(Command::Status) => status::run(ctx),
+        Some(Command::Hosts) => hosts::run(ctx),
+        Some(Command::Search { ref term }) => search::run(ctx, term),
+        Some(Command::Info { ref package }) => info::run(ctx, package),
         Some(Command::Add {
             ref packages,
             ref host,
-        }) => add::run(&ctx, packages, host.as_deref()),
-        Some(Command::Untrack { ref packages }) => untrack::run(&ctx, packages),
-        Some(Command::Setup { apply }) => setup::run(&ctx, apply),
-        Some(Command::Updates { format }) => updates::run(&ctx, format),
+        }) => add::run(ctx, packages, host.as_deref()),
+        Some(Command::Untrack { ref packages }) => untrack::run(ctx, packages),
+        Some(Command::Setup { apply }) => setup::run(ctx, apply),
+        Some(Command::Updates { format }) => updates::run(ctx, format),
         Some(Command::Vendor {
             ref package,
             ref upstream,
             role,
             yes,
             force,
-        }) => vendor::run(&ctx, package, upstream.as_deref(), role, yes, force),
+        }) => vendor::run(ctx, package, upstream.as_deref(), role, yes, force),
         Some(Command::Grade {
             ref package,
             ref commit,
@@ -321,43 +339,36 @@ fn dispatch(command: Option<Command>) -> Result<(), String> {
             ref note,
             refresh,
         }) => grade::run(
-            &ctx,
+            ctx,
             package,
             commit.as_deref(),
             grade,
             note.as_deref(),
             refresh,
         ),
-        Some(Command::Review { ref package }) => review::run(&ctx, package),
+        Some(Command::Review { ref package }) => review::run(ctx, package),
         Some(Command::AdoptUpdate {
             ref package,
             ref commit,
             yes,
             override_block,
             ref reason,
-        }) => adopt_update(
-            &ctx,
-            package,
-            commit.as_deref(),
-            yes,
-            override_block,
-            reason,
-        ),
-        Some(Command::Update { mode, format }) => update::run(&ctx, mode.map(Into::into), format),
-        Some(Command::Decisions) => decisions::run(&ctx),
+        }) => adopt_update(ctx, package, commit.as_deref(), yes, override_block, reason),
+        Some(Command::Update { mode, format }) => update::run(ctx, mode.map(Into::into), format),
+        Some(Command::Decisions) => decisions::run(ctx),
         Some(Command::Reject {
             ref package,
             ref note,
-        }) => review::reject(&ctx, package, note.as_deref()),
-        Some(Command::Build { ref packages }) => build::run(&ctx, packages),
-        Some(Command::Sync { prune, json }) => sync::run(&ctx, prune, json),
+        }) => review::reject(ctx, package, note.as_deref()),
+        Some(Command::Build { ref packages }) => build::run(ctx, packages),
+        Some(Command::Sync { prune, json }) => sync::run(ctx, prune, json),
         Some(Command::Push {
             ref package,
             retry,
             yes,
-        }) => push::run(&ctx, package.as_deref(), retry, yes),
+        }) => push::run(ctx, package.as_deref(), retry, yes),
         // Dispatched in `main` before the store is resolved; this arm only
         // completes the match, and would be correct anyway.
         Some(Command::About) => about::run(),
-    })
+    }
 }

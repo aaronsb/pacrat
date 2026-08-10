@@ -92,6 +92,7 @@ pacrat() {
     DOTFILES_DIR="$SB/store" \
     XDG_CONFIG_HOME="$SB/config" \
     XDG_STATE_HOME="$SB/state" \
+    PACRAT_SETUP_GATE=off \
     "$BIN" "$@"
 }
 
