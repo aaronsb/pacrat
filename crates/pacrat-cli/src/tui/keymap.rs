@@ -10,11 +10,20 @@
 //!
 //! ## Screens claim letters
 //!
-//! The mockup gives each screen its own verbs on bare letters, and they
-//! collide with the global ones by design: `g` is *go to top* everywhere and
-//! *regrade* on updates; `r` is *reload* everywhere and *drop* on hosts.
-//! Twenty-six letters and six screens leaves no way to avoid this that does
-//! not end in chords nobody can remember.
+//! The mockup gives each screen its own verbs on bare letters, and some of
+//! them are letters the global rows already use: `a` on updates is *adopt*
+//! while nothing global answers it, and `x`, `o`, `v`, `t`, `i`, `s`, `p`
+//! and `R` are claimed the same way. Twenty-six letters and six screens
+//! leaves no way to avoid collisions that does not end in chords nobody can
+//! remember, so the mechanism has to exist whether or not today's table
+//! happens to exercise it.
+//!
+//! (The mockup also asks for `g` regrade on updates and `r` drop on hosts,
+//! which *would* shadow the global `g` and `r`. Neither is bound: `pacrat
+//! grade` reads the store tree rather than the candidate on screen, so the
+//! key would grade the wrong bytes, and dropping a rung has no CLI verb yet.
+//! When they land they are one row each, and the scope below is what makes
+//! them possible.)
 //!
 //! So a row carries a [`Scope`], and the screen's rows are consulted before
 //! the global ones. Two consequences worth stating, because they are the
@@ -327,9 +336,22 @@ pub fn global() -> impl Iterator<Item = &'static Binding> {
 /// Shift is not a modifier for this purpose — it is how `G` is typed. The
 /// others change what a key means, so a row that wants a bare letter has to
 /// say it does not want them.
+///
+/// All five of the others, `META` and `HYPER` included. Those two are only
+/// ever reported by terminals speaking the kitty keyboard protocol, which is
+/// exactly why they were missed and exactly why they matter: on such a
+/// terminal `meta-o` arrived with the bare `o` row answering for it, which
+/// on the updates screen is the key that opens the override. A modifier this
+/// code has not heard of should never make a key mean *more* than it does
+/// unmodified.
 fn modified(key: KeyEvent) -> bool {
-    key.modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    key.modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::META
+            | KeyModifiers::HYPER,
+    )
 }
 
 /// An unmodified letter, as the mockup's footers write them.
@@ -448,6 +470,54 @@ mod tests {
         assert_eq!(press(KeyCode::Char('c')), None);
     }
 
+    /// **Every** modifier makes a key not-bare, including the two only a
+    /// kitty-protocol terminal ever reports.
+    ///
+    /// `META` and `HYPER` were missing, and the consequence was not academic:
+    /// on such a terminal `meta-o` matched the bare `o` row, which on the
+    /// updates screen is the key that opens the override. A chord nobody
+    /// bound must never mean *more* than the letter in it.
+    #[test]
+    fn an_unbound_modifier_never_makes_a_key_mean_more() {
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::META,
+            KeyModifiers::HYPER,
+        ] {
+            for (tab, c) in [
+                (Tab::Updates, 'o'),
+                (Tab::Updates, 'a'),
+                (Tab::Updates, 'x'),
+                (Tab::Hosts, 'A'),
+                (Tab::Hosts, 's'),
+                (Tab::Browse, 'v'),
+                (Tab::Jobs, 'p'),
+                (Tab::Overview, 'q'),
+                (Tab::Overview, 'j'),
+                (Tab::Overview, '1'),
+            ] {
+                let chord = action_for(KeyEvent::new(KeyCode::Char(c), modifier), tab);
+                let bare = on(tab, KeyCode::Char(c));
+                assert!(
+                    chord.is_none() || chord != bare,
+                    "{modifier:?}-{c} was handled as a bare {c} on {}",
+                    tab.title()
+                );
+            }
+        }
+        // Shift stays not-a-modifier: it is how `A` and `R` are typed, and
+        // those are the keys the mockup gives their own jobs.
+        assert_eq!(
+            action_for(
+                KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+                Tab::Hosts
+            ),
+            Some(Action::Local(Local::AdoptSelection))
+        );
+    }
+
     /// Chords are not accidental synonyms for the letters in them.
     #[test]
     fn a_modified_question_mark_is_not_the_help_key() {
@@ -510,28 +580,62 @@ mod tests {
 
     /// Everything a screen has not claimed still works there — a screen that
     /// accidentally swallowed `j` or `q` would be a screen nobody can leave.
+    ///
+    /// Every screen, every time. Screen rows are consulted *first* and win,
+    /// so this is not a property of the table that holds once — it is one a
+    /// future screen-local row can break by claiming a letter, and the only
+    /// way to notice is to ask on all six.
     #[test]
     fn the_global_keys_survive_on_every_screen() {
         for tab in Tab::ALL {
+            let where_ = tab.title();
             assert_eq!(
                 on(tab, KeyCode::Char('q')),
                 Some(Action::Quit),
-                "{} swallowed the way out",
-                tab.title()
+                "{where_} swallowed the way out"
+            );
+            // `esc` is the other half of "back, then quit", and it is the
+            // one an overlay is dismissed with — a screen that took it would
+            // trap a reader inside a prompt.
+            assert_eq!(
+                on(tab, KeyCode::Esc),
+                Some(Action::Quit),
+                "{where_} took esc"
             );
             assert_eq!(
                 on(tab, KeyCode::Char('j')),
                 Some(Action::Scroll(Scroll::LineDown)),
-                "{} swallowed j",
-                tab.title()
+                "{where_} swallowed j"
             );
             assert_eq!(
                 on(tab, KeyCode::Char('1')),
                 Some(Action::Screen(Tab::Overview)),
-                "{} swallowed the screen keys",
-                tab.title()
+                "{where_} swallowed the screen keys"
             );
             assert_eq!(on(tab, KeyCode::Char('?')), Some(Action::ToggleHelp));
+        }
+    }
+
+    /// ctrl-c is the reflex, and it must reach [`Action::Interrupt`] from
+    /// every screen.
+    ///
+    /// Its own test because its failure mode is the worst one here. Raw mode
+    /// means this keystroke is not a SIGINT — if a screen-local row ever
+    /// shadowed it, "get me out" would silently do something else, and the
+    /// user's next move is `kill -9`, which is the one exit that restores
+    /// nothing and leaves the terminal wrecked.
+    #[test]
+    fn ctrl_c_escapes_from_every_screen() {
+        for tab in Tab::ALL {
+            assert_eq!(
+                action_for(
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    tab
+                ),
+                Some(Action::Interrupt),
+                "{} shadowed ctrl-c",
+                tab.title()
+            );
         }
     }
 
@@ -545,5 +649,60 @@ mod tests {
             .sum::<usize>()
             + global().count();
         assert_eq!(listed, BINDINGS.len());
+    }
+
+    /// Every row can actually win somewhere.
+    ///
+    /// Counting rows proves they are *listed*; it does not prove any of them
+    /// does anything. A global row whose keys were all claimed by screens, or
+    /// a screen row placed after another that answers the same key, would be
+    /// documented in the overlay and dead in practice — the exact drift the
+    /// one-table design exists to prevent, arriving by a different door.
+    ///
+    /// So each row is asked to beat the dispatcher on at least one screen,
+    /// using a key it itself claims. Rows are matchers rather than key lists,
+    /// so the probe is the printable keyboard plus the named keys the table
+    /// uses; a row that answers none of those has no way to be pressed.
+    #[test]
+    fn every_row_wins_for_at_least_one_key_somewhere() {
+        let mut probes: Vec<KeyEvent> = (b' '..=b'~')
+            .map(|c| KeyEvent::new(KeyCode::Char(c as char), KeyModifiers::NONE))
+            .collect();
+        probes.extend(
+            [
+                KeyCode::Enter,
+                KeyCode::Esc,
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::PageUp,
+                KeyCode::PageDown,
+            ]
+            .map(|code| KeyEvent::new(code, KeyModifiers::NONE)),
+        );
+        probes.extend(
+            ['d', 'u', 'f', 'b', 'c']
+                .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)),
+        );
+
+        for binding in BINDINGS {
+            let reachable = probes.iter().any(|key| {
+                let mine = (binding.of)(*key);
+                mine.is_some()
+                    && Tab::ALL.into_iter().any(|tab| match binding.scope {
+                        Scope::On(t) if t != tab => false,
+                        _ => action_for(*key, tab) == mine,
+                    })
+            });
+            assert!(
+                reachable,
+                "the row documented as {:?} ({}) never wins — it is shadowed \
+                 everywhere, or answers no key a keyboard can send",
+                binding.keys, binding.what
+            );
+        }
     }
 }
