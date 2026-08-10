@@ -348,6 +348,9 @@ mod tests {
         assert!(text.starts_with("# Written by pacrat on 2026-08-10T12:00:00Z."));
         let read_back = Config::from_toml(&text).expect("pacrat wrote a file it cannot read");
         assert_eq!(read_back, config);
+        // And rendering what was read back is byte-identical: the writer is
+        // stable across a round trip, both cmd forms included.
+        assert_eq!(render(&read_back, "2026-08-10T12:00:00Z"), text);
     }
 
     /// A grader argument is the one field that can hold TOML's own syntax;

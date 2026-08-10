@@ -243,8 +243,9 @@ enum Command {
         /// Answer the interview's update-mode question (skips asking it)
         #[arg(long, value_enum)]
         mode: Option<update::ModeArg>,
-        /// Answer the interview's grader question: register the contrib
-        /// yay-friend adapter (absolute path, 0-4 scale, 600s timeout)
+        /// Answer the interview's grader question: register yay-friend —
+        /// the native `yay-friend grade` when the installed binary has it,
+        /// the contrib adapter otherwise (600s timeout either way)
         #[arg(long)]
         register_yay_friend: bool,
         /// Answer the interview's grader question: register nothing
