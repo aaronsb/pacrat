@@ -537,7 +537,7 @@ impl Updates {
         let outcome = self.render_review(ctx, &package, &curated, &cand, &candidate);
         // The trees are scratch, and they are only worth keeping when
         // something went wrong with reading them.
-        review::finish(&cand, outcome.is_err());
+        review::finish(&cand, outcome.is_ok());
         outcome
     }
 
