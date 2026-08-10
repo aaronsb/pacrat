@@ -2,10 +2,12 @@ use clap::{Parser, Subcommand};
 
 mod add;
 mod ctx;
+mod fstree;
 mod hosts;
 mod live;
 mod out;
 mod status;
+mod vendor;
 
 /// pacrat — store-backed package curation for Arch.
 ///
@@ -32,8 +34,23 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
-    /// Vendor an AUR package's tree into the store (fetch → grade → review)
-    Vendor { package: String },
+    /// Vendor a package's build tree into the store (tracked → vendored)
+    Vendor {
+        /// Package name (also names the default AUR repo)
+        package: String,
+        /// Git URL to clone (default: the AUR repo for <package>)
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Ledger role to record
+        #[arg(long, value_enum, default_value_t = vendor::RoleArg::Vendored)]
+        role: vendor::RoleArg,
+        /// Skip the review prompt (scripting)
+        #[arg(long)]
+        yes: bool,
+        /// Overwrite an existing store tree and ledger entry
+        #[arg(long)]
+        force: bool,
+    },
     /// One-shot update loop: detect → grade → decide → build
     Update,
     /// List pending updates with grades
@@ -66,6 +83,13 @@ fn main() {
             ref packages,
             ref host,
         }) => add::run(&ctx, packages, host.as_deref()),
+        Some(Command::Vendor {
+            ref package,
+            ref upstream,
+            role,
+            yes,
+            force,
+        }) => vendor::run(&ctx, package, upstream.as_deref(), role, yes, force),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {

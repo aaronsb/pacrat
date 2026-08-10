@@ -4,6 +4,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use pacrat_core::config::Config;
@@ -61,6 +62,33 @@ impl Ctx {
                 .map_err(|e| format!("{}: {e}", self.sources_path().display())),
             Err(_) => Ok(Sources::default()),
         }
+    }
+
+    /// Write the ledger, atomically.
+    ///
+    /// `fs::write` truncates first, so a crash mid-write would leave the
+    /// store with a half-written — or empty — record of every vendored
+    /// package. Writing a sibling temp file and renaming it into place makes
+    /// the update all-or-nothing. Callers must load immediately before they
+    /// modify: this replaces the whole file, so a stale copy silently
+    /// reverts whatever another process wrote in the meantime.
+    pub fn save_sources(&self, sources: &Sources) -> Result<(), String> {
+        let path = self.sources_path();
+        let dir = path
+            .parent()
+            .ok_or_else(|| format!("{}: no parent directory", path.display()))?;
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let tmp = dir.join(format!(".sources.toml.{}.new", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(sources.to_toml().as_bytes())?;
+            f.sync_all()
+        };
+        write().map_err(|e| format!("{}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("{}: {e}", path.display())
+        })
     }
 
     pub fn packages_dir(&self) -> PathBuf {
