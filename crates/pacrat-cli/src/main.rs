@@ -226,17 +226,30 @@ enum Command {
     /// Put this host on the serving model: the first-run interview, then
     /// the repo section, database and guard hooks
     ///
-    /// At a terminal the interview asks the config questions first (each
-    /// one defaults to the current value), and `--apply` walks the
-    /// root-owned steps through a confirmed sudo run. Headless, the
-    /// interview is skipped unless the answer flags are given, and the
-    /// sudo commands are printed for you to run.
+    /// At a terminal this is the guided flow: the interview (each question
+    /// defaults to the current value), the steps you can do yourself, then
+    /// each root-owned step shown and confirmed before sudo runs it —
+    /// anything declined is listed at the end to run later. `sudo pacrat
+    /// setup` runs the same system steps directly, one confirmation each,
+    /// with the interview left to your own user. Headless, the interview
+    /// is skipped unless the answer flags are given, and the commands are
+    /// printed for you to run.
+    ///
+    /// Exits 0 when nothing was refused, 10 when any confirmed step was
+    /// declined (the walked steps ran fine, you deliberately kept some),
+    /// and 1 when a step or a confirmed command failed.
     Setup {
-        /// Do the steps that need no root (repo dir, empty db, staging the
-        /// root-owned files); at a terminal, also offer each sudo command,
-        /// one confirm at a time.
+        /// Accepted for compatibility — the guided flow is the default at
+        /// a terminal now, so this changes nothing there. Headless it
+        /// still runs the user-doable steps and stages the root-owned
+        /// files so the printed sudo lines work verbatim.
         #[arg(long)]
         apply: bool,
+        /// Print every step in full — the pacman.conf section, both guard
+        /// files, the copy-paste commands — and change nothing. The audit
+        /// view.
+        #[arg(long, conflicts_with = "apply")]
+        print: bool,
         /// Answer the interview's UI question (skips asking it)
         #[arg(long, value_enum)]
         ui: Option<config::UiArg>,
@@ -333,6 +346,12 @@ fn main() {
 }
 
 fn dispatch(command: Option<Command>) -> Result<(), String> {
+    // Root is maintenance mode (ADR-003, amended), and the split comes
+    // before anything else — before the setup gate, and before the store
+    // is even looked for, because root's HOME points at the wrong one.
+    if euid() == 0 {
+        return dispatch_as_root(command);
+    }
     let ctx = ctx::Ctx::resolve()?;
     // The setup gate (ADR-003). `setup` is the only verb that can open it,
     // and `about` was dispatched before the store was even looked for; every
@@ -347,6 +366,65 @@ fn dispatch(command: Option<Command>) -> Result<(), String> {
         }
     }
     run(&ctx, command)
+}
+
+/// Root runs `pacrat setup` and nothing else (`about` was dispatched
+/// storeless before this). Every package and store verb — bare `pacrat`
+/// and the TUI included — answers with one plain line, because a root-made
+/// commit or root-owned file in the store is exactly the mess the mode
+/// split exists to prevent.
+fn dispatch_as_root(command: Option<Command>) -> Result<(), String> {
+    let Some(Command::Setup {
+        apply,
+        print,
+        ui,
+        mode,
+        register_yay_friend,
+        no_graders,
+    }) = command
+    else {
+        return Err("package work runs as your user — root is for `pacrat setup` only".into());
+    };
+    let answers = setup::Interview {
+        ui: ui.map(Into::into),
+        mode: mode.map(Into::into),
+        register_yay_friend,
+        no_graders,
+    };
+    if answers.any_flag() {
+        return Err(
+            "the interview flags (--ui, --mode, --register-yay-friend, --no-graders) \
+             write your user's config.toml, which root never touches — run \
+             `pacrat setup` with them as yourself"
+                .into(),
+        );
+    }
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let flow = setup::flow(euid(), sudo_user.as_deref(), at_terminal(), print, apply)?;
+    // `flow` refused every rootless case above, so a root flow always
+    // names its operator.
+    let operator = flow
+        .operator()
+        .ok_or("root setup with no operator — this is a bug in the flow decision")?
+        .to_string();
+    let ctx = ctx::Ctx::resolve_for_operator(&operator)?;
+    setup::run(&ctx, flow, &answers)
+}
+
+/// The effective uid, straight from the kernel — the root/user mode split
+/// (ADR-003, amended) hangs on it. geteuid cannot fail and touches no
+/// memory, hence the quiet unsafe.
+#[cfg(unix)]
+fn euid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+/// A human on both ends of this run? stdin and stdout together, the same
+/// question `elevate::Session::open` asks — checked once here so `setup`'s
+/// flow decision and the session it opens cannot disagree.
+fn at_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 fn run(ctx: &ctx::Ctx, command: Option<Command>) -> Result<(), String> {
@@ -365,20 +443,32 @@ fn run(ctx: &ctx::Ctx, command: Option<Command>) -> Result<(), String> {
         Some(Command::Untrack { ref packages }) => untrack::run(ctx, packages),
         Some(Command::Setup {
             apply,
+            print,
             ui,
             mode,
             register_yay_friend,
             no_graders,
-        }) => setup::run(
-            ctx,
-            apply,
-            &setup::Interview {
-                ui: ui.map(Into::into),
-                mode: mode.map(Into::into),
-                register_yay_friend,
-                no_graders,
-            },
-        ),
+        }) => {
+            // euid 0 was routed to `dispatch_as_root` long before this arm;
+            // passing the real euid anyway keeps the decision one function.
+            let flow = setup::flow(
+                euid(),
+                std::env::var("SUDO_USER").ok().as_deref(),
+                at_terminal(),
+                print,
+                apply,
+            )?;
+            setup::run(
+                ctx,
+                flow,
+                &setup::Interview {
+                    ui: ui.map(Into::into),
+                    mode: mode.map(Into::into),
+                    register_yay_friend,
+                    no_graders,
+                },
+            )
+        }
         Some(Command::Config { ref action }) => config::run(ctx, action),
         Some(Command::Updates { format }) => updates::run(ctx, format),
         Some(Command::Vendor {

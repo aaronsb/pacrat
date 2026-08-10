@@ -11,13 +11,32 @@
 //! It writes `~/.config/pacrat/config.toml` through `config::save`, so a
 //! full setup is one command on one terminal.
 //!
-//! pacrat never elevates *unasked* (ADR-003, amending ADR-001). Everything
-//! root-owned is printed; headless, `--apply` performs only the steps this
-//! user can already do without sudo, and stages the root-owned files
-//! somewhere user-writable so the printed `sudo install` lines work
-//! verbatim. At a terminal, `--apply` walks those same root-owned steps
-//! through `elevate::Session` — argv shown, y/n asked, sudo authenticating
-//! on the terminal itself — and reports anything declined at the end.
+//! Which of the five flows a run gets is one pure decision ([`flow`]):
+//! euid, `SUDO_USER`, the terminal and the flags in, a [`Flow`] out. At a
+//! terminal, bare `pacrat setup` IS the guided flow (ADR-003, as amended):
+//! the interview, the user-doable steps, then each root-owned step through
+//! `elevate::Session` — argv shown, y/n asked, sudo authenticating on the
+//! terminal itself — with anything declined reported at the end as the
+//! exact commands to run later. `--print` asks for the wall instead: every
+//! section, file body and copy-paste command, nothing run or changed.
+//! Headless runs print, as they always did. `--apply` (now a synonym at a
+//! terminal) headless still performs the user-doable steps and stages the
+//! root-owned files so the printed `sudo install` lines work verbatim —
+//! user mode only: no root invocation ever stages, so root's wall points
+//! at `sudo pacrat setup` on a terminal rather than at staged files that
+//! would not exist.
+//!
+//! Root is maintenance mode (ADR-003, second amendment): `sudo pacrat
+//! setup` reads the OPERATOR's config via `SUDO_USER` — never root's own —
+//! refuses the interview (config.toml is the user's file), and runs the
+//! system steps directly, each still shown and confirmed; the privilege
+//! line was crossed by the operator typing sudo, so the commands lose
+//! their `sudo` prefix and nothing else. Root never writes config.toml
+//! and never touches the store.
+//!
+//! pacrat never elevates *unasked* (ADR-003, amending ADR-001), and never
+//! authenticates itself — in any flow, every command that runs was printed
+//! first and answered by a human.
 //!
 //! Repo values are substituted into pacman.conf and into a script that runs
 //! as root out of a pacman hook. They are safe to substitute because
@@ -26,7 +45,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -56,25 +75,202 @@ const PACMAN_CONF: &str = "/etc/pacman.conf";
 const MARKER: &str = ".pacrat-transaction";
 const MARKER_MAX_AGE_S: u64 = 3600;
 
-pub fn run(ctx: &Ctx, apply: bool, answers: &Interview) -> Result<(), String> {
+// ------------------------------------------------------------------- flow
+
+/// Which of the five shapes this run of `setup` gets. Decided once, by
+/// [`flow`], from the four facts that matter — euid, `SUDO_USER`, the
+/// terminal, the flags — and nothing else, so the table is testable
+/// without being root or holding a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Flow {
+    /// A user at a terminal: the interview, the user-doable steps, then
+    /// each root-owned step confirmed and run through the sudo flow.
+    Guided,
+    /// `--print` at a terminal: the wall — every section, file body and
+    /// command — with nothing run and nothing changed. The audit view.
+    Print,
+    /// No terminal: print everything, run nothing. Today's output for a
+    /// script, byte for byte; flags still answer the interview.
+    HeadlessPrint,
+    /// No terminal, `--apply`: the printed wall plus the user-doable work —
+    /// staged files, the repo dir and db where this user can already write.
+    HeadlessApply,
+    /// Root at a terminal: maintenance mode. No interview, no store; the
+    /// system steps run directly — shown and confirmed, minus the sudo the
+    /// operator already typed. `operator` is who this setup is *for*.
+    RootDirect { operator: String },
+    /// Root without a terminal, or root `--print`: the wall, rendered from
+    /// the operator's config.
+    RootPrint { operator: String },
+}
+
+impl Flow {
+    /// Root maintenance mode? (Decides whose scratch the staging uses and
+    /// which refusal the interview section prints.)
+    fn as_root(&self) -> bool {
+        matches!(self, Flow::RootDirect { .. } | Flow::RootPrint { .. })
+    }
+
+    /// The operator a root-mode run is for; `None` in every user flow.
+    pub fn operator(&self) -> Option<&str> {
+        match self {
+            Flow::RootDirect { operator } | Flow::RootPrint { operator } => Some(operator),
+            _ => None,
+        }
+    }
+
+    /// Does this flow write the three staged files? Exactly the flows that
+    /// go on to run (or, headless `--apply`, to print runnable) commands
+    /// that read them.
+    fn stages(&self) -> bool {
+        matches!(
+            self,
+            Flow::Guided | Flow::HeadlessApply | Flow::RootDirect { .. }
+        )
+    }
+
+    /// The banner's `mode` line. The two headless strings are the ones
+    /// scripts have always seen and stay byte-identical.
+    fn describe(&self) -> &'static str {
+        match self {
+            Flow::Guided => {
+                "guided (the first-run questions, then each system step shown and asked \
+                 before it runs)"
+            }
+            Flow::Print => "--print (system steps are printed, not run; nothing changes)",
+            Flow::HeadlessPrint => {
+                "print only (system steps are printed, not run; interview answers are still saved to config.toml)"
+            }
+            // `--apply` only reaches here headless now, where nothing can
+            // ask — the honest line names what actually happens.
+            Flow::HeadlessApply => {
+                "--apply (user-owned steps run now; the root-owned commands are printed to run yourself)"
+            }
+            Flow::RootDirect { .. } => {
+                "root (each system step is shown and asked, then run directly)"
+            }
+            Flow::RootPrint { .. } => "print only, as root (system steps are printed, not run)",
+        }
+    }
+}
+
+/// The one mode decision (ADR-003, both amendments), pure: the caller
+/// gathers the four facts, this ranks them. Root outranks everything —
+/// and root with no `SUDO_USER` is refused, because pacrat cannot tell
+/// whose serving model it would be assembling. Then `--print`, then the
+/// terminal; `--apply` keeps its old meaning headless and is a synonym
+/// for the default at a terminal.
+pub fn flow(
+    euid: u32,
+    sudo_user: Option<&str>,
+    tty: bool,
+    print: bool,
+    apply: bool,
+) -> Result<Flow, String> {
+    if euid == 0 {
+        let operator = sudo_user
+            .filter(|user| !user.is_empty() && *user != "root")
+            .ok_or(
+                "running as root with no user behind it (SUDO_USER is not set) — pacrat \
+                 cannot tell whose setup this would be. Run `sudo pacrat setup` from your \
+                 own login, or `pacrat setup` as yourself.",
+            )?
+            .to_string();
+        return Ok(if print || !tty {
+            Flow::RootPrint { operator }
+        } else {
+            Flow::RootDirect { operator }
+        });
+    }
+    if print {
+        return Ok(if tty {
+            Flow::Print
+        } else {
+            Flow::HeadlessPrint
+        });
+    }
+    if !tty {
+        return Ok(if apply {
+            Flow::HeadlessApply
+        } else {
+            Flow::HeadlessPrint
+        });
+    }
+    Ok(Flow::Guided)
+}
+
+/// How the three steps behave, distilled from the [`Flow`]: print the wall,
+/// or walk the commands through a confirmed session. `sudo` is the only
+/// difference between the guided walk and root's — the argv is otherwise
+/// identical, so the two modes cannot drift. `owner` is who the repo
+/// directory is installed for — `$USER` in the user flows, the operator in
+/// the root ones — and both shapes carry it, so a printed `install -d -o`
+/// names the same owner the walked one would. `root` on the printed wall
+/// swaps the remedy lines: no root invocation stages files, so pointing a
+/// root reader at `--apply` would point at files that never exist.
+enum Steps {
+    Print {
+        apply: bool,
+        root: bool,
+        owner: String,
+    },
+    Walk {
+        session: crate::elevate::Session,
+        sudo: bool,
+        owner: String,
+    },
+}
+
+/// One step command, built from the same argv whichever side of the
+/// privilege line it runs on.
+fn step_cmd(sudo: bool, args: &[&str]) -> crate::elevate::Cmd {
+    if sudo {
+        crate::elevate::Cmd::sudo(args)
+    } else {
+        crate::elevate::Cmd::plain(args.iter().map(|a| (*a).to_string()).collect())
+    }
+}
+
+pub fn run(ctx: &Ctx, flow: Flow, answers: &Interview) -> Result<(), String> {
     let repo = &ctx.config.repo;
     let repo_path = PathBuf::from(&repo.path);
     let db = repo_path.join(format!("{}.db.tar.zst", repo.name));
-    let staged = staging_dir()?;
+    let staged = staging_dir(flow.as_root())?;
     let st = state(repo);
 
     println!("pacrat setup — {} onto the serving model", ctx.host);
     println!("repo    [{}] {}", repo.name, repo.path);
-    println!(
-        "mode    {}",
-        if apply {
-            "--apply (user-owned steps run now; each root-owned step asks before sudo runs it)"
-        } else {
-            "print only (system steps are printed, not run; interview answers are still saved to config.toml)"
-        }
-    );
+    if let Some(operator) = flow.operator() {
+        // SUDO_USER is environment, not pacrat's own data — de-escaped like
+        // every other name a terminal is asked to display.
+        println!(
+            "user    {} (from SUDO_USER — the config and repo values are theirs)",
+            crate::out::visible_line(operator).0
+        );
+    }
+    println!("mode    {}", flow.describe());
     println!();
-    interview(ctx, answers)?;
+
+    match &flow {
+        Flow::Guided => interview(ctx, answers, true)?,
+        // Headless keeps today's behavior to the byte: flags answer and
+        // save, no flags leaves the file alone with a note.
+        Flow::HeadlessPrint | Flow::HeadlessApply => interview(ctx, answers, false)?,
+        Flow::Print => {
+            println!("config  --print changes nothing — run `pacrat setup` without it to");
+            println!("        answer the first-run questions.");
+            println!();
+        }
+        Flow::RootDirect { operator } | Flow::RootPrint { operator } => {
+            let operator = crate::out::visible_line(operator).0;
+            println!("config  the first-run questions are skipped as root — config.toml");
+            println!(
+                "        belongs to {operator}. Run `pacrat setup` as {operator} to answer them."
+            );
+            println!();
+        }
+    }
+
     println!("state   repo dir      {}", yn(st.repo_dir));
     println!("        repo db       {}", yn(st.repo_db));
     println!("        pacman.conf   {}", yn(st.conf_section));
@@ -86,40 +282,85 @@ pub fn run(ctx: &Ctx, apply: bool, answers: &Interview) -> Result<(), String> {
         println!();
     }
 
-    if apply {
+    if flow.stages() {
         stage(&staged, "pacman.conf.section", &pacman_conf_section(repo))?;
         stage(&staged, "pacrat-guard.hook", &guard_hook())?;
         stage(&staged, "pacrat-guard.sh", &guard_script(repo))?;
-        println!("staged  {} (three files, user-owned)", staged.display());
+        if flow.as_root() {
+            println!("staged  {} (three files; gone at reboot)", staged.display());
+        } else {
+            println!("staged  {} (three files, user-owned)", staged.display());
+        }
         println!();
     }
 
-    // On a terminal, `--apply` walks the root-owned steps through the
-    // confirmed sudo flow (ADR-003) after the user-doable work; headless,
-    // `flow` is `None` and every step prints its sudo lines exactly as
-    // before, so a script sees what it always saw.
-    let mut flow = if apply {
-        crate::elevate::Session::open()
-    } else {
-        None
+    let user = || env::var("USER").unwrap_or_else(|_| "$USER".into());
+    let mut steps = match &flow {
+        Flow::Guided => Steps::Walk {
+            session: crate::elevate::Session::at_terminal(),
+            sudo: true,
+            owner: user(),
+        },
+        Flow::RootDirect { operator } => Steps::Walk {
+            session: crate::elevate::Session::at_terminal(),
+            sudo: false,
+            owner: operator.clone(),
+        },
+        Flow::HeadlessApply => Steps::Print {
+            apply: true,
+            root: false,
+            owner: user(),
+        },
+        Flow::Print | Flow::HeadlessPrint => Steps::Print {
+            apply: false,
+            root: false,
+            owner: user(),
+        },
+        // The root wall names the operator as the repo directory's owner —
+        // `install -d -o root` would be a root-owned repo dir, the exact
+        // mess the mode split exists to prevent.
+        Flow::RootPrint { operator } => Steps::Print {
+            apply: false,
+            root: true,
+            owner: operator.clone(),
+        },
     };
 
-    step_pacman_conf(repo, &staged, &st, apply, &mut flow);
-    step_repo(&repo_path, &db, &st, apply, &mut flow)?;
-    step_guard(repo, &staged, &st, apply, &mut flow);
+    // A hard step failure must not swallow the walk's ledger: report what
+    // was asked and declined first, then propagate the error.
+    let stepped = (|| -> Result<(), String> {
+        step_pacman_conf(repo, &staged, &st, &mut steps);
+        step_repo(&repo_path, &db, &st, &mut steps)?;
+        step_guard(repo, &staged, &st, &mut steps);
+        Ok(())
+    })();
 
-    if let Some(flow) = &flow {
-        flow.report();
-        if flow.any_failed() {
+    if let Steps::Walk { session, .. } = &steps {
+        session.report();
+        if session.any_declined() {
+            println!();
+            println!("The declined commands above are yours to run later, exactly as");
+            println!("shown — or re-run `pacrat setup` to be asked again.");
+        }
+    }
+    stepped?;
+    if let Steps::Walk { session, .. } = &steps {
+        if session.any_failed() {
             return Err(
-                "a confirmed command failed — see above; re-run `pacrat setup --apply` \
-                        once it is sorted"
+                "a confirmed command failed — see above; re-run `pacrat setup` once it \
+                 is sorted"
                     .into(),
             );
         }
         if !st.complete() && state(repo).complete() {
             println!();
             println!("done      this host is on the serving model — the setup gate is open.");
+        }
+        if session.any_declined() {
+            // Ran fine, deliberately did not act — the same answer `sync
+            // --run` gives a script, and for the same reason: completed and
+            // refused must not share an exit code.
+            std::process::exit(crate::HELD)
         }
     }
 
@@ -140,18 +381,22 @@ pub struct Interview {
 }
 
 impl Interview {
-    fn any_flag(&self) -> bool {
+    /// Any answer flag at all — the line between "script that answered"
+    /// and "script that gets the leave-it-alone note", and (in root mode)
+    /// between silence and a refusal.
+    pub fn any_flag(&self) -> bool {
         self.ui.is_some() || self.mode.is_some() || self.register_yay_friend || self.no_graders
     }
 }
 
 /// The first-run questions (ADR-003): UI, update mode, graders. Ends by
 /// writing `~/.config/pacrat/config.toml` through the one stamped writer
-/// (`config::save`), carrying every grader it did not touch. Headless with
-/// no flags, it says so and leaves the file alone — today's behavior.
-fn interview(ctx: &Ctx, answers: &Interview) -> Result<(), String> {
-    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
-    if !tty && !answers.any_flag() {
+/// (`config::save`), carrying every grader it did not touch. `ask` is the
+/// flow's decision, not a fresh terminal probe: only the guided flow asks,
+/// and with `ask` false and no flags it says so and leaves the file alone
+/// — today's headless behavior.
+fn interview(ctx: &Ctx, answers: &Interview, ask: bool) -> Result<(), String> {
+    if !ask && !answers.any_flag() {
         println!("config  no terminal and no answer flags (--ui, --mode,");
         println!("        --register-yay-friend, --no-graders) — leaving the config file");
         println!("        alone. `pacrat config` changes it any time.");
@@ -163,7 +408,7 @@ fn interview(ctx: &Ctx, answers: &Interview) -> Result<(), String> {
 
     config.default_ui = match answers.ui {
         Some(ui) => ui,
-        None if tty => {
+        None if ask => {
             match ask_choice(
                 "ui      what should bare `pacrat` open?",
                 &["cli", "tui"],
@@ -180,7 +425,7 @@ fn interview(ctx: &Ctx, answers: &Interview) -> Result<(), String> {
 
     config.update_mode = match answers.mode {
         Some(mode) => mode,
-        None if tty => {
+        None if ask => {
             match ask_choice(
                 "update  how much of `pacrat update` runs without asking?",
                 &["auto", "semi", "manual"],
@@ -196,7 +441,7 @@ fn interview(ctx: &Ctx, answers: &Interview) -> Result<(), String> {
         None => config.update_mode,
     };
 
-    grader_question(ctx, &mut config, answers, tty)?;
+    grader_question(ctx, &mut config, answers, ask)?;
 
     let path = crate::config::save(&config)?;
     println!(
@@ -214,14 +459,14 @@ fn grader_question(
     ctx: &Ctx,
     config: &mut Config,
     answers: &Interview,
-    tty: bool,
+    ask: bool,
 ) -> Result<(), String> {
     if answers.no_graders {
         println!("grader  --no-graders — registering none.");
         return Ok(());
     }
     if let Some(i) = config.graders.iter().position(|g| g.name == "yay-friend") {
-        return modernize_question(config, i, tty);
+        return modernize_question(config, i, ask);
     }
     if answers.register_yay_friend {
         if probe_native() {
@@ -237,7 +482,7 @@ fn grader_question(
         register(config, &adapter)?;
         return Ok(());
     }
-    if !tty {
+    if !ask {
         // No flag and nobody to ask: the question simply does not come up.
         return Ok(());
     }
@@ -297,8 +542,8 @@ fn grader_question(
 /// rewrite — one string, subject in the environment — at a terminal, and
 /// only that: declining leaves it byte-for-byte as it was, a string-form
 /// one has nothing to modernize, and no other grader is ever considered.
-fn modernize_question(config: &mut Config, i: usize, tty: bool) -> Result<(), String> {
-    if !tty || matches!(config.graders[i].cmd, Cmd::Line(_)) {
+fn modernize_question(config: &mut Config, i: usize, ask: bool) -> Result<(), String> {
+    if !ask || matches!(config.graders[i].cmd, Cmd::Line(_)) {
         println!("grader  yay-friend is already registered — leaving it as it is.");
         return Ok(());
     }
@@ -553,13 +798,7 @@ fn yn(present: bool) -> &'static str {
 
 // ---------------------------------------------------------------- step 1
 
-fn step_pacman_conf(
-    repo: &Repo,
-    staged: &Path,
-    st: &State,
-    apply: bool,
-    flow: &mut Option<crate::elevate::Session>,
-) {
+fn step_pacman_conf(repo: &Repo, staged: &Path, st: &State, steps: &mut Steps) {
     println!("1. pacman.conf section — teach pacman about the repo");
     println!();
     if st.conf_section {
@@ -570,32 +809,44 @@ fn step_pacman_conf(
         println!();
         return;
     }
-    block(&pacman_conf_section(repo));
-    println!();
-    if let Some(flow) = flow {
-        // The confirmed flow (ADR-003): the staged section, appended by a
-        // sudo tee whose stdin is the file just shown. tee echoes what it
-        // appended — the receipt of exactly what landed in pacman.conf.
-        let ran = flow.run(
-            crate::elevate::Cmd::sudo(&["tee", "-a", PACMAN_CONF])
-                .reading(staged.join("pacman.conf.section")),
-        ) == crate::elevate::Verdict::Ran;
-        if !ran {
-            println!("   still to do: the command above appends the staged section.");
+    let file = staged.join("pacman.conf.section");
+    match steps {
+        Steps::Print { apply, root, .. } => {
+            block(&pacman_conf_section(repo));
+            println!();
+            println!("   append it to {PACMAN_CONF} (root):");
+            println!(
+                "     sudo tee -a {PACMAN_CONF} <{} >/dev/null",
+                sh(&file.to_string_lossy())
+            );
+            if *root {
+                // No root invocation stages files (only the walked flows
+                // and user-mode headless --apply do), so the honest remedy
+                // is the one that both stages and installs.
+                println!("     (run `sudo pacrat setup` at a terminal to stage and install these");
+                println!("     directly)");
+            } else if !*apply {
+                println!("     (`pacrat setup --apply` writes that staged file first)");
+            }
         }
-    } else {
-        println!("   append it to {PACMAN_CONF} (root):");
-        println!(
-            "     sudo tee -a {PACMAN_CONF} <{} >/dev/null",
-            sh(&staged.join("pacman.conf.section").to_string_lossy())
-        );
-        if !apply {
-            println!("     (`pacrat setup --apply` writes that staged file first)");
+        Steps::Walk { session, sudo, .. } => {
+            // A walked step shows what a confirm needs (ADR-003, amended):
+            // the destination and the staged file, readable before
+            // answering — the section's body belongs to `--print`. The
+            // command is a tee whose stdin is that same staged file, so
+            // what was readable is what lands; tee echoes it back as the
+            // receipt.
+            println!("   append to  {PACMAN_CONF}");
+            println!("   staged at  {}", file.display());
+            println!("   (`pacrat setup --print` shows the section itself)");
+            session.run(step_cmd(*sudo, &["tee", "-a", PACMAN_CONF]).reading(file.clone()));
         }
     }
+    // Appending last is load-bearing, not incidental (issue #24): official
+    // repos winning a name collision is what keeps pacrat from proxying
+    // official Arch packages, so no "move it up" advice belongs here.
     println!("   appending puts the section last, so official repos win any name");
-    println!("   collision — the safe default. Move it above [core] by hand if you");
-    println!("   want curated builds to shadow official packages.");
+    println!("   collision — official packages stay official.");
     println!("   the database in step 2 must exist before the next `pacman -Sy`.");
     println!();
 }
@@ -637,14 +888,7 @@ fn pacman_conf_section(repo: &Repo) -> String {
 
 // ---------------------------------------------------------------- step 2
 
-fn step_repo(
-    repo_path: &Path,
-    db: &Path,
-    st: &State,
-    apply: bool,
-    flow: &mut Option<crate::elevate::Session>,
-) -> Result<(), String> {
-    let user = env::var("USER").unwrap_or_else(|_| "$USER".into());
+fn step_repo(repo_path: &Path, db: &Path, st: &State, steps: &mut Steps) -> Result<(), String> {
     println!("2. repo directory and empty database");
     println!();
     if st.repo_dir && st.repo_db {
@@ -656,50 +900,105 @@ fn step_repo(
         println!();
         return Ok(());
     }
-    println!(
-        "     sudo install -d -o {user} {}",
-        sh(&repo_path.to_string_lossy())
-    );
-    println!("     repo-add {}", sh(&db.to_string_lossy()));
-    println!();
-
-    if !apply {
-        println!("   `pacrat setup --apply` runs these itself when the path is already");
-        println!("   yours to write; the sudo line is only for a root-owned location.");
-        println!();
-        return Ok(());
-    }
-
-    match ensure_dir(repo_path) {
-        Ok(()) => {}
-        Err(Denied) => {
-            // A root-owned location. On a terminal the confirmed flow makes
-            // the directory (owned by this user, so repo-add stays a plain
-            // unprivileged call below); otherwise the two printed lines are
-            // the answer, as they always were.
-            let recovered = match flow {
-                Some(flow) => {
-                    flow.run(crate::elevate::Cmd::sudo(&[
-                        "install",
-                        "-d",
-                        "-o",
-                        &user,
-                        &repo_path.to_string_lossy(),
-                    ])) == crate::elevate::Verdict::Ran
-                }
-                None => false,
-            };
-            if !recovered {
-                println!(
-                    "   {} needs root — run the two lines above, then",
-                    repo_path.display()
-                );
-                println!("   re-run `pacrat setup --apply`.");
+    match steps {
+        Steps::Print { apply, root, owner } => {
+            // `owner` rides in from the flow: `$USER` on a user's wall, the
+            // operator on root's — a root print must not offer a root-owned
+            // repo directory.
+            println!(
+                "     sudo install -d -o {owner} {}",
+                sh(&repo_path.to_string_lossy())
+            );
+            println!("     repo-add {}", sh(&db.to_string_lossy()));
+            println!();
+            if *root {
+                println!("   run `sudo pacrat setup` at a terminal to be asked through these");
+                println!("   directly, one confirm each.");
                 println!();
                 return Ok(());
             }
+            if !*apply {
+                println!("   `pacrat setup --apply` runs these itself when the path is already");
+                println!("   yours to write; the sudo line is only for a root-owned location.");
+                println!();
+                return Ok(());
+            }
+            match ensure_dir(repo_path) {
+                Ok(()) => {}
+                Err(Denied) => {
+                    // A root-owned location, headless: the two printed
+                    // lines are the answer, as they always were.
+                    println!(
+                        "   {} needs root — run the two lines above, then",
+                        repo_path.display()
+                    );
+                    println!("   re-run `pacrat setup --apply`.");
+                    println!();
+                    return Ok(());
+                }
+                Err(Failed(e)) => return Err(e),
+            }
         }
-        Err(Failed(e)) => return Err(e),
+        Steps::Walk {
+            session,
+            sudo: true,
+            owner,
+        } => {
+            println!("   directory  {}", repo_path.display());
+            match ensure_dir(repo_path) {
+                Ok(()) => {}
+                Err(Denied) => {
+                    // A root-owned location. The confirmed flow makes the
+                    // directory — owned by this user, so repo-add stays a
+                    // plain unprivileged call below.
+                    let ran = session.run(crate::elevate::Cmd::sudo(&[
+                        "install",
+                        "-d",
+                        "-o",
+                        owner,
+                        &repo_path.to_string_lossy(),
+                    ])) == crate::elevate::Verdict::Ran;
+                    if !ran {
+                        println!("   the database needs that directory first — nothing more");
+                        println!("   to do here until it exists.");
+                        println!();
+                        return Ok(());
+                    }
+                }
+                Err(Failed(e)) => return Err(e),
+            }
+        }
+        Steps::Walk {
+            session,
+            sudo: false,
+            owner,
+        } => {
+            // Root maintenance mode: nothing here is "user-doable" — even
+            // making the directory is a root action now, so it is shown
+            // and asked like every other one. `-o <operator>` because the
+            // directory belongs to the user whose serving model this is:
+            // user-mode `build` writes into it.
+            println!("   directory  {}", repo_path.display());
+            if !st.repo_dir {
+                let ran = session.run(step_cmd(
+                    false,
+                    &["install", "-d", "-o", owner, &repo_path.to_string_lossy()],
+                )) == crate::elevate::Verdict::Ran;
+                if !ran {
+                    println!("   the database needs that directory first — nothing more");
+                    println!("   to do here until it exists.");
+                    println!();
+                    return Ok(());
+                }
+            }
+            if db.exists() {
+                println!("   db   {} already present — left alone", db.display());
+            } else {
+                session.run(step_cmd(false, &["repo-add", &db.to_string_lossy()]));
+            }
+            println!();
+            return Ok(());
+        }
     }
     println!("   dir  {} ready", repo_path.display());
 
@@ -761,13 +1060,7 @@ fn ensure_dir(dir: &Path) -> Result<(), DirErr> {
 
 // ---------------------------------------------------------------- step 3
 
-fn step_guard(
-    repo: &Repo,
-    staged: &Path,
-    st: &State,
-    apply: bool,
-    flow: &mut Option<crate::elevate::Session>,
-) {
+fn step_guard(repo: &Repo, staged: &Path, st: &State, steps: &mut Steps) {
     println!("3. guard hook — abort installs that went around curation");
     println!();
     if st.hook && st.script {
@@ -778,54 +1071,67 @@ fn step_guard(
         println!();
         return;
     }
-    println!("   {HOOK_DEST}");
-    block(&guard_hook());
-    println!();
-    println!("   {SCRIPT_DEST}");
-    block(&guard_script(repo));
-    println!();
-    if let Some(flow) = flow {
-        // Script before hook, deliberately: a hook whose Exec target is not
-        // there yet would fail every transaction in the window between the
-        // two confirms.
-        println!("   install both (root, one confirm each):");
-        flow.run(crate::elevate::Cmd::sudo(&[
-            "install",
-            "-Dm755",
-            &staged.join("pacrat-guard.sh").to_string_lossy(),
-            SCRIPT_DEST,
-        ]));
-        flow.run(crate::elevate::Cmd::sudo(&[
-            "install",
-            "-Dm644",
-            &staged.join("pacrat-guard.hook").to_string_lossy(),
-            HOOK_DEST,
-        ]));
-    } else {
-        println!("   install both (root):");
-        println!(
-            "     sudo install -Dm755 {} {SCRIPT_DEST}",
-            sh(&staged.join("pacrat-guard.sh").to_string_lossy())
-        );
-        println!(
-            "     sudo install -Dm644 {} {HOOK_DEST}",
-            sh(&staged.join("pacrat-guard.hook").to_string_lossy())
-        );
-        if !apply {
-            println!("     (`pacrat setup --apply` writes those staged files first)");
+    let script = staged.join("pacrat-guard.sh");
+    let hook = staged.join("pacrat-guard.hook");
+    match steps {
+        Steps::Print { apply, root, .. } => {
+            println!("   {HOOK_DEST}");
+            block(&guard_hook());
+            println!();
+            println!("   {SCRIPT_DEST}");
+            block(&guard_script(repo));
+            println!();
+            println!("   install both (root):");
+            println!(
+                "     sudo install -Dm755 {} {SCRIPT_DEST}",
+                sh(&script.to_string_lossy())
+            );
+            println!(
+                "     sudo install -Dm644 {} {HOOK_DEST}",
+                sh(&hook.to_string_lossy())
+            );
+            if *root {
+                println!("     (run `sudo pacrat setup` at a terminal to stage and install these");
+                println!("     directly)");
+            } else if !*apply {
+                println!("     (`pacrat setup --apply` writes those staged files first)");
+            }
+            println!();
+            println!("   the guard stands aside for pacrat's own transactions via a marker");
+            println!("   file:");
+            println!(
+                "     {}",
+                sh(&Path::new(&repo.path).join(MARKER).to_string_lossy())
+            );
+            println!("   holding `pid=<pid> started=<unix seconds>`. It is honoured only while");
+            println!(
+                "   that pid is alive and the timestamp is under {MARKER_MAX_AGE_S}s, and every use"
+            );
+            println!("   of it is announced on stderr — an interrupted build leaves a stale");
+            println!("   marker, and a stale marker is ignored rather than trusted.");
+        }
+        Steps::Walk { session, sudo, .. } => {
+            // Destinations and the staged files, readable before answering;
+            // the hundred lines of guard script belong to `--print`.
+            println!("   script to  {SCRIPT_DEST}");
+            println!("   staged at  {}", script.display());
+            println!("   hook to    {HOOK_DEST}");
+            println!("   staged at  {}", hook.display());
+            println!("   (`pacrat setup --print` shows both files in full)");
+            // Script before hook, deliberately: a hook whose Exec target is
+            // not there yet would fail every transaction in the window
+            // between the two confirms.
+            session.run(step_cmd(
+                *sudo,
+                &["install", "-Dm755", &script.to_string_lossy(), SCRIPT_DEST],
+            ));
+            session.run(step_cmd(
+                *sudo,
+                &["install", "-Dm644", &hook.to_string_lossy(), HOOK_DEST],
+            ));
+            println!();
         }
     }
-    println!();
-    println!("   the guard stands aside for pacrat's own transactions via a marker");
-    println!("   file:");
-    println!(
-        "     {}",
-        sh(&Path::new(&repo.path).join(MARKER).to_string_lossy())
-    );
-    println!("   holding `pid=<pid> started=<unix seconds>`. It is honoured only while");
-    println!("   that pid is alive and the timestamp is under {MARKER_MAX_AGE_S}s, and every use");
-    println!("   of it is announced on stderr — an interrupted build leaves a stale");
-    println!("   marker, and a stale marker is ignored rather than trusted.");
 }
 
 fn guard_hook() -> String {
@@ -983,10 +1289,15 @@ fn sh(word: &str) -> String {
     }
 }
 
-/// XDG state, where the root-owned files are staged so the printed `sudo
-/// install` commands have something real to copy from (ADR-001 puts host
-/// scratch under XDG state).
-fn staging_dir() -> Result<PathBuf, String> {
+/// Where the root-owned files are staged so the install commands have
+/// something real to copy from. As the user: XDG state (ADR-001 puts host
+/// scratch there). As root: /run/pacrat — sudo does not reliably say whose
+/// HOME is in the environment, and root-owned files must never land in the
+/// operator's home, so a root-owned tmpfs path is the honest scratch.
+fn staging_dir(root: bool) -> Result<PathBuf, String> {
+    if root {
+        return Ok(PathBuf::from("/run/pacrat/setup"));
+    }
     Ok(crate::ctx::state_dir()?.join("setup"))
 }
 
@@ -1028,6 +1339,71 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    // ---- the flow decision (ADR-003, both amendments) ----
+
+    /// The whole table: root/user × SUDO_USER × terminal × flags. Pure
+    /// data in, pure data out — nothing here is root, holds a terminal,
+    /// or touches this machine.
+    #[test]
+    fn the_flow_table() {
+        use Flow::*;
+        let root = |op: &str| RootDirect {
+            operator: op.into(),
+        };
+        let root_print = |op: &str| RootPrint {
+            operator: op.into(),
+        };
+        //     euid, sudo_user, tty, print, apply → the flow
+        type Case<'a> = (u32, Option<&'a str>, bool, bool, bool, Flow);
+        let cases: &[Case] = &[
+            // A user at a terminal gets the guided flow; `--apply` is a
+            // synonym, and a lingering SUDO_USER means nothing off-root —
+            // even when it says root, and even headless.
+            (1000, None, true, false, false, Guided),
+            (1000, None, true, false, true, Guided),
+            (1000, Some("aaron"), true, false, false, Guided),
+            (1000, Some("root"), true, false, false, Guided),
+            (1000, Some("aaron"), false, false, false, HeadlessPrint),
+            (1000, Some("aaron"), false, true, false, HeadlessPrint),
+            (1000, Some("aaron"), false, false, true, HeadlessApply),
+            (1000, Some("root"), false, false, false, HeadlessPrint),
+            // `--print` at a terminal is the wall, changing nothing.
+            (1000, None, true, true, false, Print),
+            // Headless keeps printing; `--apply` keeps its headless
+            // meaning (user-doable steps plus the staged files).
+            (1000, None, false, false, false, HeadlessPrint),
+            (1000, None, false, true, false, HeadlessPrint),
+            (1000, None, false, false, true, HeadlessApply),
+            // Root is maintenance mode, for the operator SUDO_USER names.
+            (0, Some("aaron"), true, false, false, root("aaron")),
+            (0, Some("aaron"), true, false, true, root("aaron")),
+            (0, Some("aaron"), true, true, false, root_print("aaron")),
+            (0, Some("aaron"), false, false, false, root_print("aaron")),
+            (0, Some("aaron"), false, false, true, root_print("aaron")),
+        ];
+        for (euid, sudo_user, tty, print, apply, want) in cases {
+            assert_eq!(
+                flow(*euid, *sudo_user, *tty, *print, *apply).as_ref(),
+                Ok(want),
+                "euid {euid}, sudo_user {sudo_user:?}, tty {tty}, print {print}, apply {apply}"
+            );
+        }
+    }
+
+    /// Root with nobody behind it is refused: no SUDO_USER, an empty one,
+    /// and root-sudoing-root all read as "whose setup would this be?".
+    #[test]
+    fn root_with_no_operator_is_refused() {
+        for sudo_user in [None, Some(""), Some("root")] {
+            for (tty, print) in [(true, false), (false, false), (true, true)] {
+                let err = flow(0, sudo_user, tty, print, false)
+                    .expect_err(&format!("{sudo_user:?} must refuse"));
+                assert!(err.contains("SUDO_USER"), "{err}");
+                assert!(err.contains("pacrat setup"), "no pointer at the fix: {err}");
+            }
+        }
     }
 
     // ---- rendering ----

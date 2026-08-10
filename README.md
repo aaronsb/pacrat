@@ -44,7 +44,7 @@ them back upstream.
 
 ## Quickstart
 
-    pacrat setup --apply      # first-run questions, then the system steps —
+    pacrat setup              # first-run questions, then the system steps —
                               # every sudo command shown and confirmed, one y/n each
     pacrat add --all-installed
     pacrat vendor <pkg>       # review the PKGBUILD, take custody
@@ -58,6 +58,17 @@ machine's two working commands are `pacrat about` and `pacrat setup`, which
 is exactly the pair it needs. The interview at the top of `setup` writes
 `~/.config/pacrat/config.toml` for you; change it later with `pacrat config
 list / get / set` — the file stays hand-editable, but nothing requires it.
+
+At a terminal, `setup` guides: it asks the interview, does the steps your
+user can do, and shows each root-owned command before sudo runs it — answer
+n and the command is listed at the end to run later. Two alternatives:
+`sudo pacrat setup` runs the same system steps already elevated, still one
+confirmation each, and reads *your* config via SUDO_USER (the interview
+stays with your user — root never writes config.toml and never touches the
+store; every other verb refuses under root). And `pacrat setup --print`
+prints everything — the pacman.conf section, both guard files, the
+copy-paste commands — changing nothing, which is also what a headless run
+gets.
 
 `pacrat status`, `search`, `info`, `updates`, `hosts` and `sync` are
 read-only; `sync` prints the exact commands that would close the gap between

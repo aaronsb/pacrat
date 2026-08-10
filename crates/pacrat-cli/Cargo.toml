@@ -45,3 +45,7 @@ crossterm = "0.29"
 # machinery (features are additive, so this neither adds to nor subtracts
 # from what crossterm already turns on).
 signal-hook = { version = "0.3", default-features = false }
+# One call: geteuid(), for the root/user mode split (ADR-003's maintenance
+# -mode amendment). Already on the graph under crossterm and signal-hook,
+# so this adds nothing to the lock.
+libc = "0.2"

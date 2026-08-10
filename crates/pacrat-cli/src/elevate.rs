@@ -15,9 +15,10 @@
 //!    callers fall back to printing the commands, so a timer cannot elevate.
 //!
 //! Not everything that walks through here is sudo — `sync --run` brings its
-//! whole plan, `pacrat vendor` lines included — but everything pacrat has
-//! ever run as root came through here, which is the one-code-path answer
-//! ADR-003 asks for.
+//! whole plan, `pacrat vendor` lines included, and root maintenance mode
+//! (`sudo pacrat setup`) walks its bare, already-elevated commands through
+//! the same show-and-ask — but everything pacrat has ever run as root came
+//! through here, which is the one-code-path answer ADR-003 asks for.
 //!
 //! Tests cover the pure pieces — the printed line, the answer grammar, the
 //! closing report — and never spawn anything: a test that runs sudo is a
@@ -108,6 +109,15 @@ impl Session {
     pub fn open() -> Option<Self> {
         (io::stdin().is_terminal() && io::stdout().is_terminal())
             .then(|| Session { done: Vec::new() })
+    }
+
+    /// A session for a caller that has already established the terminal —
+    /// `setup`'s flow decision checks stdin and stdout once, picks a flow on
+    /// the strength of it, and must not have the answer change between the
+    /// decision and the session. Everything else — print, ask, run, report —
+    /// is the same flow rule 4 protects in [`Session::open`].
+    pub fn at_terminal() -> Self {
+        Session { done: Vec::new() }
     }
 
     /// Print, ask, run. The terminal was checked at [`Session::open`]; the
