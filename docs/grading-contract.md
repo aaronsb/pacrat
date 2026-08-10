@@ -62,8 +62,16 @@ quoting. A string containing `{package}`, `{tree}` or `{commit}` is a
 config error naming the environment convention, so the argv form's ceremony
 cannot be shipped into a string that would grep a literal brace. Everything
 downstream is identical for both forms — same timeout, same cache, same
-report checks, same aggregation — and a string cmd is printed as-is before
-it runs, because it *is* the invocation.
+report checks, same aggregation — and a string cmd is printed, as one
+neutered line, before it runs: it *is* the invocation, though a multi-line
+TOML string renders flattened rather than verbatim.
+
+One timeout caveat specific to the string form: pacrat kills the `sh` it
+spawned, but a pipeline's stages are that shell's children, and a stage
+that ignores its parent's death can outlive the timeout. For an
+LLM-backed one-liner that can mean a paid call continues after pacrat has
+already reported UNGRADED. Keep expensive work first in the pipe, or trap
+signals in the line itself.
 
 **stdout** carries exactly one JSON object: the report. Nothing else, ever —
 no progress lines, no banner, no trailing log. If your tool prints, redirect

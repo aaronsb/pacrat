@@ -307,9 +307,9 @@ fn modernize_question(config: &mut Config, i: usize, tty: bool) -> Result<(), St
         println!("grader  yay-friend is already registered — leaving it as it is.");
         return Ok(());
     };
-    println!("grader  yay-friend is registered in the argv form. Since ADR-004 the");
-    println!("        subject arrives as PACRAT_* environment variables, so one line");
-    println!("        is enough:");
+    println!("grader  yay-friend is registered in the argv form. The subject now");
+    println!("        arrives as PACRAT_* environment variables, so one line is");
+    println!("        enough:");
     println!("          cmd = \"{}\"", updated.cmd);
     if native && config.graders[i].scale.is_some() {
         println!("        (the native subcommand declares its own scale, so the pin");

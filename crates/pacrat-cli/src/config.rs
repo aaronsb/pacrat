@@ -270,7 +270,12 @@ fn toml_str(value: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            // DEL joins the controls: TOML requires it escaped in a basic
+            // string, and a renderer that let it through would write a file
+            // the load path refuses — bricking every later write.
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => {
+                out.push_str(&format!("\\u{:04X}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -364,6 +369,11 @@ mod tests {
                 "/bin/grader".into(),
                 "a \"quoted\" thing".into(),
                 "back\\slash".into(),
+                // DEL sits above the C0 range the escaper's `< 0x20` arm
+                // catches, and TOML requires it escaped too — unescaped it
+                // renders a file the load path refuses, bricking every
+                // later write.
+                "del\u{7F}ete".into(),
                 "{package}".into(),
             ]),
             timeout_s: 30,

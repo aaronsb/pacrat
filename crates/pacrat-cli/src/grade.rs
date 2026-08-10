@@ -354,10 +354,16 @@ pub fn grade_tree(
     let others = other_cached(&dir, commit, digest, &ctx.config.graders, package);
     let no_graders = ctx.config.graders.is_empty() && others.is_empty();
 
+    // Absolutized once, here, so `{tree}` and PACRAT_TREE carry the same
+    // value — which the contract promises — and so an argv-form grader
+    // under a relative DOTFILES_DIR is not handed a path it cannot resolve
+    // (the contract also says the working directory is not to be relied on).
+    let tree = std::path::absolute(tree).unwrap_or_else(|_| tree.to_path_buf());
+    let tree_str = tree.to_string_lossy().into_owned();
     let subj = Subj {
         package,
         commit,
-        tree: &tree.to_string_lossy(),
+        tree: &tree_str,
         digest,
         refresh,
     };
@@ -509,15 +515,12 @@ fn grade_with(grader: &Grader, dir: &Path, subj: &Subj) -> Outcome {
 
     // The subject, in the environment — both cmd forms get it (ADR-004).
     // Every value here is already validated: the package and commit were
-    // re-checked at `grade_tree`'s door, and the tree is pacrat's own path,
-    // made absolute because the contract promises an absolute one and a
-    // grader is free to chdir.
-    let tree = std::path::absolute(subj.tree)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| subj.tree.to_string());
+    // re-checked at `grade_tree`'s door, and the tree was absolutized there
+    // too — the same string the `{tree}` placeholder carries, which the
+    // contract promises.
     let env = [
         (ENV_PACKAGE, subj.package.to_string()),
-        (ENV_TREE, tree),
+        (ENV_TREE, subj.tree.to_string()),
         (ENV_COMMIT, subj.commit.to_string()),
     ];
 
