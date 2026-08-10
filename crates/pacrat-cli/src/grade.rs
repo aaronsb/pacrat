@@ -781,7 +781,9 @@ fn stderr_tail(stderr: &[u8]) -> String {
     if first.is_empty() {
         return String::new();
     }
-    format!(" — {}", truncate(&visible(first).0, 100))
+    // visible_line, not visible: this lands inside a single result line, so
+    // even the line separators visible() preserves (U+2028) must fold.
+    format!(" — {}", truncate(&visible_line(first).0, 100))
 }
 
 // ------------------------------------------------------------------ cache

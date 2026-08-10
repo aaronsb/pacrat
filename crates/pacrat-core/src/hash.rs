@@ -6,12 +6,22 @@
 //! SHA-256 sitting in the part of pacrat that decides what to trust would
 //! contradict the thesis however well it passed its vectors. RustCrypto's
 //! implementation is audited, is what the ecosystem already depends on, and
-//! keeps receiving fixes nobody here would have written. The five crates it
+//! keeps receiving fixes nobody here would have written. The ten crates it
 //! brings are the price of that, and it is worth paying.
 //!
 //! What *is* ours is the construction below: which bytes go into the hash,
 //! in what order, with what framing. That is a design decision no crate can
 //! make, so it is the thing this module tests.
+//!
+//! Threat-model boundary: this digest detects mutation of bytes pacrat
+//! hashed on both sides of the comparison — it computes the stored digest
+//! and the checked digest itself, so an attacker never supplies either
+//! half. It is NOT for verifying content against a digest that arrived
+//! from elsewhere (a forge release, a mirror, a message); the moment one
+//! side of the comparison is someone else's claim, that is a different
+//! problem with different requirements — signatures, pinned checksums —
+//! and this module is the wrong tool. `push` and `sync` will be tempted;
+//! this sentence is here to say no.
 
 use sha2::{Digest, Sha256};
 

@@ -75,7 +75,7 @@ use crate::vendor::valid_name;
 /// the failure mode `pacrat build x && sudo pacman -Sy x` would act on. The
 /// code cannot express "partly", so the tail of the output names what was
 /// served and what was held, and callers that care read those lines.
-const HELD: i32 = 10;
+use crate::HELD;
 
 /// makepkg's argv.
 ///
