@@ -49,3 +49,15 @@ signal-hook = { version = "0.3", default-features = false }
 # -mode amendment). Already on the graph under crossterm and signal-hook,
 # so this adds nothing to the lock.
 libc = "0.2"
+
+# The TUI scenario rig (ADR-005). Dev-dependencies only, on purpose:
+# scenarios run the real binary under a real pseudo-terminal, and nothing of
+# this ships in it.
+[dev-dependencies]
+# wezterm's pty layer: spawns, sizes and mid-scenario resizes the pty, so
+# SIGWINCH and the redraw path are exercised for real.
+portable-pty = "0.9.0"
+# The terminal state machine the rig asserts against: what it renders from
+# the byte stream is what a capable terminal renders, escapes and all —
+# which is exactly the seam no in-process TestBackend test can see.
+vt100 = "0.16.2"
