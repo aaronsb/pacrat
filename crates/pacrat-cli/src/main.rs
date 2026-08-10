@@ -5,6 +5,7 @@ mod ctx;
 mod hosts;
 mod live;
 mod out;
+mod setup;
 mod status;
 
 /// pacrat — store-backed package curation for Arch.
@@ -51,7 +52,12 @@ enum Command {
     /// Publish a maintained package to the AUR (queues while read-only)
     Push { package: String },
     /// Install the [dotfiles-aur] repo section and guard hooks
-    Setup,
+    Setup {
+        /// Do the steps that need no root (repo dir, empty db, staging the
+        /// root-owned files); the sudo commands are still only printed.
+        #[arg(long)]
+        apply: bool,
+    },
     /// The petit chef
     About,
 }
@@ -66,6 +72,7 @@ fn main() {
             ref packages,
             ref host,
         }) => add::run(&ctx, packages, host.as_deref()),
+        Some(Command::Setup { apply }) => setup::run(&ctx, apply),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {
