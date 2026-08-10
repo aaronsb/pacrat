@@ -1,0 +1,721 @@
+<title>pacrat — flow &amp; TUI mockup</title>
+<style>
+  :root {
+    --bg: #EFEDE8;
+    --surface: #F7F6F2;
+    --ink: #26221C;
+    --muted: #6E675C;
+    --line: #D8D3C9;
+    --accent: #A6572E;
+    --accent-ink: #8A4826;
+    --ok: #4C7A3D;
+    --warn: #A87817;
+    --bad: #B04A38;
+    --chip-bg: #E7E4DC;
+    /* terminal world — fixed, both themes */
+    --t-bg: #16130F;
+    --t-ink: #CDC7B8;
+    --t-dim: #837C6D;
+    --t-line: #3B362C;
+    --t-sel: #26221A;
+    --t-green: #93C471;
+    --t-amber: #D9A845;
+    --t-red: #DE6B58;
+    --t-blue: #7FA8C9;
+    --t-acc: #D08050;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Consolas, monospace;
+    --serif: Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1B1916;
+      --surface: #221F1B;
+      --ink: #E4DFD5;
+      --muted: #989183;
+      --line: #3A352E;
+      --accent: #D08050;
+      --accent-ink: #DE9668;
+      --ok: #8DBA71;
+      --warn: #D2A34E;
+      --bad: #D97B64;
+      --chip-bg: #2A2621;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #1B1916;
+    --surface: #221F1B;
+    --ink: #E4DFD5;
+    --muted: #989183;
+    --line: #3A352E;
+    --accent: #D08050;
+    --accent-ink: #DE9668;
+    --ok: #8DBA71;
+    --warn: #D2A34E;
+    --bad: #D97B64;
+    --chip-bg: #2A2621;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.6;
+    margin: 0;
+    padding: 3rem 1.25rem 5rem;
+  }
+  main { max-width: 62rem; margin: 0 auto; }
+  .prose { max-width: 68ch; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent-ink);
+  }
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(2rem, 5vw, 2.9rem);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin: 0.35rem 0 0.5rem;
+    text-wrap: balance;
+  }
+  h1 .dim { color: var(--muted); font-weight: 400; }
+  .lede { font-size: 1.12rem; color: var(--muted); max-width: 60ch; margin: 0; }
+
+  .suite {
+    display: flex; flex-wrap: wrap; gap: 0.5rem;
+    margin: 1.6rem 0 0; padding: 0; list-style: none;
+    font-family: var(--mono); font-size: 0.78rem;
+  }
+  .suite li {
+    background: var(--chip-bg);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 0.28rem 0.6rem;
+    color: var(--muted);
+  }
+  .suite li b { color: var(--ink); font-weight: 600; }
+
+  h2 {
+    font-family: var(--mono);
+    font-size: 1.25rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 0.8rem;
+    text-wrap: balance;
+  }
+  h2 .no { color: var(--accent); }
+  h3 {
+    font-family: var(--mono);
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 2.2rem 0 0.6rem;
+  }
+  section { margin-top: 4rem; }
+  section > p { max-width: 68ch; }
+  p + p { margin-top: 0.9rem; }
+
+  /* lifecycle chips */
+  .chain {
+    display: flex; flex-wrap: wrap; align-items: stretch;
+    gap: 0.55rem; margin: 1.4rem 0 0.4rem; padding: 0; list-style: none;
+  }
+  .chain li {
+    display: flex; flex-direction: column; gap: 0.2rem;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0.55rem 0.75rem;
+    max-width: 13.5rem;
+    position: relative;
+  }
+  .chain li.hot { border-color: var(--accent); }
+  .chain .st { font-family: var(--mono); font-size: 0.82rem; font-weight: 600; }
+  .chain .tr {
+    font-family: var(--mono); font-size: 0.68rem;
+    color: var(--accent-ink); letter-spacing: 0.05em;
+  }
+  .chain .why { font-size: 0.8rem; color: var(--muted); line-height: 1.45; }
+  .chain li:not(:last-child)::after {
+    content: "→";
+    position: absolute; right: -0.62rem; top: 0.5rem;
+    color: var(--muted); font-family: var(--mono); font-size: 0.8rem;
+  }
+  .aside-note {
+    font-size: 0.85rem; color: var(--muted);
+    border-left: 2px solid var(--accent);
+    padding-left: 0.8rem; max-width: 62ch;
+    margin: 1rem 0 0;
+  }
+
+  /* terminal blocks: .term = CLI output (CSS border), .term.frame = TUI screen (glyph borders) */
+  .term {
+    background: var(--t-bg);
+    border: 1px solid var(--t-line);
+    border-radius: 6px;
+    margin: 1.1rem 0 0.4rem;
+    overflow-x: auto;
+  }
+  .term.frame { border: none; }
+  .term pre {
+    margin: 0;
+    padding: 0.9rem 1.1rem 1rem;
+    font-family: var(--mono);
+    font-size: 12.8px;
+    line-height: 1.5;
+    color: var(--t-ink);
+    min-width: max-content;
+  }
+  .term .d  { color: var(--t-dim); }
+  .term .g  { color: var(--t-green); }
+  .term .y  { color: var(--t-amber); }
+  .term .r  { color: var(--t-red); }
+  .term .b  { color: var(--t-blue); }
+  .term .a  { color: var(--t-acc); }
+  .term .sel { background: var(--t-sel); color: var(--t-ink); display: inline-block; }
+  .term .tab { color: var(--t-acc); }
+  .caption {
+    font-size: 0.88rem; color: var(--muted);
+    max-width: 68ch; margin: 0.5rem 0 0;
+  }
+  .caption b { color: var(--ink); font-weight: 600; }
+
+  /* tables */
+  table {
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 1.2rem 0 0;
+    width: 100%;
+  }
+  .tablewrap { overflow-x: auto; }
+  th {
+    font-family: var(--mono); font-size: 0.7rem;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    text-align: left; color: var(--muted);
+    padding: 0.4rem 1.2rem 0.4rem 0;
+    border-bottom: 1px solid var(--line);
+    font-weight: 600;
+  }
+  td {
+    padding: 0.5rem 1.2rem 0.5rem 0;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  td code, .kbd {
+    font-family: var(--mono); font-size: 0.82em;
+    background: var(--chip-bg);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 0.08em 0.4em;
+    white-space: nowrap;
+  }
+
+  .paths {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+    gap: 0.7rem; margin-top: 1.3rem;
+  }
+  .paths div {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0.7rem 0.85rem;
+  }
+  .paths .k { font-family: var(--mono); font-size: 0.75rem; color: var(--accent-ink); display: block; }
+  .paths .v { font-size: 0.82rem; color: var(--muted); line-height: 1.5; }
+  .paths .v code { background: none; border: none; padding: 0; color: var(--ink); }
+
+  ol.open { max-width: 66ch; padding-left: 1.2rem; }
+  ol.open li { margin-bottom: 0.7rem; font-size: 0.95rem; }
+  ol.open b { font-family: var(--mono); font-size: 0.85em; }
+  ul.rules { max-width: 66ch; padding-left: 1.2rem; }
+  ul.rules li { margin-bottom: 0.55rem; font-size: 0.95rem; }
+
+  footer {
+    margin-top: 4.5rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--line);
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+  }
+  a { color: var(--accent-ink); }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<main>
+  <header class="prose">
+    <span class="eyebrow">design mockup · rev 3 · 2026-08-09</span>
+    <h1>pacrat <span class="dim">— flow &amp; screens</span></h1>
+    <p class="lede">A curation TUI for Arch packages: browse the repos and the AUR, vendor
+    what you trust into the dotfiles store, collect gradings from any configured analyzer,
+    and serve every machine from a repo you control — so <b>yay just works</b>.</p>
+    <ul class="suite">
+      <li><b>pacrat</b> manifest · vendored trees · gradings · decisions</li>
+      <li><b>yay-friend</b> one grader behind the contract</li>
+      <li><b>aurutils</b> fetch · build · local repo</li>
+      <li><b>dotfiles store</b> synced shared state</li>
+      <li><b>pacman/yay/update-arch</b> unchanged</li>
+    </ul>
+  </header>
+
+  <section>
+    <h2><span class="no">1</span> · The two loops</h2>
+    <p class="prose">Everything the UI does serves one of two loops. The <b>custody ladder</b> is
+    how a package moves into your control; the <b>update loop</b> is what happens, forever after,
+    to everything on the vendored rung and above.</p>
+
+    <h3>custody ladder</h3>
+    <ul class="chain">
+      <li>
+        <span class="st">unmanaged</span>
+        <span class="why">Installed on some host; invisible to the manifest. Browsable with full metadata like everything else.</span>
+      </li>
+      <li>
+        <span class="tr">adopt ·  A </span>
+        <span class="st">tracked</span>
+        <span class="why">In the manifest with host/profile membership. Still updates from its upstream repo; upstream drift is flagged.</span>
+      </li>
+      <li class="hot">
+        <span class="tr">vendor ·  v </span>
+        <span class="st">vendored</span>
+        <span class="why">PKGBUILD tree committed to the store at a reviewed commit. Built into <b>[dotfiles-aur]</b>; the AUR is no longer consulted by pacman/yay.</span>
+      </li>
+      <li>
+        <span class="tr">claim</span>
+        <span class="st">maintained</span>
+        <span class="why">Yours. Same as vendored, plus push rights back to the AUR.</span>
+      </li>
+    </ul>
+    <p class="aside-note">Moving down the ladder is always allowed (<i>drop</i> returns a package
+    to the rung below). Official-repo packages top out at <i>tracked</i> — vendoring is an
+    AUR-package concept.</p>
+
+    <h3>update loop <span style="color:var(--muted); font-weight:400">(vendored &amp; maintained)</span></h3>
+    <ul class="chain">
+      <li>
+        <span class="st">current</span>
+        <span class="why">Store tree == reviewed commit; built package served.</span>
+      </li>
+      <li>
+        <span class="tr">drift check</span>
+        <span class="st">drifted</span>
+        <span class="why">Upstream moved past the reviewed commit — an update available to adopt.</span>
+      </li>
+      <li>
+        <span class="tr">graders run</span>
+        <span class="st">graded</span>
+        <span class="why">Configured graders score the <em>candidate commit</em>; pacrat maps the grade to <b style="color:var(--ok)">PROCEED</b> / <b style="color:var(--warn)">WARN</b> / <b style="color:var(--bad)">BLOCK</b> with its own thresholds (§9).</span>
+      </li>
+      <li class="hot">
+        <span class="tr">decide gate</span>
+        <span class="st">adopted</span>
+        <span class="why">Auto, semi-auto, or manual (§8). BLOCK holds regardless of mode.</span>
+      </li>
+      <li>
+        <span class="tr">makepkg + repo-add</span>
+        <span class="st">served</span>
+        <span class="why">Built into [dotfiles-aur]; reviewed commit advances; every host picks it up on next <code>-Syu</code>.</span>
+      </li>
+    </ul>
+    <p class="aside-note">The verdict is <em>pacrat's</em> data: graders return numbers and
+    findings, pacrat owns thresholds, decisions, and history. A held package simply never gets a
+    new build — yay keeps serving the last approved version, no flag files, no pinning tricks.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">2</span> · Screen model</h2>
+    <p class="prose">One binary, two faces. Bare <code class="kbd">pacrat</code> opens whatever
+    <code class="kbd">default_ui</code> says in <code class="kbd">~/.config/pacrat/config.toml</code>;
+    any subcommand is always CLI. Six screens on number keys; every action a screen offers has a
+    CLI twin (§11).</p>
+    <div class="tablewrap"><table>
+      <tr><th>key</th><th>screen</th><th>question it answers</th></tr>
+      <tr><td><span class="kbd">1</span></td><td>overview</td><td>what needs my attention?</td></tr>
+      <tr><td><span class="kbd">2</span></td><td>browse</td><td>what exists, and what's our relationship to it?</td></tr>
+      <tr><td><span class="kbd">3</span></td><td>updates</td><td>what changed upstream, and what did the graders say?</td></tr>
+      <tr><td><span class="kbd">4</span></td><td>hosts</td><td>does each machine match the manifest?</td></tr>
+      <tr><td><span class="kbd">5</span></td><td>jobs</td><td>what is pacrat running right now, exactly?</td></tr>
+      <tr><td><span class="kbd">6</span></td><td>config</td><td>which gates are auto, and what's connected?</td></tr>
+    </table></div>
+    <p class="caption">Global keys: <span class="kbd">j/k</span> move · <span class="kbd">/</span> filter ·
+    <span class="kbd">enter</span> detail · <span class="kbd">?</span> help · <span class="kbd">q</span> back/quit.</p>
+    <p class="caption"><b>Scrolling and paging are first-class everywhere.</b> Every list and pane
+    scrolls independently: <span class="kbd">j/k</span> line, <span class="kbd">ctrl-d/ctrl-u</span>
+    half-page, <span class="kbd">ctrl-f/ctrl-b</span> (or PgUp/PgDn) full page,
+    <span class="kbd">g/G</span> top/bottom. <span class="kbd">tab</span> moves focus between a
+    screen's regions and the focused region is the one that scrolls, marked by an accent border.
+    Any region with overflow shows a scrollbar plus a <code class="kbd">12/214</code> position
+    indicator — with 200+ tracked packages and multi-hundred-line PKGBUILD diffs, no list is ever
+    assumed to fit. (ratatui's Scrollbar widget and list state make this cheap; the discipline is
+    designing every region as a viewport from day one.)</p>
+    <p class="caption"><span class="kbd">?</span> opens help; its <b>about</b> tab is where the
+    mascot lives:</p>
+    <div class="term frame" data-w="86"><pre>
+<span class="d">┌─</span> <span class="a">pacrat</span> <span class="d">── ? help ·</span> <span class="tab">about</span><span class="d">──────────────────────────────────────────────────────────┐</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>                   <span style="color:#f4ebdd">▄</span>                                                                <span class="d">│</span>
+<span class="d">│</span>              <span style="color:#f4ebdd">▄▄███████▄▄</span>                    <span class="a">pacrat 0.1.0</span>                           <span class="d">│</span>
+<span class="d">│</span>            <span style="color:#f4ebdd">███████████████</span>                  <span class="d">package curation for Arch</span>              <span class="d">│</span>
+<span class="d">│</span>           <span style="color:#f4ebdd">▀███████████████▀</span>                                                        <span class="d">│</span>
+<span class="d">│</span>         <span style="color:#8a90ae">▄██</span><span style="color:#f4ebdd;background:#8a90ae">▀▀</span><span style="color:#d9ccb9">███████████</span><span style="color:#f4ebdd;background:#8a90ae">▀▀</span><span style="color:#8a90ae">██▄</span>               store    ~/.dotfiles                   <span class="d">│</span>
+<span class="d">│</span>       <span style="color:#8a90ae">▄█</span><span style="color:#8a90ae;background:#e894a6">▀</span><span style="color:#e894a6">███</span><span style="color:#8a90ae;background:#e894a6">▀</span><span style="color:#d9ccb9;background:#8a90ae">▀▀▀▀▀▀▀▀▀▀▀</span><span style="color:#8a90ae;background:#e894a6">▀</span><span style="color:#e894a6">███</span><span style="color:#8a90ae;background:#e894a6">▀</span><span style="color:#8a90ae">█▄</span>             repo     [dotfiles-aur] · 12 pkgs      <span class="d">│</span>
+<span class="d">│</span>       <span style="color:#8a90ae">██</span><span style="color:#e894a6">████</span><span style="color:#8a90ae">██</span><span style="color:#ffffff;background:#1b1521">▀</span><span style="color:#1b1521">██</span><span style="color:#8a90ae">███</span><span style="color:#ffffff;background:#1b1521">▀</span><span style="color:#1b1521">██</span><span style="color:#8a90ae">██</span><span style="color:#e894a6">████</span><span style="color:#8a90ae">██</span>             grading  pacrat-grade/v1               <span class="d">│</span>
+<span class="d">│</span>        <span style="color:#8a90ae">▀█</span><span style="color:#e894a6;background:#8a90ae">▀▀▀</span><span style="color:#8a90ae">██</span><span style="color:#1b1521;background:#8a90ae">▀▀</span><span style="color:#1b1521;background:#cfc8dc">▀</span><span style="color:#8a90ae;background:#cfc8dc">▀▀▀</span><span style="color:#1b1521;background:#cfc8dc">▀</span><span style="color:#1b1521;background:#8a90ae">▀▀</span><span style="color:#8a90ae">██</span><span style="color:#e894a6;background:#8a90ae">▀▀▀</span><span style="color:#8a90ae">█▀</span> <span style="color:#e0aab4">█▄</span>                                                  <span class="d">│</span>
+<span class="d">│</span>        <span style="color:#6a6f8d">▄▄</span><span style="color:#8a90ae;background:#6a6f8d">▀▀▀</span><span style="color:#8a90ae">▀█</span><span style="color:#8a90ae;background:#cfc8dc">▀</span><span style="color:#cfc8dc">██</span><span style="color:#ef7f95;background:#cfc8dc">▀</span><span style="color:#ef7f95">█</span><span style="color:#ef7f95;background:#cfc8dc">▀</span><span style="color:#cfc8dc">██</span><span style="color:#8a90ae;background:#cfc8dc">▀</span><span style="color:#8a90ae">█▀</span><span style="color:#8a90ae;background:#6a6f8d">▀▀▀</span><span style="color:#6a6f8d">▄▄</span>  <span style="color:#e0aab4">▀█</span>          <span class="d">"N'importe qui peut cuisiner."</span>         <span class="d">│</span>
+<span class="d">│</span>         <span style="color:#6a6f8d">▀████▄</span><span style="color:#8a90ae">█</span><span style="color:#cfc8dc;background:#8a90ae">▀</span><span style="color:#cfc8dc">█</span><span style="color:#cfc8dc;background:#efc04a">▀▀▀</span><span style="color:#cfc8dc">█</span><span style="color:#cfc8dc;background:#8a90ae">▀</span><span style="color:#8a90ae">█</span><span style="color:#6a6f8d">▄████▀</span>    <span style="color:#e0aab4">█▄</span>                                                <span class="d">│</span>
+<span class="d">│</span>            <span style="color:#e3bcc5">▄▄</span><span style="color:#8a90ae;background:#e3bcc5">▀</span><span style="color:#8a90ae">█</span><span style="color:#8a90ae;background:#efc04a">▀</span><span style="color:#efc04a">██</span><span style="color:#b8871f;background:#efc04a">▀</span><span style="color:#efc04a">██</span><span style="color:#8a90ae;background:#efc04a">▀</span><span style="color:#8a90ae">█</span><span style="color:#8a90ae;background:#e3bcc5">▀</span><span style="color:#e3bcc5">▄▄</span>       <span style="color:#e0aab4">▄█</span>         <span class="d">little chef on duty:</span>                   <span class="d">│</span>
+<span class="d">│</span>            <span style="color:#e3bcc5">███</span><span style="color:#e3bcc5;background:#efc04a">▀</span><span style="color:#efc04a">██</span><span style="color:#b8871f;background:#efc04a">▀</span><span style="color:#efc04a">██</span><span style="color:#efc04a;background:#b8871f">▀</span><span style="color:#efc04a">█</span><span style="color:#e3bcc5;background:#efc04a">▀</span><span style="color:#e3bcc5">███</span>      <span style="color:#e0aab4">▄█</span>          yay-friend · provider claude           <span class="d">│</span>
+<span class="d">│</span>            <span style="color:#8a90ae">███</span><span style="color:#cfc8dc">█████████</span><span style="color:#8a90ae">███</span><span style="color:#e0aab4">▄▄▄▄███</span>                                                  <span class="d">│</span>
+<span class="d">│</span>            <span style="color:#8a90ae">▀█</span><span style="color:#cfc8dc;background:#8a90ae">▀</span><span style="color:#cfc8dc">█████████</span><span style="color:#cfc8dc;background:#8a90ae">▀</span><span style="color:#8a90ae">█</span><span style="color:#8a90ae;background:#e0aab4">▀</span><span style="color:#e0aab4">█▀▀▀▀</span>             <span class="d">MIT · github.com/aaronsb/pacrat</span>        <span class="d">│</span>
+<span class="d">│</span>              <span style="color:#8a90ae">▀</span><span style="color:#cfc8dc;background:#8a90ae">▀▀</span><span style="color:#cfc8dc">█████</span><span style="color:#cfc8dc;background:#8a90ae">▀▀</span><span style="color:#8a90ae">▀</span>                                                           <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">└─ esc close · tab keys/about</span><span class="d">────────────────────────────────────────────────────────┘</span>
+</pre></div>
+    <p class="caption"><b>The petit chef, at terminal resolution.</b> The 38×32 pixel grid renders
+    as half-block characters — two pixels per row, so he stands 16 rows tall and fits any
+    terminal. Truecolor where available, 256-color fallback, absent entirely when stdout isn't a
+    TTY or <code class="kbd">NO_COLOR</code> is set. <code class="kbd">--help</code> stays plain
+    text for scripts and screen readers; <code class="kbd">pacrat about</code> prints this in the
+    CLI. The grid ships in the repo as a const — same run-length trick as the HTML original.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">3</span> · Overview</h2>
+    <div class="term frame" data-w="86"><pre>
+<span class="d">┌─</span> <span class="a">pacrat</span> ── <span class="tab">[1]overview</span> <span class="d">[2]browse [3]updates [4]hosts [5]jobs [6]config</span><span class="d">─────────────┐</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>  store <span class="b">~/.dotfiles</span>                     aur ssh <span class="y">read-only</span> <span class="d">· publishes queued (2)</span>    <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>  tracked <span class="b">214</span>     vendored <span class="a">12</span>     maintained <span class="a">11</span>     unmanaged <span class="d">43</span>                    <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">attention</span><span class="d">─────────────────────────────────────────────────────────────────────────┤</span>
+<span class="d">│</span>   <span class="y">▲</span> 4 updates pending review                            <span class="d">→ [3] updates</span>              <span class="d">│</span>
+<span class="d">│</span>   <span class="r">■</span> 1 update held by grading                            <span class="d">→ [3] updates</span>              <span class="d">│</span>
+<span class="d">│</span>   <span class="b">●</span> 2 gradings running, 1 queued                        <span class="d">→ [5] jobs</span>                 <span class="d">│</span>
+<span class="d">│</span>   <span class="d">○</span> 43 installed packages not in the manifest           <span class="d">→ [4] hosts · adopt</span>        <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">hosts</span><span class="d">─────────────────────────────────────────────────────────────────────────────┤</span>
+<span class="d">│</span>   drift        cube <span class="g">✓ clean</span>   north <span class="y">3 missing</span>   padnoir <span class="y">1 extra</span>   slab <span class="g">✓ clean</span>     <span class="d">│</span>
+<span class="d">│</span>   last sync    today          2d ago            today             5d ago           <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">recent</span><span class="d">────────────────────────────────────────────────────────────────────────────┤</span>
+<span class="d">│</span>   14:02  graded <span class="b">mdcat</span> 2.11.0 · yay-friend               grade 0 → <span class="g">PROCEED</span>          <span class="d">│</span>
+<span class="d">│</span>   13:58  built <span class="b">coolercontrol</span> 4.3.2-1 → [dotfiles-aur]                              <span class="d">│</span>
+<span class="d">│</span>   13:41  vendored <span class="b">pacseek</span> @ 8c41f2e <span class="d">(reviewed)</span>                                     <span class="d">│</span>
+<span class="d">└─</span> <span class="d">? help · q quit</span><span class="d">───────────────────────────────────────────────────────────────────┘</span>
+</pre></div>
+    <p class="caption"><b>The landing screen is a triage list, not a dashboard of vanity numbers.</b>
+    Each attention line jumps to the screen that resolves it. The AUR's write-path status lives in
+    the header because it gates real work (publish queue, §7) — when ssh comes back, the
+    <span style="color:var(--warn)">read-only</span> badge flips and queued publishes offer to run.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">4</span> · Browse</h2>
+    <div class="term frame" data-w="86"><pre>
+<span class="d">┌─</span> <span class="a">pacrat</span> ── <span class="tab">[2]browse</span>                              <span class="d">source</span> all ▾    <span class="d">state</span> all ▾<span class="d">──────┐</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>  <span class="d">search:</span> pacseek<span class="a">▍</span>                                                                  <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>   <span class="d">name                     ver           source   state        grade</span>               <span class="d">│</span>
+<span class="d">│</span><span class="sel"> ▸ pacseek                  1.8.3-1       aur      unmanaged    <span class="d">ungraded</span>            </span><span class="d">│</span>
+<span class="d">│</span>   pacman-contrib           1.10.6-1      extra    tracked      <span class="d">n/a</span>                 <span class="d">│</span>
+<span class="d">│</span>   pacseek-bin              1.8.3-1       aur      unmanaged    <span class="d">ungraded</span>            <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="b">pacseek</span> <span class="d">· aur/moson-mo · votes 214 · updated 2026-07-30 @ 8c41f2e</span><span class="d">─────────────────┤</span>
+<span class="d">│</span>   A terminal user interface for searching and installing Arch Linux packages       <span class="d">│</span>
+<span class="d">│</span>   upstream <span class="b">github.com/moson-mo/pacseek</span> · PKGBUILD 64 lines · <span class="d">.SRCINFO ok</span>           <span class="d">│</span>
+<span class="d">│</span>   source pinned tarball · sha256 pinned · no install hooks                         <span class="d">│</span>
+<span class="d">│</span>   state <span class="d">unmanaged · not installed · grade — (a to grade now)</span>                       <span class="d">│</span>
+<span class="d">└─</span> <span class="a">v</span> <span class="d">vendor ·</span> <span class="a">t</span> <span class="d">track ·</span> <span class="a">a</span> <span class="d">grade ·</span> <span class="a">i</span> <span class="d">install ·</span> <span class="a">enter</span> <span class="d">full PKGBUILD ·</span> <span class="a">q</span> <span class="d">back</span><span class="d">───────────┘</span>
+</pre></div>
+    <p class="caption"><b>The detail pane is identical for every custody state.</b> An unmanaged
+    package gets the same description, upstream, PKGBUILD summary, and grade line as anything you
+    already manage — for a vendored one the state line reads
+    <code class="kbd">state vendored @ 3f9c21a · installed cube 2026-05-02, slab 2026-06-11 · grade 0 (yay-friend, 2h)</code>
+    — install dates read straight from each host's pacman local db.
+    Pressing <span class="kbd">v</span> starts the vendor flow: fetch tree → graders run async →
+    review PKGBUILD + findings → approve commits the tree to
+    <code class="kbd">aur/packages/pacseek/</code> and queues a build.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">5</span> · Updates — the centerpiece</h2>
+    <div class="term frame" data-w="86"><pre>
+<span class="d">┌─</span> <span class="a">pacrat</span> ── <span class="tab">[3]updates</span> <span class="d">──</span> 4 pending · <span class="r">1 held</span> · <span class="b">1 grading</span><span class="d">────────────────────────────┐</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>   <span class="d">package                  vendored → candidate     grade          age</span>             <span class="d">│</span>
+<span class="d">│</span><span class="sel"> ▸ mdcat                    2.10.1 → 2.11.0          <span class="g">● 0 PROCEED</span>    2h              </span><span class="d">│</span>
+<span class="d">│</span>   coolercontrol            4.3.1  → 4.3.2           <span class="g">● 0 PROCEED</span>    3h              <span class="d">│</span>
+<span class="d">│</span>   logseq-desktop-bin       0.10.15 → 0.10.16        <span class="y">▲ 2 WARN</span>       1d              <span class="d">│</span>
+<span class="d">│</span>   lug-helper               1:4.15 → 1:4.16          <span class="b">○ grading…</span>     —               <span class="d">│</span>
+<span class="d">│</span>   obsbot-camera-control    1.3.0  → 1.3.1           <span class="r">■ 4 BLOCK</span>      4d              <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">upstream · tracked, not yet vendored</span><span class="d">──────────────────────────────────────────────┤</span>
+<span class="d">│</span>   marktext-bin             0.19.1 → 0.19.2          <span class="d">aur</span>            <span class="a">v</span> <span class="d">vendor now</span>    <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="b">mdcat</span> <span class="d">· diff since reviewed 3f9c21a</span><span class="d">───────────────────────────────────────────────┤</span>
+<span class="d">│</span>   <span class="r">-pkgver=2.10.1</span>                        <span class="r">-sha256sums=('9d978d02…')</span>                  <span class="d">│</span>
+<span class="d">│</span>   <span class="g">+pkgver=2.11.0</span>                        <span class="g">+sha256sums=('41c00a8e…')</span>                  <span class="d">│</span>
+<span class="d">│</span>   <span class="d">2 files changed · enter full diff</span>                                                <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">grading · yay-friend @ 7d02e4c · grade 0 of 0–4 · verdict</span> <span class="g">PROCEED</span> <span class="d">(pacrat)</span><span class="d">────────┤</span>
+<span class="d">│</span>   <span class="g">✓</span> version bump only; source stays on github.com/swsnr/mdcat                      <span class="d">│</span>
+<span class="d">│</span>   <span class="g">✓</span> checksums updated and match the upstream tarball                               <span class="d">│</span>
+<span class="d">│</span>   <span class="d">$ yay-friend analyze mdcat --no-spinner --provider claude       cached · 41s</span>     <span class="d">│</span>
+<span class="d">└─</span> <span class="a">a</span> <span class="d">adopt+build ·</span> <span class="a">d</span> <span class="d">defer ·</span> <span class="a">x</span> <span class="d">reject ·</span> <span class="a">g</span> <span class="d">regrade ·</span> <span class="a">o</span> <span class="d">full report ·</span> <span class="a">q</span> <span class="d">back</span><span class="d">───────────┘</span>
+</pre></div>
+    <p class="caption"><b>Diff and grading share the screen</b> because that's the actual decision:
+    "what changed" beside "what the graders think of it" — with the exact grader invocation shown,
+    never hidden. The <b>upstream</b> region flags updates for tracked-but-not-vendored AUR
+    packages: they'd otherwise update outside your control, so pacrat surfaces them and offers
+    vendoring at the new version. Selecting the <span style="color:var(--bad)">BLOCK</span> row
+    shows why — e.g. <code class="kbd">post_install()</code> gained
+    <code class="kbd">curl … | sh</code>, the June-incident pattern — and offers no adopt key at
+    all: held updates can only be rejected, deferred, or escalated to the full report.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">6</span> · Hosts</h2>
+    <div class="term frame" data-w="86"><pre>
+<span class="d">┌─</span> <span class="a">pacrat</span> ── <span class="tab">[4]hosts</span> <span class="d">── manifest vs installed</span>                     <span class="d">filter</span> drift ▾<span class="d">────┐</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>   <span class="d">package                  cube    north   padnoir  slab     state</span>                 <span class="d">│</span>
+<span class="d">│</span>   claude-code              <span class="g">✓</span>       <span class="g">✓</span>       <span class="g">✓</span>        <span class="g">✓</span>        tracked               <span class="d">│</span>
+<span class="d">│</span>   coolercontrol            <span class="g">✓</span>       <span class="r">✗</span>       <span class="g">✓</span>        <span class="g">✓</span>        <span class="a">vendored</span>              <span class="d">│</span>
+<span class="d">│</span>   mdcat                    <span class="g">✓</span>       <span class="r">✗</span>       <span class="g">✓</span>        <span class="g">✓</span>        <span class="a">vendored</span>              <span class="d">│</span>
+<span class="d">│</span>   playtimed                <span class="g">✓</span>       <span class="r">✗</span>       <span class="d">—</span>        <span class="g">✓</span>        <span class="a">maintained</span>            <span class="d">│</span>
+<span class="d">│</span>   bosectl-qt               <span class="g">✓</span>       <span class="d">—</span>       <span class="d">—</span>        <span class="g">✓</span>        <span class="a">maintained</span>            <span class="d">│</span>
+<span class="d">│</span>   hexabyte                 <span class="y">+</span>       <span class="d">—</span>       <span class="d">—</span>        <span class="d">—</span>        <span class="d">unmanaged</span>             <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>   <span class="g">✓</span> <span class="d">installed</span>   <span class="r">✗</span> <span class="d">missing on host</span>   <span class="y">+</span> <span class="d">installed, unmanaged</span>   <span class="d">— not in profile</span>      <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="b">north</span> <span class="d">· 3 missing — coolercontrol, mdcat, playtimed</span><span class="d">───────────────────────────────┤</span>
+<span class="d">│</span>   <span class="a">s</span> <span class="d">sync north → pacman -S from [dotfiles-aur] over ssh, or print the command</span>      <span class="d">│</span>
+<span class="d">└─</span> <span class="a">s</span> <span class="d">sync host ·</span> <span class="a">A</span> <span class="d">adopt selection ·</span> <span class="a">space</span> <span class="d">select ·</span> <span class="a">r</span> <span class="d">drop ·</span> <span class="a">tab</span> <span class="d">next host</span><span class="d">───────────┘</span>
+</pre></div>
+    <p class="caption"><b>This screen is <code>pkg</code>'s n-way diff, promoted to a UI.</b>
+    The matrix is the lifted set math from dotfiles-core rendered live; <span class="kbd">A</span> on
+    a <span style="color:var(--warn)">+</span> row is the adopt flow (multi-select with
+    <span class="kbd">space</span> for burning down the 43-unmanaged backlog in batches).
+    Profile membership — which hosts a package <em>should</em> be on — is edited here too, not in
+    a config file.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">7</span> · Jobs</h2>
+    <div class="term frame" data-w="86"><pre>
+<span class="d">┌─</span> <span class="a">pacrat</span> ── <span class="tab">[5]jobs</span><span class="d">─────────────────────────────────────────────────────────────────┐</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">running</span><span class="d">───────────────────────────────────────────────────────────────────────────┤</span>
+<span class="d">│</span>   <span class="b">●</span> grade <span class="b">lug-helper</span> @ e91ab77                                          01:12      <span class="d">│</span>
+<span class="d">│</span>     <span class="d">$ yay-friend analyze lug-helper --no-spinner --provider claude</span>                 <span class="d">│</span>
+<span class="d">│</span>   <span class="b">●</span> build <span class="b">coolercontrol</span> 4.3.2-1                                         04:37      <span class="d">│</span>
+<span class="d">│</span>     <span class="d">$ aur build -d dotfiles-aur --chroot</span>                                           <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">queued</span><span class="d">────────────────────────────────────────────────────────────────────────────┤</span>
+<span class="d">│</span>   <span class="d">○ grade marktext-bin @ 55d0c1f</span>                                                   <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">done today</span><span class="d">────────────────────────────────────────────────────────────────────────┤</span>
+<span class="d">│</span>   <span class="g">✓</span> 14:02  grade <span class="b">mdcat</span> @ 7d02e4c · yay-friend            grade 0 · <span class="d">cached</span>          <span class="d">│</span>
+<span class="d">│</span>   <span class="g">✓</span> 13:58  repo-add <span class="b">coolercontrol</span> 4.3.2-1 → dotfiles-aur.db                        <span class="d">│</span>
+<span class="d">│</span>   <span class="g">✓</span> 13:41  vendor <span class="b">pacseek</span> @ 8c41f2e                                                <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">publish queue ·</span> <span class="y">blocked — aur ssh read-only</span><span class="d">───────────────────────────────────────┤</span>
+<span class="d">│</span>   <span class="y">»</span> <span class="b">clicue</span> 0.4.0-1         first publish                                           <span class="d">│</span>
+<span class="d">│</span>   <span class="y">»</span> <span class="b">bosectl-qt</span> 0.3.1-1     version bump                                            <span class="d">│</span>
+<span class="d">│</span>   <span class="d">probe hourly · last 18:40 "The AUR is down due to maintenance."</span>                  <span class="d">│</span>
+<span class="d">└─</span> <span class="a">enter</span> <span class="d">log ·</span> <span class="a">x</span> <span class="d">cancel ·</span> <span class="a">p</span> <span class="d">probe aur ·</span> <span class="a">R</span> <span class="d">retry publishes ·</span> <span class="a">q</span> <span class="d">back</span><span class="d">───────────────────┘</span>
+</pre></div>
+    <p class="caption"><b>Every external call is shown verbatim</b> — the grader command line, the
+    build command, the publish push. Nothing pacrat does through another tool is invisible; the
+    full log is one keypress away. The publish queue holds <code class="kbd">push</code> work while
+    the AUR write path is down, with an hourly probe and one-key retry.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">8</span> · Config — gates &amp; sources</h2>
+    <div class="term frame" data-w="86"><pre>
+<span class="d">┌─</span> <span class="a">pacrat</span> ── <span class="tab">[6]config</span> <span class="d">── gates and sources</span><span class="d">──────────────────────────────────────────┐</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>  <span class="d">flow preset:</span>   manual      <span class="a">‹ semi-auto ›</span>      auto                                <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>   ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐               <span class="d">│</span>
+<span class="d">│</span>   │ detect │───▶│ grade  │───▶│ <span class="a">decide</span> │───▶│ build  │───▶│ serve  │               <span class="d">│</span>
+<span class="d">│</span>   └────────┘    └────────┘    └────────┘    └────────┘    └────────┘               <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>   <span class="d">preset        grade gate     decide gate      build gate</span>                         <span class="d">│</span>
+<span class="d">│</span>   manual        verbose        manual           manual                             <span class="d">│</span>
+<span class="d">│</span>  <span class="a">›semi-auto</span>    auto           <span class="a">manual</span>           auto                                <span class="d">│</span>
+<span class="d">│</span>   auto          auto           auto             auto                               <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">│</span>   <span class="d">decide policy</span>   <span class="g">PROCEED</span> adopt · <span class="y">WARN</span> hold <span class="d">(ask in semi-auto)</span> · <span class="r">BLOCK</span> hold always <span class="d">│</span>
+<span class="d">│</span>   <span class="d">thresholds</span>      warn at grade 2 · block at grade 4          <span class="d">(pacrat.toml)</span>        <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">graders</span><span class="d">───────────────────────────────────────────────────────────────────────────┤</span>
+<span class="d">│</span>   yay-friend    contract pacrat-grade/v1 · provider claude            <span class="g">✓ ok</span>         <span class="d">│</span>
+<span class="d">│</span>   manual        pacrat grade PKG --grade N --note "…"                 <span class="d">always on</span>    <span class="d">│</span>
+<span class="d">│</span>                                                                                    <span class="d">│</span>
+<span class="d">├─</span> <span class="d">sources</span><span class="d">───────────────────────────────────────────────────────────────────────────┤</span>
+<span class="d">│</span>   aur rpc       <span class="g">✓ ok · 41ms</span>          aur ssh      <span class="y">read-only · probe hourly</span>         <span class="d">│</span>
+<span class="d">│</span>   local repo    [dotfiles-aur] · file:///var/cache/pacrat/repo · <span class="b">12 pkgs</span>           <span class="d">│</span>
+<span class="d">│</span>   guards        pacman guard hook <span class="g">✓ installed</span> · yay config <span class="g">✓ managed</span>               <span class="d">│</span>
+<span class="d">│</span>   store         <span class="b">~/.dotfiles</span> · clean · last sync 14:02                              <span class="d">│</span>
+<span class="d">└─</span> <span class="a">←/→</span> <span class="d">preset ·</span> <span class="a">enter</span> <span class="d">edit gate ·</span> <span class="a">q</span> <span class="d">back</span><span class="d">─────────────────────────────────────────────┘</span>
+</pre></div>
+    <p class="caption"><b>The pipeline is drawn, and the preset selects gate modes.</b>
+    Each gate is <i>auto</i> (proceed silently), <i>verbose</i> (proceed, narrating), or
+    <i>manual</i> (stop and ask). Presets are just bundles — <span class="kbd">enter</span> on a
+    gate overrides it individually. Two invariants no preset can change:
+    <span style="color:var(--bad)">BLOCK</span> always holds, and every grader/build call is
+    logged in jobs. The sources region is the connection status for everything pacrat talks to.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">9</span> · The grading contract</h2>
+    <p class="prose">PROCEED/WARN/BLOCK is <b>pacrat's</b> data. Graders — yay-friend, some future
+    tool, or you by hand — only return a number and findings, through one convention:
+    <code class="kbd">pacrat-grade/v1</code>. pacrat invokes each configured grader with the
+    candidate tree and commit, and expects contract JSON on stdout:</p>
+    <div class="term"><pre>
+<span class="d">$</span> yay-friend analyze mdcat <span class="d">--format pacrat --commit 7d02e4c</span>
+{
+  <span class="b">"contract"</span>: "pacrat-grade/v1",
+  <span class="b">"grader"</span>:   "yay-friend",
+  <span class="b">"subject"</span>:  { "package": "mdcat", "commit": "7d02e4c", "version": "2.11.0-1" },
+  <span class="b">"grade"</span>:    0,
+  <span class="b">"scale"</span>:    { "min": 0, "max": 4 },
+  <span class="b">"findings"</span>: [
+    { "level": 0, "title": "version bump only", "span": "PKGBUILD:3" }
+  ],
+  <span class="b">"meta"</span>:     { "provider": "claude", "duration_s": 41, "cached": true }
+}
+</pre></div>
+    <ul class="rules">
+      <li><b>pacrat owns the verdict.</b> Grade → PROCEED/WARN/BLOCK happens in pacrat via its
+      thresholds, never in the grader. Changing your risk posture is a config edit, not a grader
+      release.</li>
+      <li><b>Cache key is (grader, package, commit).</b> A grading is valid for exactly one
+      candidate commit; if upstream moves again, pacrat re-dispatches instead of reusing.
+      yay-friend already caches by commit hash, so it's naturally idempotent — the adapter is
+      thin: an output format, not a redesign.</li>
+      <li><b>Failure is ungraded, and ungraded is not PROCEED.</b> A grader that exits non-zero,
+      times out, or emits invalid JSON leaves the package ungraded; in auto mode ungraded holds,
+      same as WARN.</li>
+      <li><b>Manual grading is a first-class grader.</b>
+      <code class="kbd">pacrat grade mdcat --grade 0 --note "read it myself"</code> records a
+      human verdict for that commit, alongside — not instead of — tool gradings.</li>
+      <li><b>Multiple graders: worst grade wins</b> (proposed — open question 5).</li>
+      <li><b>Every invocation is visible</b> in jobs, argv verbatim, with duration and
+      cached/fresh status.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2><span class="no">10</span> · One-shot mode &amp; guard rails</h2>
+    <p class="prose">The whole update loop runs headless as a single command — detect everything,
+    grade everything, decide by policy, build what passed. This is the same engine as screen [3],
+    with every gate on auto; run it from a timer and the repo is always current before any
+    <code class="kbd">-Syu</code>:</p>
+    <div class="term"><pre>
+<span class="d">$</span> pacrat update --mode auto
+<span class="d">detect</span>   5 upstream updates <span class="d">(4 vendored · 1 tracked)</span>
+<span class="d">grade</span>    yay-friend: 4 cached · 1 fresh <span class="d">(lug-helper @ e91ab77 · 38s)</span>
+<span class="d">decide</span>   4 adopt · <span class="r">1 hold</span>
+  <span class="r">hold</span>   obsbot-camera-control 1.3.1   grade 4 → <span class="r">BLOCK</span>  <span class="d">(post_install curl|sh)</span>
+<span class="d">build</span>    4 built → [dotfiles-aur] · repo db updated
+<span class="d">exit</span>     <span class="y">10</span> <span class="d">(holds present — pacrat updates to review · --format json for machines)</span>
+</pre></div>
+    <p class="prose">Nothing else on the system needs to know pacrat exists.
+    <code class="kbd">update-arch</code>, <code class="kbd">yay -Syu</code>, plain pacman — all
+    unchanged: vendored packages resolve from <code class="kbd">[dotfiles-aur]</code>, and a held
+    package simply has no new build, so hosts keep the last approved version with zero pinning.
+    What pacrat <em>does</em> own are the <b>guard rails</b> — the pacman hook and yay config it
+    deploys (config screen, §8) so a brain-fart can't bypass the managed repo:</p>
+    <div class="term"><pre>
+<span class="d">$</span> yay -S some-shiny-aur-thing
+<span class="r">:: pacrat guard</span> — some-shiny-aur-thing would install from the AUR directly,
+   bypassing [dotfiles-aur]. Bring it through curation instead:
+     <span class="a">pacrat vendor some-shiny-aur-thing</span>
+   <span class="d">override once: PACRAT_BYPASS=1 yay -S some-shiny-aur-thing (logged)</span>
+<span class="r">error: failed to commit transaction</span>
+</pre></div>
+    <p class="caption">Mechanism: a PreTransaction pacman hook (deployed by
+    <code class="kbd">pacrat setup</code>) aborts installs of foreign packages that didn't come
+    through pacrat — pacrat's own builds set an env marker the hook recognizes. yay stays fully
+    usable for everything sanctioned; the only path it can't take is the one around the curation
+    flow, and even that has a logged, deliberate escape hatch.</p>
+  </section>
+
+  <section>
+    <h2><span class="no">11</span> · CLI parity</h2>
+    <p class="prose">Every screen action is a verb; scripts and timers get the same engine the TUI
+    drives. This table is the contract.</p>
+    <div class="tablewrap"><table>
+      <tr><th>screen / action</th><th>command</th></tr>
+      <tr><td>overview</td><td><code>pacrat status</code></td></tr>
+      <tr><td>browse / search</td><td><code>pacrat search &lt;term&gt;</code> · <code>pacrat info &lt;pkg&gt;</code></td></tr>
+      <tr><td>adopt into manifest</td><td><code>pacrat add &lt;pkg&gt; [--host H] [--profile P]</code></td></tr>
+      <tr><td>vendor an AUR package</td><td><code>pacrat vendor &lt;pkg&gt;</code></td></tr>
+      <tr><td>one-shot update loop</td><td><code>pacrat update --mode auto|semi|manual [--format json]</code></td></tr>
+      <tr><td>list / review pending</td><td><code>pacrat updates</code> · <code>pacrat review &lt;pkg&gt;</code> · <code>pacrat adopt-update &lt;pkg&gt;</code> · <code>pacrat reject &lt;pkg&gt;</code></td></tr>
+      <tr><td>grade (tools or manual)</td><td><code>pacrat grade &lt;pkg&gt; [--grade N --note S]</code></td></tr>
+      <tr><td>build into local repo</td><td><code>pacrat build [pkg…]</code></td></tr>
+      <tr><td>host reconcile</td><td><code>pacrat hosts</code> · <code>pacrat sync [host]</code></td></tr>
+      <tr><td>publish to AUR</td><td><code>pacrat push &lt;pkg&gt;</code> <span style="color:var(--muted)">(queues while read-only)</span></td></tr>
+      <tr><td>gates &amp; sources</td><td><code>pacrat config [get|set]</code> · <code>pacrat setup</code> <span style="color:var(--muted)">(repo section + guard hooks)</span></td></tr>
+    </table></div>
+  </section>
+
+  <section>
+    <h2><span class="no">12</span> · Where things live</h2>
+    <div class="paths">
+      <div><span class="k">shared · dotfiles store</span>
+        <span class="v"><code>aur/packages/&lt;name&gt;/</code> pristine trees<br>
+        <code>aur/sources.toml</code> upstream url · reviewed commit · role · grades adopted<br>
+        <code>packages/&lt;host&gt;/</code> manifest lists (lifted from <code>pkg</code>)</span></div>
+      <div><span class="k">host preference · XDG config</span>
+        <span class="v"><code>~/.config/pacrat/config.toml</code><br>
+        default_ui · gate presets · thresholds · graders · repo path<br>
+        <em>itself deployable as a dotfiles entry</em></span></div>
+      <div><span class="k">host state · XDG state</span>
+        <span class="v"><code>$XDG_STATE_HOME/pacrat/</code><br>
+        job queue · publish queue · probe history</span></div>
+      <div><span class="k">grader caches · per grader</span>
+        <span class="v">e.g. <code>~/.local/share/yay-friend/cache/&lt;pkg&gt;/&lt;commit&gt;.json</code><br>
+        joined to pacrat by (grader, package, commit)</span></div>
+      <div><span class="k">served · local pacman repo</span>
+        <span class="v"><code>[dotfiles-aur]</code> in pacman.conf<br>
+        <code>/var/cache/pacrat/repo</code> · built packages + repo db · never in git</span></div>
+      <div><span class="k">guards · system</span>
+        <span class="v"><code>/etc/pacman.d/hooks/pacrat-guard.hook</code><br>
+        yay config kept repo-first · deployed and verified by <code>pacrat setup</code></span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="no">13</span> · Open questions for ADR-001</h2>
+    <ol class="open">
+      <li><b>Bulk adopt ergonomics.</b> 43 unmanaged packages won't be adopted one at a time.
+      Multi-select in hosts is the sketch; is there also an "adopt everything currently installed,
+      then prune" first-run mode?</li>
+      <li><b>Block override policy.</b> No UI path approves a BLOCK. Should a CLI-only escape
+      hatch exist (<code class="kbd">pacrat adopt-update --override-block --reason "…"</code>,
+      recorded in sources.toml), or is rejection + manual vendoring the only path?</li>
+      <li><b>Jobs runtime.</b> One-shot mode covers timers and update-arch; inside the TUI, do
+      jobs run only while pacrat is open, or does a user service own the queue?</li>
+      <li><b>Sync transport.</b> Hosts screen shows remote sync over ssh — or does each host only
+      ever sync itself, with the matrix as read-only awareness for the others?</li>
+      <li><b>Multi-grader aggregation.</b> Worst-grade-wins is the proposal; do graders ever get
+      weights or veto scopes (e.g. manual overrides tools)?</li>
+    </ol>
+  </section>
+
+  <footer>pacrat · design mockup rev 3 · store-backed package curation · the pun was load-bearing</footer>
+</main>

@@ -1,0 +1,9 @@
+[package]
+name = "pacrat-core"
+description = "Pure model for pacrat: custody states, grading verdicts, manifest set math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>petit chef — a monospace rat</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;500;800&display=swap" rel="stylesheet">
+<style>
+  :root{
+    /* Paris-kitchen-at-night palette */
+    --ink:      #17121e;
+    --ink-2:    #1f1828;
+    --ink-3:    #2a2035;
+    --cream:    #f4ebdd;
+    --cream-dim:#a89b8c;
+    --copper:   #c8783c;
+    --cheese:   #efc04a;
+
+    /* rat palette (keys match the art grid below) */
+    --c-w: #f4ebdd;  /* toque            */
+    --c-W: #d9ccb9;  /* toque band       */
+    --c-f: #8a90ae;  /* fur              */
+    --c-l: #cfc8dc;  /* belly + muzzle   */
+    --c-p: #e894a6;  /* inner ear        */
+    --c-P: #e3bcc5;  /* paws             */
+    --c-e: #1b1521;  /* eye              */
+    --c-h: #ffffff;  /* eye shine        */
+    --c-n: #ef7f95;  /* nose             */
+    --c-k: #6a6f8d;  /* whiskers         */
+    --c-c: #efc04a;  /* cheese           */
+    --c-K: #b8871f;  /* cheese holes     */
+    --c-t: #e0aab4;  /* tail             */
+
+    --cell: clamp(7px, 2.1vw, 13px);
+    --mono: "JetBrainsMono Nerd Font", "JetBrainsMono NF", "FiraCode Nerd Font",
+            "Hack Nerd Font", "Symbols Nerd Font", "JetBrains Mono",
+            ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+
+  *{ box-sizing:border-box; }
+
+  body{
+    margin:0;
+    min-height:100dvh;
+    display:grid;
+    place-items:center;
+    padding:clamp(16px,4vw,48px);
+    font-family:var(--mono);
+    color:var(--cream);
+    background:
+      radial-gradient(120% 90% at 50% 0%, #2a2035 0%, var(--ink) 62%),
+      var(--ink);
+  }
+
+  .ticket{
+    width:min(560px,100%);
+    background:linear-gradient(180deg,var(--ink-2),var(--ink));
+    border:1px solid #3a2e47;
+    border-radius:4px;
+    box-shadow:0 30px 70px -30px #000, inset 0 1px 0 #4a3b58;
+    padding:clamp(20px,4vw,34px);
+  }
+
+  /* --- header, set like a kitchen order ticket --- */
+  .eyebrow{
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-size:11px; font-weight:500; letter-spacing:.22em;
+    text-transform:uppercase; color:var(--cream-dim);
+  }
+  .eyebrow b{ color:var(--copper); font-weight:800; }
+
+  h1{
+    margin:.5em 0 0;
+    font-size:clamp(26px,7vw,40px);
+    font-weight:800;
+    letter-spacing:.12em;
+    line-height:1;
+  }
+  .sub{
+    margin:.7em 0 0;
+    font-size:13px; font-weight:300; font-style:italic;
+    color:var(--cream-dim);
+  }
+
+  .rule{
+    margin:22px 0;
+    border:0; border-top:1px dashed #4a3b58;
+  }
+
+  /* --- the rat --- */
+  .stage{
+    display:grid; place-items:center;
+    padding:clamp(10px,3vw,22px) 0;
+    background:
+      radial-gradient(60% 70% at 50% 45%, rgba(200,120,60,.13), transparent 70%);
+  }
+  pre.rat{
+    margin:0;
+    font-family:var(--mono);
+    font-size:var(--cell);
+    line-height:.6;              /* squares up the block cells */
+    letter-spacing:0;
+    white-space:pre;
+    -webkit-font-smoothing:none;
+    text-rendering:optimizeSpeed;
+  }
+  .t{ color:transparent; }
+  .w{color:var(--c-w)} .W{color:var(--c-W)} .f{color:var(--c-f)}
+  .l{color:var(--c-l)} .p{color:var(--c-p)} .P{color:var(--c-P)}
+  .e{color:var(--c-e)} .h{color:var(--c-h)} .n{color:var(--c-n)}
+  .k{color:var(--c-k)} .c{color:var(--c-c)} .K{color:var(--c-K)}
+  .tl{color:var(--c-t)}
+
+  /* --- footer --- */
+  .foot{
+    display:flex; flex-wrap:wrap; gap:14px;
+    justify-content:space-between; align-items:center;
+    font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--cream-dim);
+  }
+  button{
+    font:inherit; font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--cream); background:transparent;
+    border:1px solid #4a3b58; border-radius:3px;
+    padding:8px 14px; cursor:pointer;
+  }
+  button:hover{ border-color:var(--copper); color:var(--cheese); }
+  button:focus-visible{ outline:2px solid var(--cheese); outline-offset:2px; }
+</style>
+</head>
+<body>
+  <main class="ticket">
+    <div class="eyebrow"><span>Table 01 &middot; Gusteau's</span><b>&#9679; ready</b></div>
+    <h1>PETIT CHEF</h1>
+    <p class="sub">"N'importe qui peut cuisiner." &mdash; drawn entirely in block characters.</p>
+
+    <hr class="rule">
+
+    <div class="stage">
+      <pre class="rat" id="rat" aria-label="Pixel drawing of a rat in a chef's hat holding a wedge of cheese"></pre>
+    </div>
+
+    <hr class="rule">
+
+    <div class="foot">
+      <span>38 &times; 32 cells &middot; 13 colors</span>
+      <button id="copy" type="button">Copy as text</button>
+    </div>
+  </main>
+
+<script>
+/* Each character is one pixel. Edit this grid to redraw him.
+   . transparent   w toque   W hat band   f fur   l belly/muzzle
+   p inner ear     P paws    e eye        h shine n nose
+   k whiskers      c cheese  K cheese hole  t tail                */
+const ART = `......................................
+......................................
+......................................
+................w.....................
+.............wwwwwww..................
+...........wwwwwwwwwww................
+.........wwwwwwwwwwwwwww..............
+.........wwwwwwwwwwwwwww..............
+........wwwwwwwwwwwwwwwww.............
+.........wwwwwwwwwwwwwww..............
+.......ffwwWWWWWWWWWWWwwff............
+......fffffWWWWWWWWWWWfffff...........
+.....ffpppfWWWWWWWWWWWfpppff..........
+....ffpppppfffffffffffpppppff.........
+....ffppppffheefffheeffppppff.........
+....ffppppffeeefffeeeffppppff.........
+.....ffpppffeeefffeeeffpppff.t........
+......fffffffflllllffffffff..tt.......
+.......ffffffllnnnllffffff....tt......
+.....kkkkk.fllllnllllf.kkkkk...t......
+......kkkkk.flllllllf.kkkkk....t......
+.......kkkkkfflccclffkkkkk.....tt.....
+...........fffccKccfff..........t.....
+.........PPPfcccccccfPPP.......tt.....
+.........PPPPccKccccPPPP.......t......
+.........PPPccccccKccPPP......tt......
+.........ffflllllllllfff....ttt.......
+.........ffflllllllllfffttttttt.......
+.........fflllllllllllffttttt.........
+..........fflllllllllfftt.............
+...........flllllllllf................
+............fflllllff.................`;
+
+const CLASS = { t: "tl" };            // 't' would collide with .t (transparent)
+const BLOCK = "\u2588";
+
+const grid = ART.split("\n");
+let html = "";
+for (const row of grid) {
+  let i = 0;
+  while (i < row.length) {
+    const ch = row[i];
+    let j = i;
+    while (j < row.length && row[j] === ch) j++;
+    const run = BLOCK.repeat(j - i);
+    html += ch === "."
+      ? '<span class="t">' + run + '</span>'
+      : '<span class="' + (CLASS[ch] || ch) + '">' + run + '</span>';
+    i = j;
+  }
+  html += "\n";
+}
+document.getElementById("rat").innerHTML = html;
+
+document.getElementById("copy").addEventListener("click", async (e) => {
+  const plain = grid.map(r => r.replace(/[^.]/g, BLOCK).replace(/\./g, " ").replace(/\s+$/, "")).join("\n");
+  try {
+    await navigator.clipboard.writeText(plain);
+    e.target.textContent = "Copied";
+    setTimeout(() => (e.target.textContent = "Copy as text"), 1600);
+  } catch {
+    e.target.textContent = "Copy failed";
+  }
+});
+</script>
+</body>
+</html>

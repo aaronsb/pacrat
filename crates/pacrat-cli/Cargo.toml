@@ -1,0 +1,15 @@
+[package]
+name = "pacrat-cli"
+description = "pacrat — store-backed package curation for Arch (CLI + TUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pacrat"
+path = "src/main.rs"
+
+[dependencies]
+pacrat-core = { path = "../pacrat-core" }
+clap = { version = "4", features = ["derive"] }
