@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod add;
 mod ctx;
 mod hosts;
 mod live;
@@ -24,8 +25,13 @@ enum Command {
     Status,
     /// Search official repos and the AUR (with custody state)
     Search { term: String },
-    /// Adopt a package into the manifest
-    Add { package: String },
+    /// Adopt installed packages into the manifest (unmanaged → tracked)
+    Add {
+        packages: Vec<String>,
+        /// Host list to write (default: this host)
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Vendor an AUR package's tree into the store (fetch → grade → review)
     Vendor { package: String },
     /// One-shot update loop: detect → grade → decide → build
@@ -56,6 +62,9 @@ fn main() {
         // Bare `pacrat`: the TUI once it exists; the overview meanwhile.
         None | Some(Command::Status) => status::run(&ctx),
         Some(Command::Hosts) => hosts::run(&ctx),
+        Some(Command::Add { ref packages, ref host }) => {
+            add::run(&ctx, packages, host.as_deref())
+        }
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {
