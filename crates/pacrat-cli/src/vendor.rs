@@ -22,7 +22,6 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::ValueEnum;
@@ -31,6 +30,7 @@ use pacrat_core::sources::{Role, SourceEntry, Sources};
 
 use crate::ctx::Ctx;
 use crate::fstree;
+use crate::git::{self, Git};
 use crate::out::{list_preview, short_hash, visible};
 
 /// The ledger `Role` as a CLI flag; core owns the model, clap owns the words.
@@ -143,14 +143,9 @@ pub fn run(
         ));
     }
     let upstream = match upstream {
-        // A URL that looks like a flag would be one, to git.
-        Some(u) if u.starts_with('-') => {
-            return Err(format!(
-                "{u:?} is not a URL — upstreams cannot begin with '-'"
-            ))
-        }
         Some("") => return Err("--upstream is empty".into()),
-        Some(u) => u.to_string(),
+        // A URL that looks like a flag would be one, to git.
+        Some(u) => git::url_arg(u)?.to_string(),
         None => format!("https://aur.archlinux.org/{package}.git"),
     };
 
@@ -202,12 +197,14 @@ fn execute(ctx: &Ctx, plan: &Plan) -> Result<Outcome, String> {
     println!("package   {}", plan.package);
     println!("upstream  {}", plan.upstream);
     // `--` so that an upstream cannot be read as a git option.
-    git([
+    Git::new([
         OsStr::new("clone"),
         OsStr::new("--"),
         OsStr::new(&plan.upstream),
         plan.clone.as_os_str(),
-    ])?;
+    ])
+    .timeout(git::TRANSFER)
+    .text()?;
 
     // Validates as it walks: symlinks, odd file types and unprintable names
     // are refused here rather than surprising us at copy time.
@@ -229,12 +226,13 @@ fn execute(ctx: &Ctx, plan: &Plan) -> Result<Outcome, String> {
         });
     }
 
-    let commit = git([
+    let commit = Git::new([
         OsStr::new("-C"),
         plan.clone.as_os_str(),
         OsStr::new("rev-parse"),
         OsStr::new("HEAD"),
-    ])?;
+    ])
+    .text()?;
     println!("commit    {commit}");
     println!("files     {}", list_preview(&files, 12));
 
@@ -423,37 +421,6 @@ pub fn scratch_dir(verb: &str, package: &str) -> Result<PathBuf, String> {
         .create(&dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
-}
-
-/// Run git, showing the argv first — every external call pacrat makes is
-/// visible, and that rule has no exceptions for the quiet ones (ADR-001).
-/// Returns trimmed stdout; a non-zero exit is an error carrying stderr.
-///
-/// Unbounded: `Command::output` waits as long as the child cares to run.
-/// That is right for the local calls — a `rev-parse` in a clone we already
-/// have answers or fails at once — and is a known gap for the clone above,
-/// which reaches the network and would sit forever on a remote that accepts
-/// the connection and then says nothing. New calls that talk to a remote
-/// should go through [`crate::proc`] instead, where "never answers" is a
-/// reportable outcome (`review` does).
-pub fn git<const N: usize>(argv: [&OsStr; N]) -> Result<String, String> {
-    let shown = argv
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
-    println!("run       git {shown}");
-    let out = Command::new("git")
-        .args(argv)
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git {shown} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// A store path as the user thinks of it: relative to the store root.

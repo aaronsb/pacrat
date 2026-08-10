@@ -45,8 +45,6 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
 
 use pacrat_core::grading::commit_matches;
 use pacrat_core::pkg::valid_name;
@@ -55,22 +53,13 @@ use pacrat_core::Verdict;
 
 use crate::ctx::Ctx;
 use crate::fstree;
+use crate::git::{self, Git};
 use crate::grade;
-use crate::out::{list_preview, shell_quote, short_hash, truncate, visible, visible_line};
+use crate::out::{list_preview, short_hash, truncate, visible, visible_line};
 use crate::proc;
 use crate::updates;
 use crate::vendor;
 use crate::HELD;
-
-/// Wall-clock bound on the candidate clone. Longer than `updates`' probe,
-/// because this one transfers a repository rather than asking one question,
-/// and short enough that a remote which accepts the connection and then goes
-/// quiet does not become a terminal a human is stuck in.
-const CLONE_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Wall-clock bound on the diff. Local work, but over a tree the upstream
-/// chose the size of.
-const DIFF_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Diff lines printed before the rest is left to the reader's own tools. A
 /// review that scrolls a terminal's whole scrollback away has hidden the
@@ -346,7 +335,7 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
     }
 
     preamble(package, &curated);
-    let candidate = updates::ls_remote(&curated.entry.upstream, |line| println!("{line}"))?;
+    let candidate = updates::ls_remote(&curated.entry.upstream, git::Trace::Stdout)?;
     // An error (exit 1), where the same shape of nothing-to-do is exit 0 in
     // `adopt-update`. The asymmetry is real, not an oversight: adopt is
     // convergent — asked to make the store hold HEAD, and it already does,
@@ -395,9 +384,13 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
 // ------------------------------------------------------------ the package
 
 /// A package these verbs can work on: in the ledger, with a tree.
-struct Curated {
-    entry: SourceEntry,
-    tree: PathBuf,
+///
+/// Shared with `push`, which needs exactly the same four-state answer — and
+/// must give it in the same words, since "not vendored" and "tree but no
+/// ledger entry" are the same two problems whichever verb ran into them.
+pub struct Curated {
+    pub entry: SourceEntry,
+    pub tree: PathBuf,
 }
 
 /// Resolve the package, or say which of the four states it is in instead.
@@ -406,7 +399,7 @@ struct Curated {
 /// seen from the other side — vendoring refuses the one thing reviewing
 /// requires — and describing them twice, differently, would leave a reader
 /// wondering whether they are the same problem.
-fn curated(ctx: &Ctx, package: &str) -> Result<Curated, String> {
+pub fn curated(ctx: &Ctx, package: &str) -> Result<Curated, String> {
     if !valid_name(package) {
         return Err(format!(
             "{package:?} is not a package name — expected letters, digits, \
@@ -477,12 +470,13 @@ fn stage(scratch: &Path, entry: &SourceEntry, store_tree: &Path) -> Result<Candi
             safe(&entry.upstream)
         ));
     }
-    let commit = vendor::git([
+    let commit = Git::new([
         OsStr::new("-C"),
         clone.as_os_str(),
         OsStr::new("rev-parse"),
         OsStr::new("HEAD"),
-    ])?;
+    ])
+    .text()?;
     if !valid_commit(&commit) {
         return Err(format!(
             "git rev-parse HEAD answered {commit:?}, which is not an object id"
@@ -506,63 +500,21 @@ fn stage(scratch: &Path, entry: &SourceEntry, store_tree: &Path) -> Result<Candi
     })
 }
 
-/// `git clone` the upstream into scratch, argv first.
+/// `git clone` the upstream into scratch.
 ///
-/// Not [`vendor::git`], for two reasons that are the same reason: this call
-/// reaches the network. It is bounded, so a remote that never answers is a
-/// reported failure rather than a hung terminal, and its environment closes
-/// the interactive doors, so a private upstream asks nothing of a human who
-/// may be a timer. (`GIT_SSH_COMMAND` is deliberately left alone — see
-/// `updates::ls_remote`, which guards its probe the same way and explains
-/// why ssh's own prompts are left to the timeout.)
+/// Bounded and guarded like every other git call pacrat makes; [`crate::git`]
+/// holds the reasons, including why `GIT_SSH_COMMAND` is left alone.
 fn clone_upstream(upstream: &str, dest: &Path) -> Result<(), String> {
-    if upstream.starts_with('-') {
-        return Err(format!(
-            "{upstream:?} is not a URL — upstreams cannot begin with '-'"
-        ));
-    }
-    let dest_s = dest.to_string_lossy().into_owned();
     // `--` so that an upstream cannot be read as a git option.
-    let argv = ["clone", "--", upstream, &dest_s];
-    println!("run       git {}", shown(&argv));
-
-    let mut cmd = Command::new("git");
-    cmd.args(argv)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "/bin/true");
-    let ran = proc::run_with_timeout(cmd, CLONE_TIMEOUT).map_err(|e| format!("git: {e}"))?;
-    if ran.timed_out {
-        return Err(format!(
-            "git clone -- {} timed out after {}s",
-            safe(&shell_quote(upstream)),
-            CLONE_TIMEOUT.as_secs()
-        ));
-    }
-    if !ran.status.success() {
-        // A remote's text, neutered: a server that can name itself in the
-        // error can otherwise paint the terminal.
-        let (stderr, _) = visible_line(&String::from_utf8_lossy(&ran.stderr));
-        return Err(format!(
-            "git clone -- {} failed: {}",
-            safe(&shell_quote(upstream)),
-            truncate(stderr.trim(), 200)
-        ));
-    }
-    Ok(())
-}
-
-/// An argv as a line a human can read and paste.
-///
-/// Quoted *and* neutered. The quoting is `out::shell_quote`'s job and makes
-/// the line true; the neutering is this line's own, because one of these
-/// arguments is an upstream URL out of a ledger every host in the fleet can
-/// write to, and single quotes do not stop an escape code from painting a
-/// terminal.
-fn shown(argv: &[&str]) -> String {
-    argv.iter()
-        .map(|a| visible_line(&shell_quote(a)).0)
-        .collect::<Vec<_>>()
-        .join(" ")
+    Git::new([
+        OsStr::new("clone"),
+        OsStr::new("--"),
+        OsStr::new(git::url_arg(upstream)?),
+        dest.as_os_str(),
+    ])
+    .timeout(git::TRANSFER)
+    .text()
+    .map(|_| ())
 }
 
 /// One untrusted field on pacrat's own report: the ledger's upstream URL.
@@ -759,37 +711,17 @@ fn names_of(names: &[String]) -> String {
 /// decide.
 fn diff(scratch: &Path) -> Result<Diff, String> {
     let dir = scratch.to_string_lossy().into_owned();
-    let argv = [
-        "-C",
-        &dir,
-        // The one view this module exists to make trustworthy must not be
-        // rewritable by config this module never read. `diff.external`
-        // replaces the diff body outright — a reviewer demonstrated a
-        // gitconfig that answered "PKGBUILD: no changes worth reading" —
-        // and a `diff` attribute with a `textconv` does the same per path,
-        // from a `.gitattributes` the *upstream* controls. Both doors are
-        // shut here rather than trusted to be unused.
-        "-c",
-        "core.attributesFile=/dev/null",
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-index",
-        "--",
-        REVIEWED,
-        CANDIDATE,
-    ];
-    println!("run       git {}", shown(&argv));
-
-    let mut cmd = Command::new("git");
-    cmd.args(argv);
-    let ran = proc::run_with_timeout(cmd, DIFF_TIMEOUT).map_err(|e| format!("git: {e}"))?;
-    if ran.timed_out {
-        return Err(format!(
-            "git diff --no-index timed out after {}s",
-            DIFF_TIMEOUT.as_secs()
-        ));
-    }
+    // The one view this module exists to make trustworthy must not be
+    // rewritable by config this module never read — `git::NO_ATTRS` and
+    // `git::NO_FILTERS` are that door, shut, and say why.
+    let argv: Vec<&str> = git::NO_ATTRS
+        .iter()
+        .copied()
+        .chain(["-C", &dir, "diff"])
+        .chain(git::NO_FILTERS)
+        .chain(["--no-index", "--", REVIEWED, CANDIDATE])
+        .collect();
+    let ran = Git::new(argv).timeout(git::DIFF).run()?;
     // The reader is bounded, so a tree with a gigabyte of "data" in it
     // cannot make pacrat hold a gigabyte. Output at the bound is output that
     // was probably cut, and saying so is the difference between a short diff
@@ -952,6 +884,8 @@ fn store_rel(ctx: &Ctx, path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
+    use std::time::Duration;
 
     struct Tmp(PathBuf);
 
@@ -1079,28 +1013,6 @@ mod tests {
         let reason = diff_failure(&ran);
         assert!(reason.contains("fatal:"), "{reason}");
         assert!(!reason.contains('\x1b'), "{reason}");
-    }
-
-    /// The argv line is pacrat's own output about someone else's string. It
-    /// has to stay one pasteable line whatever the ledger says the upstream
-    /// is — quotes do not stop an escape code.
-    #[test]
-    fn a_printed_argv_can_neither_paint_nor_sprawl() {
-        let hostile = "file:///srv/x\x1b[2K\nrun       git push --force";
-        let line = shown(&["clone", "--", hostile, "/tmp/scratch"]);
-        assert!(!line.contains('\x1b'), "{line}");
-        assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(line.starts_with("clone -- "), "{line}");
-        // An ordinary URL is left alone, quotes and all.
-        assert_eq!(
-            shown(&[
-                "clone",
-                "--",
-                "https://aur.archlinux.org/mdcat.git",
-                "/tmp/x"
-            ]),
-            "clone -- https://aur.archlinux.org/mdcat.git /tmp/x"
-        );
     }
 
     #[test]

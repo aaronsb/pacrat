@@ -29,8 +29,41 @@ const SKIP: &[&str] = &[".git"];
 /// note on symlinks — so a successful return is also a statement that the
 /// tree is safe to copy.
 pub fn files(root: &Path) -> Result<Vec<String>, String> {
+    files_of(root, Whose::Store)
+}
+
+/// Whose tree is being walked — which is to say, who a refusal is *about*.
+///
+/// The walk is used on trees from two directions now: the store's own, and a
+/// clone of a remote that `push` is about to publish over. "The store holds
+/// plain files" is the right thing to say about the first and misdirects
+/// entirely about the second, where the symlink is in somebody's published
+/// repository and the reader's next move is to go look at it there.
+#[derive(Copy, Clone)]
+pub enum Whose {
+    Store,
+    Published,
+}
+
+impl Whose {
+    fn refusal(self, rel: &str, target: &str) -> String {
+        match self {
+            Whose::Store => format!(
+                "{rel} is a symlink (→ {target}) — the store holds plain files, \
+                 and copying one would put the target's bytes in the store"
+            ),
+            Whose::Published => format!(
+                "{rel} is a symlink (→ {target}) in the published tree — pacrat \
+                 will not mirror over a repository whose contents it cannot read \
+                 as plain files; look at what is published before republishing"
+            ),
+        }
+    }
+}
+
+pub fn files_of(root: &Path, whose: Whose) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
-    walk(root, "", &mut found)?;
+    walk(root, "", whose, &mut found)?;
     found.sort();
     Ok(found)
 }
@@ -58,7 +91,7 @@ pub fn digest(root: &Path) -> Result<String, String> {
     ))
 }
 
-fn walk(dir: &Path, prefix: &str, found: &mut Vec<String>) -> Result<(), String> {
+fn walk(dir: &Path, prefix: &str, whose: Whose, found: &mut Vec<String>) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -87,12 +120,9 @@ fn walk(dir: &Path, prefix: &str, found: &mut Vec<String>) -> Result<(), String>
             let target = fs::read_link(entry.path())
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "?".into());
-            return Err(format!(
-                "{rel} is a symlink (→ {target}) — the store holds plain files, \
-                 and copying one would put the target's bytes in the store"
-            ));
+            return Err(whose.refusal(&rel, &target));
         } else if kind.is_dir() {
-            walk(&entry.path(), &rel, found)?;
+            walk(&entry.path(), &rel, whose, found)?;
         } else if kind.is_file() {
             found.push(rel);
         } else {
@@ -152,6 +182,49 @@ pub fn install(from: &Path, files: &[String], dest: &Path) -> Result<(), String>
         let _ = fs::remove_dir_all(&backup);
     }
     Ok(())
+}
+
+/// Make `dest`'s tree match `from`'s, in place, leaving everything [`SKIP`]
+/// hides alone.
+///
+/// The difference from [`install`] is `.git`, and it is the whole reason this
+/// exists: `push` copies the store's tree over a *clone*, whose history is
+/// how the publish happens. `install` would rename a fresh directory into
+/// place and take the repository with it.
+///
+/// In place means not atomic, and that is deliberate rather than overlooked:
+/// the destination here is a scratch clone, thrown away either way. Nothing a
+/// half-finished mirror could damage is anything anyone will read again. Use
+/// [`install`] for anything under the store.
+///
+/// Returns the files it removed, which is the half of "what changed" that a
+/// copy alone cannot report.
+pub fn mirror(from: &Path, files: &[String], dest: &Path) -> Result<Vec<String>, String> {
+    // Validates the destination the same way the source was validated: a
+    // clone carrying a symlink is a tree pacrat will not walk. Blamed on the
+    // published tree, because that is where such a symlink would be.
+    let existing = files_of(dest, Whose::Published)?;
+    let mut removed = Vec::new();
+    for rel in &existing {
+        if files.contains(rel) {
+            continue;
+        }
+        let path = dest.join(rel);
+        fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        removed.push(rel.clone());
+    }
+    copy_into(from, files, dest)?;
+    // A directory emptied by the removals above is not part of the tree any
+    // more; git would not notice it, and a later walk would.
+    for rel in &removed {
+        let mut dir = dest.join(rel);
+        while dir.pop() && dir != dest {
+            if fs::remove_dir(&dir).is_err() {
+                break;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn copy_into(from: &Path, files: &[String], staging: &Path) -> Result<(), String> {
