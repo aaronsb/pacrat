@@ -1,7 +1,8 @@
 # ADR-002: TUI selection and package removal
 
-**Status:** Accepted (2026-08-10 — the three open choices below were decided
-by Aaron; implementation follows this document)
+**Status:** Accepted, amended same day (2026-08-10 — the selection language
+below stands as written; the removal design is superseded by the Amendment
+at the end, which implementation follows)
 **Date:** 2026-08-10
 **Extends:** ADR-001 (custody ladder, self-only sync, never-elevate, the
 childlock amendment)
@@ -110,3 +111,54 @@ every other asking verb follows.
 - A new config key (`removal_fence`) joins thresholds in config.toml, with
   the same validation posture: a nonsense value is a parse error, not a
   guess.
+
+## Amendment (2026-08-10): removal is drift reconciliation, not a verb
+
+Ratified by Aaron the same day, before implementation, superseding the
+"Removal" and "fence" sections above. The selection language and the
+select → action → apply flow stand unchanged.
+
+The rethink, in his words: *"we're only tracking the delta"* — something
+*tracked but no longer on the system* is the actual removal surface — and
+*"we don't install things with pacrat, so we shouldn't uninstall things
+with pacrat."*
+
+pacrat never owned the machine's package state; pacman does, and removal
+happens there, with the tool that owns it. What pacrat owns is the
+manifest. The drift state **tracked here, not installed here** is genuinely
+ambiguous — it means either "new manifest entry, install me" or "I removed
+this on purpose and the manifest is stale" — and only a human can say
+which. So the interface is not an imperative remove action; it is that
+drift, presented, with a resolving act in each direction:
+
+- **Manifest wins:** `pacrat sync` — already exists, prints the install.
+- **Reality wins:** **`pacrat untrack <pkg>…`** — new, and nothing more
+  than `add`'s exact inverse: a manifest-only edit to this host's tracked
+  list, through the same writer, so the two directions cannot disagree
+  about the file.
+
+What this deletes from the design above:
+
+- **No `pacrat remove`.** Untrack carries no removal framing: it edits the
+  manifest and prints no pacman command. A package untracked while still
+  installed is simply demoted to unmanaged, and `sync --prune`'s printed
+  plan surfaces the uninstall where it always did — run by the operator,
+  never by pacrat.
+- **No childlock fence, no `removal_fence` config key.** The store is
+  git-backed and an untrack is a revertable file edit; the actually
+  destructive step (prune's `-Rns`) is typed by a human anyway. The guard
+  that remains is a confirm that names every package and the count — and
+  only where the selection was *accumulated* rather than typed:
+
+  - **TUI apply** (hosts `x` over the marked rows): show the names and the
+    count, ask, then write through the CLI verb's writer, clear the
+    selection, and say what changed and what to do next (commit the store;
+    anything still installed appears in `sync --prune`'s plan).
+  - **CLI `pacrat untrack`** takes no prompt at all, exactly like `add`:
+    the operator typed the names, and repeating them back as a question
+    adds nothing. Unknown or untracked names are refused in plain words.
+
+- The hosts matrix already draws the removal surface — the `✗` cell is
+  "tracked here, not installed here" — so the screen's job is to say what
+  the drift means on the detail pane of such a row: removed by hand?
+  untrack accepts that; `pacrat sync` reinstalls it.
