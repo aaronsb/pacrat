@@ -138,12 +138,32 @@ impl Ctx {
     }
 
     /// Host directories under packages/, sorted.
+    ///
+    /// Names go through the same door as the tracked lists — `valid_name`
+    /// is about a *displayable, printable* identifier, and a host name is
+    /// used as one everywhere: it is printed into `pacrat sync`'s report and
+    /// into the TUI's host column. The escape-hiding argument on
+    /// [`Ctx::tracked`] applies unchanged, plus one that is specific to a
+    /// column: padding happens before the terminal ever sees the string, so
+    /// a zero-width or double-width character in a host name misaligns
+    /// `{host:<12}` for every row beneath it even where the bytes are
+    /// eventually filtered out on their way to the screen.
+    ///
+    /// Unlike a tracked list this **skips** rather than refuses, and the
+    /// difference is what the two things are. A malformed line in
+    /// `native.txt` is a corrupted member of a list pacrat is claiming to
+    /// manage, so dropping it silently would shorten an answer. A directory
+    /// under `packages/` that is not a legal name was never a host — it is
+    /// something else that happens to live there — and the honest reading
+    /// of it is not to count it, rather than to refuse to report on the
+    /// four real machines beside it.
     pub fn tracked_hosts(&self) -> Vec<String> {
         let mut hosts: Vec<String> = fs::read_dir(self.packages_dir())
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .filter(|e| e.path().is_dir())
                     .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|name| valid_name(name))
                     .collect()
             })
             .unwrap_or_default();
@@ -292,6 +312,26 @@ mod tests {
     fn one_bad_name_takes_the_whole_list_down() {
         let (ctx, _) = store_with("partial", Source::Native, "fd\n../escape\nripgrep\n");
         assert!(ctx.tracked("north", Source::Native).is_err());
+        let _ = fs::remove_dir_all(&ctx.store);
+    }
+
+    /// A host name is printed into commands and into a padded column, so it
+    /// goes through the same grammar. Here the answer is to skip rather than
+    /// to refuse: the real hosts beside it are still real.
+    #[test]
+    fn a_directory_that_is_not_a_legal_name_is_not_a_host() {
+        let (ctx, _) = store_with("hosts", Source::Native, "fd\n");
+        let packages = ctx.packages_dir();
+        for name in ["slab", "cube\u{1b}[8m", "wide\u{200b}name", ".hidden"] {
+            fs::create_dir_all(packages.join(name)).unwrap();
+        }
+        // A file, not a directory, is not a host either.
+        fs::write(packages.join("README.md"), "notes").unwrap();
+        assert_eq!(
+            ctx.tracked_hosts(),
+            vec!["north".to_string(), "slab".to_string()],
+            "the door let something through, or turned a real host away"
+        );
         let _ = fs::remove_dir_all(&ctx.store);
     }
 }

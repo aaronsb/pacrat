@@ -19,3 +19,29 @@ clap = { version = "4", features = ["derive"] }
 # see src/aur.rs for why.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The TUI. ADR-001's Surfaces section is the reason-for-being: six screens on
+# number keys where every region is a viewport with its own scrollbar and
+# position indicator. That is ratatui's Scrollbar + a layout engine, or it is
+# a year of writing one.
+#
+# Default features minus `all-widgets` (a calendar we do not draw, and the
+# `time` crate under it) and `macros` (sugar we do not use). crossterm is a
+# direct dependency because the event loop, raw mode, and the alternate
+# screen are ours to drive; it is pinned to the version ratatui's own backend
+# takes so the graph unifies on one crossterm — two would mean the terminal
+# is put into raw mode by one crate and taken out of it by another.
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+    "underline-color",
+] }
+crossterm = "0.29"
+# Already on the graph underneath crossterm; direct because the TUI has its
+# own reason to care. A SIGTERM or SIGHUP with no handler kills the process
+# between `enable_raw_mode` and the `Drop` that would undo it, and the user
+# is left with a terminal that does not echo — the exact wreckage the panic
+# hook exists to prevent, arriving by a different door. `default-features =
+# false` because only `flag` and `low_level` are wanted, not the iterator
+# machinery (features are additive, so this neither adds to nor subtracts
+# from what crossterm already turns on).
+signal-hook = { version = "0.3", default-features = false }
