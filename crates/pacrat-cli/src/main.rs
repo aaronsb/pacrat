@@ -1,5 +1,11 @@
 use clap::{Parser, Subcommand};
 
+mod ctx;
+mod hosts;
+mod live;
+mod out;
+mod status;
+
 /// pacrat — store-backed package curation for Arch.
 ///
 /// Bare `pacrat` will open the default UI (config: default_ui); any
@@ -46,9 +52,14 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
-        None => eprintln!("pacrat: TUI not yet built — see `pacrat --help`"),
-        Some(_) => eprintln!("pacrat: not yet implemented — scaffold only (ADR-001)"),
+    let result = ctx::Ctx::resolve().and_then(|ctx| match cli.command {
+        // Bare `pacrat`: the TUI once it exists; the overview meanwhile.
+        None | Some(Command::Status) => status::run(&ctx),
+        Some(Command::Hosts) => hosts::run(&ctx),
+        Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
+    });
+    if let Err(e) = result {
+        eprintln!("pacrat: {e}");
+        std::process::exit(1);
     }
-    std::process::exit(1);
 }

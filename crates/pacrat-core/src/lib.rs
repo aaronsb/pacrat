@@ -1,6 +1,10 @@
-//! Pure model for pacrat. No I/O, no subprocess, no dependencies — the same
-//! split dotfiles-core keeps: everything that talks to git/pacman/graders
-//! lives in the CLI crate.
+//! Pure model for pacrat. No I/O and no subprocess — the same split
+//! dotfiles-core keeps: everything that talks to git/pacman/graders lives in
+//! the CLI crate.
+
+pub mod config;
+pub mod pkg;
+pub mod sources;
 
 /// Where a package sits on the custody ladder (mockup §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,7 +32,8 @@ pub enum Verdict {
 
 /// Grade→verdict thresholds. Config data, not grader data: changing risk
 /// posture is a config edit, not a grader release.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Thresholds {
     pub warn_at: u8,
     pub block_at: u8,
