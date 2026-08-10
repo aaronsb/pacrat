@@ -56,7 +56,7 @@ use pacrat_core::{Thresholds, Verdict};
 
 use crate::ctx::{self, Ctx};
 use crate::fstree;
-use crate::out::{shell_quote, truncate, visible, visible_line};
+use crate::out::{shell_quote, truncate, visible_line};
 use crate::vendor::valid_name;
 use crate::HELD;
 
