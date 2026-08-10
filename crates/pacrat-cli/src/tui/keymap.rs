@@ -7,11 +7,65 @@
 //! carries its own matcher, [`action_for`] walks the rows in order, and the
 //! overlay renders the same rows. A binding that is not in the table does
 //! not work, and one that is in the table is documented.
+//!
+//! ## Screens claim letters
+//!
+//! The mockup gives each screen its own verbs on bare letters, and they
+//! collide with the global ones by design: `g` is *go to top* everywhere and
+//! *regrade* on updates; `r` is *reload* everywhere and *drop* on hosts.
+//! Twenty-six letters and six screens leaves no way to avoid this that does
+//! not end in chords nobody can remember.
+//!
+//! So a row carries a [`Scope`], and the screen's rows are consulted before
+//! the global ones. Two consequences worth stating, because they are the
+//! cost of the choice: a screen that claims a letter *takes* it — the global
+//! meaning is unreachable there, not merely shadowed — and the help overlay
+//! shows the current screen's rows above the global ones so the reader can
+//! see which meaning is in force where they are standing.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::viewport::Scroll;
 use super::Tab;
+
+/// A screen's own verbs, from the mockup's footer bars.
+///
+/// One enum rather than an action per key so the table stays the only place
+/// a key is named, and so a screen's `match` is exhaustive: a verb added
+/// here and forgotten in a screen is a compile error rather than a key that
+/// does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Local {
+    /// browse `/` — type a search term.
+    Search,
+    /// browse `enter` — everything pacrat knows about the selected package.
+    Detail,
+    /// browse `v` · `t` · `i` — the three rungs, as the command that climbs
+    /// them. The TUI shows it rather than running it; [`super`] says why.
+    Vendor,
+    Track,
+    Install,
+    /// updates `enter` — fetch the candidate, diff it, read its gradings.
+    Review,
+    /// updates `a` — the adopt+build command for the reviewed candidate.
+    Adopt,
+    /// updates `x` — the reject command for the selected candidate.
+    Reject,
+    /// updates `o` — reveal the override childlock for a held candidate.
+    Override,
+    /// hosts `space` — add or remove the row from the selection.
+    Select,
+    /// hosts `A` · `s` — adopt the selection · plan this host.
+    AdoptSelection,
+    Sync,
+    /// jobs `p` — probe the AUR write path.
+    Probe,
+    /// jobs `R` — the command that works the publish queue.
+    Retry,
+    /// config `←`/`→` — move across the presets.
+    PresetLeft,
+    PresetRight,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -34,12 +88,24 @@ pub enum Action {
     Scroll(Scroll),
     /// Re-run whatever this screen asked the system, showing it happening.
     Reload,
+    /// A verb belonging to the screen in front.
+    Local(Local),
+}
+
+/// Where a binding is in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Every screen, unless one has claimed the key.
+    Global,
+    /// This screen only, and here it wins.
+    On(Tab),
 }
 
 pub struct Binding {
     /// How the keys are written in the help overlay.
     pub keys: &'static str,
     pub what: &'static str,
+    pub scope: Scope,
     /// The matcher *and* the action: a row that can answer for a key
     /// returns what pressing it does.
     pub of: fn(KeyEvent) -> Option<Action>,
@@ -48,9 +114,97 @@ pub struct Binding {
 /// In order. The first row that answers wins, so the modified keys come
 /// before the plain ones they share a letter with.
 pub const BINDINGS: &[Binding] = &[
+    // ---- the screens' own verbs, which outrank the global rows below ----
+    Binding {
+        keys: "/",
+        what: "search the repos and the AUR",
+        scope: Scope::On(Tab::Browse),
+        of: |key| bare(key, '/').then_some(Action::Local(Local::Search)),
+    },
+    Binding {
+        keys: "enter",
+        what: "full detail for the selected package",
+        scope: Scope::On(Tab::Browse),
+        of: |key| (key.code == KeyCode::Enter).then_some(Action::Local(Local::Detail)),
+    },
+    Binding {
+        keys: "v / t / i",
+        what: "vendor · track · install — the command to run",
+        scope: Scope::On(Tab::Browse),
+        of: |key| match key.code {
+            _ if bare(key, 'v') => Some(Action::Local(Local::Vendor)),
+            _ if bare(key, 't') => Some(Action::Local(Local::Track)),
+            _ if bare(key, 'i') => Some(Action::Local(Local::Install)),
+            _ => None,
+        },
+    },
+    Binding {
+        keys: "enter",
+        what: "review: fetch the candidate, diff it, read its gradings",
+        scope: Scope::On(Tab::Updates),
+        of: |key| (key.code == KeyCode::Enter).then_some(Action::Local(Local::Review)),
+    },
+    Binding {
+        keys: "a",
+        what: "adopt+build — the command to run",
+        scope: Scope::On(Tab::Updates),
+        of: |key| bare(key, 'a').then_some(Action::Local(Local::Adopt)),
+    },
+    Binding {
+        keys: "x",
+        what: "reject this candidate — the command to run",
+        scope: Scope::On(Tab::Updates),
+        of: |key| bare(key, 'x').then_some(Action::Local(Local::Reject)),
+    },
+    Binding {
+        keys: "o",
+        what: "override a held candidate (hold-to-confirm)",
+        scope: Scope::On(Tab::Updates),
+        of: |key| bare(key, 'o').then_some(Action::Local(Local::Override)),
+    },
+    Binding {
+        keys: "space",
+        what: "select a row",
+        scope: Scope::On(Tab::Hosts),
+        of: |key| bare(key, ' ').then_some(Action::Local(Local::Select)),
+    },
+    Binding {
+        keys: "A / s",
+        what: "adopt the selection · sync this host — the command to run",
+        scope: Scope::On(Tab::Hosts),
+        of: |key| match key.code {
+            _ if bare(key, 'A') => Some(Action::Local(Local::AdoptSelection)),
+            _ if bare(key, 's') => Some(Action::Local(Local::Sync)),
+            _ => None,
+        },
+    },
+    Binding {
+        keys: "p",
+        what: "probe the AUR write path",
+        scope: Scope::On(Tab::Jobs),
+        of: |key| bare(key, 'p').then_some(Action::Local(Local::Probe)),
+    },
+    Binding {
+        keys: "R",
+        what: "retry the publish queue — the command to run",
+        scope: Scope::On(Tab::Jobs),
+        of: |key| bare(key, 'R').then_some(Action::Local(Local::Retry)),
+    },
+    Binding {
+        keys: "← / →",
+        what: "move across the flow presets",
+        scope: Scope::On(Tab::Config),
+        of: |key| match key.code {
+            KeyCode::Left => Some(Action::Local(Local::PresetLeft)),
+            KeyCode::Right => Some(Action::Local(Local::PresetRight)),
+            _ => None,
+        },
+    },
+    // ---- global ----
     Binding {
         keys: "1-6",
         what: "screen",
+        scope: Scope::Global,
         of: |key| match key.code {
             KeyCode::Char(c) if c.is_ascii_digit() && !modified(key) => {
                 Tab::from_digit(c).map(Action::Screen)
@@ -61,6 +215,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "ctrl-d / ctrl-u",
         what: "half page",
+        scope: Scope::Global,
         of: |key| {
             if ctrl(key, 'd') {
                 Some(Action::Scroll(Scroll::HalfPageDown))
@@ -74,6 +229,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "ctrl-f / ctrl-b · pgdn / pgup",
         what: "page",
+        scope: Scope::Global,
         of: |key| match key.code {
             KeyCode::PageDown => Some(Action::Scroll(Scroll::PageDown)),
             KeyCode::PageUp => Some(Action::Scroll(Scroll::PageUp)),
@@ -85,6 +241,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "j / k · ↓ / ↑",
         what: "line",
+        scope: Scope::Global,
         of: |key| match key.code {
             KeyCode::Down => Some(Action::Scroll(Scroll::LineDown)),
             KeyCode::Up => Some(Action::Scroll(Scroll::LineUp)),
@@ -96,6 +253,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "g / G",
         what: "top / bottom",
+        scope: Scope::Global,
         of: |key| match key.code {
             KeyCode::Char('g') if !modified(key) => Some(Action::Scroll(Scroll::Top)),
             KeyCode::Char('G') if !modified(key) => Some(Action::Scroll(Scroll::Bottom)),
@@ -105,6 +263,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "tab / shift-tab",
         what: "move focus — the focused region scrolls",
+        scope: Scope::Global,
         of: |key| match key.code {
             KeyCode::Tab if !modified(key) => Some(Action::Focus(true)),
             KeyCode::BackTab => Some(Action::Focus(false)),
@@ -114,11 +273,13 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "r",
         what: "re-run this screen's queries",
+        scope: Scope::Global,
         of: |key| (key.code == KeyCode::Char('r') && !modified(key)).then_some(Action::Reload),
     },
     Binding {
         keys: "?",
         what: "this help",
+        scope: Scope::Global,
         of: |key| {
             (matches!(key.code, KeyCode::Char('?')) && !modified(key)).then_some(Action::ToggleHelp)
         },
@@ -126,6 +287,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "q / esc",
         what: "back, then quit",
+        scope: Scope::Global,
         of: |key| {
             let quit = matches!(key.code, KeyCode::Esc)
                 || (matches!(key.code, KeyCode::Char('q')) && !modified(key));
@@ -135,12 +297,31 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "ctrl-c",
         what: "quit from anywhere",
+        scope: Scope::Global,
         of: |key| ctrl(key, 'c').then_some(Action::Interrupt),
     },
 ];
 
-pub fn action_for(key: KeyEvent) -> Option<Action> {
-    BINDINGS.iter().find_map(|binding| (binding.of)(key))
+/// What this key means on this screen.
+///
+/// The screen's own rows are asked first and their answer is final. That is
+/// what makes `g` mean *regrade* on updates and *top* everywhere else, and
+/// it is why [`for_screen`] exists for the overlay: a reader on a screen
+/// that has taken a letter has to be able to see that it has.
+pub fn action_for(key: KeyEvent, tab: Tab) -> Option<Action> {
+    for_screen(tab)
+        .find_map(|binding| (binding.of)(key))
+        .or_else(|| global().find_map(|binding| (binding.of)(key)))
+}
+
+/// The rows this screen has claimed, in table order.
+pub fn for_screen(tab: Tab) -> impl Iterator<Item = &'static Binding> {
+    BINDINGS.iter().filter(move |b| b.scope == Scope::On(tab))
+}
+
+/// The rows that hold everywhere they have not been claimed.
+pub fn global() -> impl Iterator<Item = &'static Binding> {
+    BINDINGS.iter().filter(|b| b.scope == Scope::Global)
 }
 
 /// Shift is not a modifier for this purpose — it is how `G` is typed. The
@@ -149,6 +330,16 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
 fn modified(key: KeyEvent) -> bool {
     key.modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+/// An unmodified letter, as the mockup's footers write them.
+///
+/// Shift is not a modifier here for the same reason it is not in
+/// [`modified`] — it is how `A` and `R` are typed, and those are two
+/// different keys from `a` and `r`, which is precisely why the mockup gives
+/// them different jobs.
+fn bare(key: KeyEvent, wanted: char) -> bool {
+    !modified(key) && key.code == KeyCode::Char(wanted)
 }
 
 fn ctrl(key: KeyEvent, wanted: char) -> bool {
@@ -160,12 +351,21 @@ fn ctrl(key: KeyEvent, wanted: char) -> bool {
 mod tests {
     use super::*;
 
+    /// The overview claims no letters, so it is where the global table can
+    /// be tested as the global table.
     fn press(code: KeyCode) -> Option<Action> {
-        action_for(KeyEvent::new(code, KeyModifiers::NONE))
+        on(Tab::Overview, code)
+    }
+
+    fn on(tab: Tab, code: KeyCode) -> Option<Action> {
+        action_for(KeyEvent::new(code, KeyModifiers::NONE), tab)
     }
 
     fn with_ctrl(c: char) -> Option<Action> {
-        action_for(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+        action_for(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+            Tab::Overview,
+        )
     }
 
     #[test]
@@ -274,5 +474,76 @@ mod tests {
                 binding.keys
             );
         }
+    }
+
+    /// A screen's letter beats the global one, and only on that screen. This
+    /// is the whole point of the scope, so it is the thing to break loudly:
+    /// `a` is adopt on updates and unbound anywhere else, `space` selects on
+    /// hosts and nowhere else.
+    #[test]
+    fn a_screen_takes_a_letter_only_where_it_claimed_it() {
+        assert_eq!(
+            on(Tab::Updates, KeyCode::Char('a')),
+            Some(Action::Local(Local::Adopt))
+        );
+        assert_eq!(on(Tab::Hosts, KeyCode::Char('a')), None);
+        assert_eq!(press(KeyCode::Char('a')), None);
+
+        assert_eq!(
+            on(Tab::Hosts, KeyCode::Char(' ')),
+            Some(Action::Local(Local::Select))
+        );
+        assert_eq!(on(Tab::Updates, KeyCode::Char(' ')), None);
+
+        // `enter` means two different things on two screens, which is the
+        // case the scope exists for.
+        assert_eq!(
+            on(Tab::Browse, KeyCode::Enter),
+            Some(Action::Local(Local::Detail))
+        );
+        assert_eq!(
+            on(Tab::Updates, KeyCode::Enter),
+            Some(Action::Local(Local::Review))
+        );
+        assert_eq!(on(Tab::Jobs, KeyCode::Enter), None);
+    }
+
+    /// Everything a screen has not claimed still works there — a screen that
+    /// accidentally swallowed `j` or `q` would be a screen nobody can leave.
+    #[test]
+    fn the_global_keys_survive_on_every_screen() {
+        for tab in Tab::ALL {
+            assert_eq!(
+                on(tab, KeyCode::Char('q')),
+                Some(Action::Quit),
+                "{} swallowed the way out",
+                tab.title()
+            );
+            assert_eq!(
+                on(tab, KeyCode::Char('j')),
+                Some(Action::Scroll(Scroll::LineDown)),
+                "{} swallowed j",
+                tab.title()
+            );
+            assert_eq!(
+                on(tab, KeyCode::Char('1')),
+                Some(Action::Screen(Tab::Overview)),
+                "{} swallowed the screen keys",
+                tab.title()
+            );
+            assert_eq!(on(tab, KeyCode::Char('?')), Some(Action::ToggleHelp));
+        }
+    }
+
+    /// The overlay is built from these two iterators, and a row that fell out
+    /// of both would be a key that works and is documented nowhere.
+    #[test]
+    fn every_row_is_reachable_from_the_help_overlay() {
+        let listed = Tab::ALL
+            .into_iter()
+            .map(|tab| for_screen(tab).count())
+            .sum::<usize>()
+            + global().count();
+        assert_eq!(listed, BINDINGS.len());
     }
 }

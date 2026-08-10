@@ -14,9 +14,9 @@
 //! cannot be tested by looking at it in CI.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
@@ -33,6 +33,15 @@ pub enum Scroll {
     HalfPageDown,
     PageUp,
     PageDown,
+    Top,
+    Bottom,
+}
+
+/// A gesture resolved against a geometry: how far, which way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    Up(usize),
+    Down(usize),
     Top,
     Bottom,
 }
@@ -102,21 +111,58 @@ impl Viewport {
         self.height.saturating_sub(1).max(1)
     }
 
+    /// What a gesture asks for, in rows, independent of what it is applied
+    /// to. The same numbers move an offset and move a cursor — a screen where
+    /// `ctrl-d` scrolls half a pane in one region and jumps some other
+    /// distance in the list beside it is a screen that has two half-pages.
+    pub fn amount(&self, scroll: Scroll) -> Move {
+        match scroll {
+            Scroll::LineUp => Move::Up(1),
+            Scroll::LineDown => Move::Down(1),
+            Scroll::HalfPageUp => Move::Up(self.half_page()),
+            Scroll::HalfPageDown => Move::Down(self.half_page()),
+            Scroll::PageUp => Move::Up(self.page()),
+            Scroll::PageDown => Move::Down(self.page()),
+            Scroll::Top => Move::Top,
+            Scroll::Bottom => Move::Bottom,
+        }
+    }
+
     /// Move. Gestures are relative to what is on screen now, so they start
     /// from `offset`; where they land becomes the new request.
     pub fn apply(&mut self, scroll: Scroll) {
-        let target = match scroll {
-            Scroll::LineUp => self.offset.saturating_sub(1),
-            Scroll::LineDown => self.offset.saturating_add(1),
-            Scroll::HalfPageUp => self.offset.saturating_sub(self.half_page()),
-            Scroll::HalfPageDown => self.offset.saturating_add(self.half_page()),
-            Scroll::PageUp => self.offset.saturating_sub(self.page()),
-            Scroll::PageDown => self.offset.saturating_add(self.page()),
-            Scroll::Top => 0,
-            Scroll::Bottom => self.max_offset(),
+        let target = match self.amount(scroll) {
+            Move::Up(n) => self.offset.saturating_sub(n),
+            Move::Down(n) => self.offset.saturating_add(n),
+            Move::Top => 0,
+            Move::Bottom => self.max_offset(),
         };
         self.desired = target.min(self.max_offset());
         self.offset = self.desired;
+    }
+
+    /// Slide the window the least it can to put `cursor` on screen.
+    ///
+    /// The *least* is the point. A cursor region that recentred on every
+    /// move would repaint the whole pane for a one-row step, and the reader
+    /// would lose the rows they were using as landmarks; scrolling only when
+    /// the cursor would otherwise leave keeps `j` at the bottom edge behaving
+    /// like `j` in a pager.
+    ///
+    /// It writes `desired` rather than only `offset`, so a list that shrinks
+    /// and grows again — the reload round trip — brings the cursor's window
+    /// back rather than the pre-reload one.
+    pub fn follow(&mut self, cursor: usize) {
+        if self.height == 0 || self.len == 0 {
+            return;
+        }
+        let cursor = cursor.min(self.len - 1);
+        if cursor < self.offset {
+            self.desired = cursor;
+        } else if cursor >= self.offset + self.height {
+            self.desired = cursor + 1 - self.height;
+        }
+        self.offset = self.desired.min(self.max_offset());
     }
 
     /// The `12/214` indicator, or `None` when there is nothing useful to
@@ -136,9 +182,25 @@ impl Viewport {
 }
 
 /// A titled band of lines that scrolls: title rule, body, scrollbar.
+///
+/// Two optional shapes on top of that, both of which the mockup's list
+/// screens need and neither of which a screen should have to build for
+/// itself: a **cursor**, so `j`/`k` pick a row rather than only slide the
+/// window, and a **pinned header**, so a table's column names stay put while
+/// its rows scroll under them. A region with a cursor also owns a two-column
+/// gutter for the `▸` marker, header rows included, so every line in the
+/// region stays in the same columns whether or not it is selected.
 pub struct Region {
     title: String,
+    /// Header rows first, then body rows. One vector because they are one
+    /// table, and the split is a count rather than a second field so a screen
+    /// cannot hand back a header and rows that disagree about their widths.
     lines: Vec<Line<'static>>,
+    /// How many leading lines are pinned. Never scrolled, never selectable.
+    frozen: usize,
+    /// The selected row, as an index into the *scrollable* part. `None` for
+    /// a region that is prose rather than a list.
+    cursor: Option<usize>,
     /// This region's share of its screen's vertical space, counting **body
     /// rows only** — the title rule is structural and [`Panes`] reserves it.
     height: Constraint,
@@ -150,6 +212,29 @@ impl Region {
         Self {
             title: title.into(),
             lines,
+            frozen: 0,
+            cursor: None,
+            height,
+            view: Viewport::default(),
+        }
+    }
+
+    /// A region whose rows are chosen rather than only read: `j`/`k` move a
+    /// cursor, `enter` acts on it. `header` is pinned above the rows.
+    pub fn table(
+        title: impl Into<String>,
+        height: Constraint,
+        header: Vec<Line<'static>>,
+        rows: Vec<Line<'static>>,
+    ) -> Self {
+        let frozen = header.len();
+        let mut lines = header;
+        lines.extend(rows);
+        Self {
+            title: title.into(),
+            lines,
+            frozen,
+            cursor: Some(0),
             height,
             view: Viewport::default(),
         }
@@ -162,7 +247,33 @@ impl Region {
     /// reader to where they were, because [`Viewport`] remembers the
     /// position they asked for separately from the one the content allowed.
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
+        self.frozen = 0;
         self.lines = lines;
+    }
+
+    /// Replace a table's rows, leaving its header and its cursor alone.
+    ///
+    /// The cursor survives by *index*, not by identity, and that is the
+    /// honest thing rather than a shortcut: a reload can return a different
+    /// set of packages, and a cursor that chased a name would silently jump
+    /// the reader to a row somewhere else in the list. Clamped, so a list
+    /// that shrank leaves the cursor on the last real row.
+    pub fn set_rows(&mut self, rows: Vec<Line<'static>>) {
+        self.lines.truncate(self.frozen);
+        self.lines.extend(rows);
+        if let Some(cursor) = self.cursor {
+            self.cursor = Some(cursor.min(self.rows().saturating_sub(1)));
+        }
+    }
+
+    /// How many selectable rows this region holds.
+    pub fn rows(&self) -> usize {
+        self.lines.len() - self.frozen
+    }
+
+    /// The selected row, or `None` for a region with no cursor or no rows.
+    pub fn cursor(&self) -> Option<usize> {
+        self.cursor.filter(|_| self.rows() > 0)
     }
 
     pub fn set_title(&mut self, title: impl Into<String>) {
@@ -176,8 +287,25 @@ impl Region {
         self.height = height;
     }
 
+    /// One gesture. On a list it moves the cursor and the window follows; on
+    /// prose it moves the window.
+    ///
+    /// Both readings use [`Viewport::amount`], so `ctrl-d` is the same
+    /// half-page in either — a screen whose list and whose diff pane
+    /// disagreed about how far a half-page is would be a screen with two
+    /// half-pages.
     pub fn scroll(&mut self, scroll: Scroll) {
-        self.view.apply(scroll);
+        let Some(cursor) = self.cursor else {
+            self.view.apply(scroll);
+            return;
+        };
+        let last = self.rows().saturating_sub(1);
+        self.cursor = Some(match self.view.amount(scroll) {
+            Move::Up(n) => cursor.saturating_sub(n),
+            Move::Down(n) => cursor.saturating_add(n).min(last),
+            Move::Top => 0,
+            Move::Bottom => last,
+        });
     }
 
     /// Draw the region.
@@ -207,7 +335,15 @@ impl Region {
             width: slot.width,
             height: slot.height - 1,
         };
-        self.view.fit(self.lines.len(), body.height as usize);
+        // A pinned header is paid for out of the body before the viewport is
+        // told how tall it is: a header that scrolled would not be pinned,
+        // and one the viewport counted as content would make `12/214` a
+        // number about a different set of rows than the reader is counting.
+        let frozen = self.frozen.min(body.height as usize);
+        self.view.fit(self.rows(), body.height as usize - frozen);
+        if let Some(cursor) = self.cursor {
+            self.view.follow(cursor);
+        }
         if let Some((seen, total)) = self.view.progress() {
             rule =
                 rule.title_top(Line::styled(format!("─ {seen}/{total} ─"), style).right_aligned());
@@ -252,10 +388,12 @@ impl Region {
         // owed — so anything that ever writes to the backend directly, or
         // measures these strings before they reach the buffer, has to run
         // them through `out::visible` first, the way the CLI verbs do.
-        frame.render_widget(
-            Paragraph::new(Text::from(self.lines.clone())).scroll((self.view.offset() as u16, 0)),
-            text,
-        );
+        //
+        // Only the rows on screen are built, rather than the whole vector
+        // scrolled by the paragraph. A review pane holds a thousand-line
+        // diff and this runs every frame — cloning all of it to show
+        // twenty of it is the one cost in here that grows with the data.
+        frame.render_widget(Paragraph::new(Text::from(self.visible(text.height))), text);
         if let Some(bar) = bar {
             // `new(max_offset)`, not `new(len)`: the argument is the number
             // of scroll *positions*, not the number of lines. With `len` the
@@ -274,6 +412,57 @@ impl Region {
                 &mut state,
             );
         }
+    }
+}
+
+impl Region {
+    /// The rows this frame actually draws: the pinned header, then the
+    /// window, each with the cursor gutter a list region owns.
+    fn visible(&self, height: u16) -> Vec<Line<'static>> {
+        let height = height as usize;
+        let frozen = self.frozen.min(height);
+        let offset = self.view.offset();
+        let rows = height - frozen;
+
+        let mut out = Vec::with_capacity(height);
+        out.extend(
+            self.lines[..frozen]
+                .iter()
+                .map(|line| self.gutter(line, "")),
+        );
+        for (index, line) in self.lines[self.frozen..]
+            .iter()
+            .skip(offset)
+            .take(rows)
+            .enumerate()
+        {
+            let selected = self.cursor == Some(offset + index);
+            let mut line = self.gutter(line, if selected { "▸ " } else { "" });
+            if selected {
+                // Reversed rather than a background colour: pacrat draws in
+                // somebody else's palette, and every colour dark enough to
+                // read `theme::DIM` against is a colour some terminal has
+                // already spent on something. Reversing whatever the row
+                // already is cannot collide with a scheme it never saw.
+                line = line.patch_style(Style::new().add_modifier(Modifier::REVERSED));
+            }
+            out.push(line);
+        }
+        out
+    }
+
+    /// Prepend the two-column cursor gutter, for a region that has one.
+    fn gutter(&self, line: &Line<'static>, marker: &str) -> Line<'static> {
+        if self.cursor.is_none() {
+            return line.clone();
+        }
+        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+        spans.push(match marker.is_empty() {
+            true => Span::raw("  "),
+            false => theme::accent(marker.to_string()),
+        });
+        spans.extend(line.spans.iter().cloned());
+        Line::from(spans)
     }
 }
 
@@ -301,6 +490,20 @@ impl Panes {
 
     pub fn region_mut(&mut self, index: usize) -> Option<&mut Region> {
         self.regions.get_mut(index)
+    }
+
+    pub fn region(&self, index: usize) -> Option<&Region> {
+        self.regions.get(index)
+    }
+
+    /// Put focus on a region by index, for a screen that has just given the
+    /// reader something new to look at. Out-of-range is ignored rather than
+    /// clamped: a screen asking for a region it does not have is a bug in the
+    /// screen, and moving focus somewhere arbitrary would hide it.
+    pub fn focus_on(&mut self, index: usize) {
+        if index < self.regions.len() {
+            self.focus = index;
+        }
     }
 
     /// `(focused, total)` for the status line — 1-based, for reading.
@@ -522,6 +725,120 @@ mod tests {
         assert_eq!(v.progress(), Some((15, 100)));
         v.apply(Scroll::Bottom);
         assert_eq!(v.progress(), Some((100, 100)), "the end reads as the end");
+    }
+
+    /// A list scrolls only when the cursor would otherwise leave, so `j` at
+    /// the bottom edge behaves like `j` in a pager rather than recentring.
+    #[test]
+    fn the_window_follows_the_cursor_by_the_least_it_can() {
+        let mut v = tall(); // 100 lines, 10 rows
+        v.follow(5);
+        assert_eq!(v.offset(), 0, "a cursor already on screen moves nothing");
+        v.follow(9);
+        assert_eq!(v.offset(), 0, "the last visible row is still visible");
+        v.follow(10);
+        assert_eq!(v.offset(), 1, "one row past the edge scrolls one row");
+        v.follow(0);
+        assert_eq!(v.offset(), 0, "and back the same way");
+        v.follow(99);
+        assert_eq!(v.offset(), 90);
+    }
+
+    /// The cursor is an index, and a list that shrank under it must not leave
+    /// it pointing past the end.
+    #[test]
+    fn following_a_cursor_past_the_end_lands_on_the_last_row() {
+        let mut v = Viewport::default();
+        v.fit(3, 10);
+        v.follow(99);
+        assert_eq!(v.offset(), 0, "there is nowhere to scroll a short list");
+        // A pane squeezed to nothing has no row to put the cursor on, and
+        // must not divide by zero looking for one.
+        let mut none = Viewport::default();
+        none.fit(100, 0);
+        none.follow(50);
+        assert_eq!(none.offset(), 0);
+    }
+
+    fn table(rows: usize) -> Region {
+        Region::table(
+            "t",
+            Constraint::Fill(1),
+            vec![Line::raw("package  state")],
+            (0..rows).map(|i| Line::raw(format!("row{i}"))).collect(),
+        )
+    }
+
+    /// `j`/`k` on a list pick a row; the same keys on prose slide the window.
+    /// One vocabulary, two readings, and the distances agree.
+    #[test]
+    fn a_gesture_moves_the_cursor_on_a_list_and_the_window_on_prose() {
+        let mut list = table(100);
+        assert_eq!(list.cursor(), Some(0));
+        list.scroll(Scroll::LineDown);
+        assert_eq!(list.cursor(), Some(1));
+        list.scroll(Scroll::Bottom);
+        assert_eq!(list.cursor(), Some(99), "the last row, not the last window");
+        list.scroll(Scroll::LineDown);
+        assert_eq!(list.cursor(), Some(99), "and it stops there");
+        list.scroll(Scroll::Top);
+        assert_eq!(list.cursor(), Some(0));
+
+        let mut prose = Region::new("p", Constraint::Fill(1), vec![Line::raw("x"); 100]);
+        assert_eq!(prose.cursor(), None);
+        prose.scroll(Scroll::LineDown);
+        assert_eq!(prose.cursor(), None, "prose never grows a cursor");
+    }
+
+    /// The header is not a row: it cannot be selected, and it is not in the
+    /// count the position indicator reports.
+    #[test]
+    fn a_pinned_header_is_not_one_of_the_rows() {
+        let list = table(50);
+        assert_eq!(list.rows(), 50);
+        assert_eq!(list.cursor(), Some(0), "the cursor starts on a real row");
+        // An empty table has a header and nothing to select.
+        let empty = Region::table(
+            "t",
+            Constraint::Fill(1),
+            vec![Line::raw("package")],
+            Vec::new(),
+        );
+        assert_eq!(empty.rows(), 0);
+        assert_eq!(empty.cursor(), None, "there is no row to be on");
+    }
+
+    /// The reload path for a list: the header and the reader's row survive
+    /// new data, and a list that shrank pulls the cursor back onto a real row
+    /// rather than leaving it pointing past the end.
+    #[test]
+    fn replacing_rows_keeps_the_header_and_clamps_the_cursor() {
+        let mut list = table(50);
+        list.scroll(Scroll::Bottom);
+        assert_eq!(list.cursor(), Some(49));
+        list.set_rows((0..5).map(|i| Line::raw(format!("r{i}"))).collect());
+        assert_eq!(list.rows(), 5);
+        assert_eq!(list.cursor(), Some(4), "clamped onto the last real row");
+        list.set_rows(Vec::new());
+        assert_eq!(list.cursor(), None);
+        // And the header is still exactly one line, not five copies of one.
+        assert_eq!(list.lines.len(), 1);
+    }
+
+    /// Only the rows on screen are built. The guard is against a review pane
+    /// cloning a thousand-line diff sixty times a second.
+    #[test]
+    fn rendering_builds_a_window_and_not_the_whole_list() {
+        let mut list = table(1000);
+        list.view.fit(1000, 20);
+        assert_eq!(list.visible(21).len(), 21, "one header plus twenty rows");
+        // Prose is windowed the same way, with no gutter and no header.
+        let mut prose = Region::new("p", Constraint::Fill(1), vec![Line::raw("x"); 1000]);
+        prose.view.fit(1000, 20);
+        assert_eq!(prose.visible(20).len(), 20);
+        // A body with no room asks for nothing rather than panicking on the
+        // slice.
+        assert!(prose.visible(0).is_empty());
     }
 
     #[test]
