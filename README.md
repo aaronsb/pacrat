@@ -15,10 +15,34 @@ The rat curates the pantry; the little chef does the tasting.
   about screen renders as half-blocks
 
 Status: the CLI works. `status`, `hosts`, `add`, `setup`, `vendor`, `search`,
-`info`, `build`, `updates`, `grade`, `review`/`adopt-update`/`reject`, and
-`sync` are implemented and tested; the one-shot update loop (`pacrat update`)
-waits on ADR-001's open questions, and the TUI is next. The mockup shows
-where it's all headed.
+`info`, `build`, `updates`, `grade`, `review`/`adopt-update`/`reject`, `sync`,
+the one-shot loop (`update`) and the decision ledger (`decisions`) are
+implemented and tested; the TUI is next. The mockup shows where it's all
+headed.
+
+## The update loop
+
+`pacrat update` is the whole loop in one command — detect, grade, decide,
+build, served — and the entry point a systemd timer uses. `--mode` says how
+much of it runs without being asked:
+
+| verdict | `auto` | `semi` (default) | `manual` |
+|---------|--------|------------------|----------|
+| PROCEED | adopt  | adopt            | ask      |
+| WARN    | hold   | ask              | ask      |
+| BLOCK   | hold   | hold             | hold     |
+| UNGRADED| hold   | hold             | ask      |
+
+BLOCK always holds and this verb has no override — the one door past it is
+`pacrat adopt-update <pkg> --commit <c> --override-block --reason "…"`, whose
+friction is writing the justification and whose price is a permanent entry in
+`aur/decisions.toml`, synced to the fleet and listed by `pacrat decisions`.
+A prompt is answered no unless a human at a terminal types `y`; a pipe is not
+a human, because one `y` would answer a whole run.
+
+Exits 0 when there was nothing to do or everything pending was adopted and
+built, 10 when anything was held, and 1 when the run could not do its job.
+`--format json` puts one object on stdout and every human line on stderr.
 
 ## Graders
 

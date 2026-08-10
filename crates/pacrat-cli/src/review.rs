@@ -23,12 +23,13 @@
 //!    `curl … | sh` cannot hide behind an escape code in the very view
 //!    meant to reveal it.
 //!
-//! 3. **BLOCK is not overridable here.** ADR-001 makes "BLOCK always holds"
-//!    an invariant no gate preset relaxes, and its open question 2 — whether
-//!    a recorded `--override-block --reason` should exist at all — is
-//!    unresolved. Until it is resolved, there is no flag: the way past a
-//!    BLOCK is to change what the graders see, or to record a human grading
-//!    of your own with `pacrat grade --grade`.
+//! 3. **BLOCK holds unless a human writes down why it should not.** ADR-001
+//!    makes "BLOCK always holds" an invariant no gate *preset* relaxes, and
+//!    its decision 2 settles the one door through it: `--override-block
+//!    --reason "…"`, whose friction is authoring the justification and whose
+//!    price is a permanent entry in the store's decision ledger. It is a
+//!    door in this verb and nowhere else — `pacrat update` has no override,
+//!    because a loop that can talk itself past a BLOCK is not a gate.
 //!
 //! 4. **Ungraded is not BLOCK.** It holds in the *automatic* loop, where
 //!    nobody is reading; a human at a terminal who has just been shown the
@@ -48,16 +49,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use pacrat_core::decisions::REASON_MAX;
 use pacrat_core::grading::commit_matches;
 use pacrat_core::pkg::valid_name;
 use pacrat_core::sources::{valid_commit, SourceEntry, NOTE_MAX};
 use pacrat_core::Verdict;
 
 use crate::ctx::Ctx;
+use crate::decisions;
 use crate::fstree;
 use crate::grade;
 use crate::out::{list_preview, shell_quote, short_hash, truncate, visible, visible_line};
 use crate::proc;
+use crate::say;
 use crate::updates;
 use crate::vendor;
 use crate::HELD;
@@ -111,12 +115,12 @@ fn show(ctx: &Ctx, package: &str, curated: &Curated, cand: &Candidate) -> Result
     let changes = changes_between(curated, cand)?;
     changes.render();
 
-    println!();
+    say!();
     let keep = if cand.digest == fstree::digest(&curated.tree)? {
         // A moved HEAD whose tree is byte-for-byte the store's: a commit
         // that touched only history. Worth saying outright, because an empty
         // diff otherwise reads as "the diff failed".
-        println!(
+        say!(
             "diff      none — the candidate's tree is byte-identical to the store's \
              (the commit moved, the contents did not)"
         );
@@ -130,9 +134,21 @@ fn show(ctx: &Ctx, package: &str, curated: &Curated, cand: &Candidate) -> Result
     Ok(keep)
 }
 
+/// How this adoption was asked for.
+pub struct Adopt<'a> {
+    /// The candidate the human says they read. Upstream having moved past it
+    /// is a refusal, never a substitution.
+    pub commit: Option<&'a str>,
+    /// Skip the prompt (scripting).
+    pub yes: bool,
+    /// Adopt past a BLOCK, recording why in the store's decision ledger.
+    /// ADR-001 decision 2: the friction is writing this sentence.
+    pub override_block: Option<&'a str>,
+}
+
 /// Take the candidate into the store: install its tree, advance the ledger.
-pub fn adopt(ctx: &Ctx, package: &str, commit: Option<&str>, yes: bool) -> Result<(), String> {
-    let want = match commit {
+pub fn adopt(ctx: &Ctx, package: &str, opts: &Adopt) -> Result<(), String> {
+    let want = match opts.commit {
         None => None,
         Some(c) if valid_commit(c) => Some(c),
         Some(c) => {
@@ -142,12 +158,15 @@ pub fn adopt(ctx: &Ctx, package: &str, commit: Option<&str>, yes: bool) -> Resul
             ))
         }
     };
+    if let Some(reason) = opts.override_block {
+        check_override(reason, want)?;
+    }
 
     let curated = curated(ctx, package)?;
     preamble(package, &curated);
     let cand = fetch(package, &curated.entry, &curated.tree)?;
 
-    let outcome = execute_adopt(ctx, package, &curated, &cand, want, yes);
+    let outcome = execute_adopt(ctx, package, &curated, &cand, want, opts);
     finish(&cand, outcome.is_ok());
     match outcome? {
         Adoption::Adopted => Ok(()),
@@ -165,13 +184,48 @@ enum Adoption {
     Held,
 }
 
+/// Refuse an override that is not one, before the network is touched.
+///
+/// Two requirements, both from ADR-001 decision 2, and both about what the
+/// entry will have to mean to somebody reading it in six months:
+///
+/// * **A reason**, because the friction *is* the writing. An override with
+///   no justification is a flag, and a flag is exactly the frictionless
+///   thing the decision was written to avoid.
+/// * **A `--commit`**, because an override says "I read this and I accept
+///   it". Without one, the verb adopts whatever HEAD happens to be by the
+///   time the clone finishes, and the ledger would record a human vouching
+///   for bytes chosen after they stopped looking.
+fn check_override(reason: &str, want: Option<&str>) -> Result<(), String> {
+    if reason.trim().is_empty() {
+        return Err("--reason is empty — overriding a BLOCK takes a justification".into());
+    }
+    let length = reason.chars().count();
+    if length > REASON_MAX {
+        return Err(format!(
+            "--reason is {length} characters — the cap is {REASON_MAX}. The decision \
+             ledger is synced to every host; put the long version in the commit message"
+        ));
+    }
+    if want.is_none() {
+        return Err(
+            "--override-block needs --commit: the record says which candidate was \
+             accepted, and adopting whatever HEAD is by the time the clone finishes \
+             would put a human's name on bytes they never saw. `pacrat review \
+             <package>` prints the commit to pass"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn execute_adopt(
     ctx: &Ctx,
     package: &str,
     curated: &Curated,
     cand: &Candidate,
     want: Option<&str>,
-    yes: bool,
+    opts: &Adopt,
 ) -> Result<Adoption, String> {
     header(curated, cand);
 
@@ -187,8 +241,8 @@ fn execute_adopt(
             // A hold rather than a failure: nothing is broken, there is
             // simply a commit at the other end that nobody has read — which
             // is exactly the state exit 10 exists to name.
-            println!();
-            println!(
+            say!();
+            say!(
                 "not adopted — you asked for {} and upstream HEAD is {}. Review what \
                  is actually there (`pacrat review {package}`)",
                 short_hash(want),
@@ -199,8 +253,8 @@ fn execute_adopt(
     }
 
     if !updates::drifted(&curated.entry.reviewed, &cand.commit) {
-        println!();
-        println!(
+        say!();
+        say!(
             "nothing to adopt — upstream HEAD is the commit the ledger already \
              records as reviewed"
         );
@@ -213,27 +267,58 @@ fn execute_adopt(
     // `.install` before it asks, and the least this can do is name what
     // moved. The full diff stays `review`'s job, and the line below says so.
     changes_between(curated, cand)?.render();
-    println!();
-    println!("diff      pacrat review {package} — the line-by-line, before you answer");
+    say!();
+    say!("diff      pacrat review {package} — the line-by-line, before you answer");
 
-    let verdict = show_gradings(ctx, package, cand)?;
-    println!();
-    if verdict == Verdict::Block {
-        // ADR-001 open question 2 — a recorded `--override-block --reason`,
-        // or no override at all — is unresolved, so there is no flag here.
-        // Adding one before the question is settled would settle it by
-        // shipping, which is the way it must not be answered.
-        println!(
-            "not adopted — BLOCK holds, and there is no override: change what the \
-             graders see, or record your own reading with `pacrat grade {package} \
-             --grade N --note …` and adopt again"
-        );
-        return Ok(Adoption::Held);
-    }
+    let (verdict, grade) = show_gradings(ctx, package, cand)?;
+    say!();
+    // The one door past a BLOCK, and it is loud on the way through: the
+    // record is written below, after the prompt and before the tree lands.
+    let overriding = match (verdict, opts.override_block) {
+        (Verdict::Block, None) => {
+            say!(
+                "not adopted — BLOCK holds. The ways past it: change what the graders \
+                 see, record your own reading (`pacrat grade {package} --grade N \
+                 --note …`), or accept the risk on the record with `pacrat \
+                 adopt-update {package} --commit {} --override-block --reason \"…\"`",
+                short_hash(&cand.commit)
+            );
+            return Ok(Adoption::Held);
+        }
+        (Verdict::Block, Some(reason)) => {
+            say!(
+                "OVERRIDE  adopting past a {} verdict, by hand",
+                Verdict::Block
+            );
+            say!("reason    {}", truncate(&visible_line(reason).0, 200));
+            // Future tense, deliberately: nothing is written until the
+            // prompt is answered, and a line that said "recorded" before a
+            // human declined would be pacrat lying about its own ledger.
+            say!(
+                "ledger    going through with this records it in {} — permanently, \
+                 and synced to every host",
+                store_rel(ctx, &ctx.decisions_path())
+            );
+            say!();
+            Some(reason)
+        }
+        (_, Some(_)) => {
+            // Not silently ignored: a human who typed a justification is
+            // owed the news that nothing was overridden and nothing filed.
+            say!(
+                "note      --override-block was given and this candidate is {verdict}, \
+                 not {} — nothing to override, and nothing recorded in the decision \
+                 ledger",
+                Verdict::Block
+            );
+            None
+        }
+        _ => None,
+    };
     if verdict == Verdict::Ungraded {
         // Ungraded holds the *automatic* loop. Here there is a human, and
         // they have just been shown the diff.
-        println!(
+        say!(
             "note      nothing has graded this candidate — ungraded holds the headless \
              loop, and is not a BLOCK; `pacrat review {package}` is where the diff is"
         );
@@ -251,28 +336,58 @@ fn execute_adopt(
             .map_or("(no reason recorded)".to_string(), |n| {
                 truncate(&visible_line(n).0, 120)
             });
-        println!("rejected  {} was refused: {note}", short_hash(&cand.commit));
-        if !yes {
-            println!("not adopted — re-adopting a candidate that was rejected takes --yes");
+        say!("rejected  {} was refused: {note}", short_hash(&cand.commit));
+        if !opts.yes {
+            say!("not adopted — re-adopting a candidate that was rejected takes --yes");
             return Ok(Adoption::Held);
         }
-        println!("proceeding anyway on --yes");
+        say!("proceeding anyway on --yes");
     }
 
-    if !yes && !vendor::confirm("adopt", package, short_hash(&cand.commit))? {
-        println!("not adopted");
+    if !opts.yes && !vendor::confirm("adopt", package, short_hash(&cand.commit))? {
+        say!("not adopted");
         return Ok(Adoption::Held);
     }
 
+    // The record before the act, and after the answer. Before, because if
+    // only one of the two survives it must be the one that says a human
+    // accepted a named risk — an adoption with no record is the audit trail
+    // ADR-001 decision 2 exists to keep. After the prompt, because a
+    // declined prompt is not a decision, and a ledger that filled up with
+    // overrides nobody went through with would be a ledger nobody believes.
+    if let Some(reason) = overriding {
+        decisions::record_override(ctx, package, &cand.commit, grade, reason)?;
+        say!(
+            "recorded  {} · {package} @ {} · override-block",
+            store_rel(ctx, &ctx.decisions_path()),
+            short_hash(&cand.commit)
+        );
+    }
+
     install(ctx, package, curated, cand)?;
+    if overriding.is_some() {
+        // Last line but one, where the eye lands: an adoption that went past
+        // a BLOCK must not read like an ordinary one.
+        say!();
+        say!(
+            "override  this adoption went past a {} verdict — `pacrat decisions` \
+             lists it",
+            Verdict::Block
+        );
+    }
     Ok(Adoption::Adopted)
 }
 
 /// Write the candidate into the store and advance the ledger.
-fn install(ctx: &Ctx, package: &str, curated: &Curated, cand: &Candidate) -> Result<(), String> {
+pub fn install(
+    ctx: &Ctx,
+    package: &str,
+    curated: &Curated,
+    cand: &Candidate,
+) -> Result<(), String> {
     fstree::install(&cand.tree, &cand.files, &curated.tree)
         .map_err(|e| format!("{e}\n       the store's {package} is unchanged"))?;
-    println!(
+    say!(
         "adopted   {} file{} → {}",
         cand.files.len(),
         if cand.files.len() == 1 { "" } else { "s" },
@@ -311,14 +426,14 @@ fn install(ctx: &Ctx, package: &str, curated: &Curated, cand: &Candidate) -> Res
             short_hash(&curated.entry.reviewed)
         )
     })?;
-    println!(
+    say!(
         "ledger    {} · {package} @ {}",
         store_rel(ctx, &ctx.sources_path()),
         short_hash(&cand.commit)
     );
 
-    println!();
-    println!("next      commit the store, then `pacrat build {package}`");
+    say!();
+    say!("next      commit the store, then `pacrat build {package}`");
     Ok(())
 }
 
@@ -346,7 +461,7 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
     }
 
     preamble(package, &curated);
-    let candidate = updates::ls_remote(&curated.entry.upstream, |line| println!("{line}"))?;
+    let candidate = updates::ls_remote(&curated.entry.upstream, |line| say!("{line}"))?;
     // An error (exit 1), where the same shape of nothing-to-do is exit 0 in
     // `adopt-update`. The asymmetry is real, not an oversight: adopt is
     // convergent — asked to make the store hold HEAD, and it already does,
@@ -378,13 +493,13 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
     entry.rejected_note = note.map(str::to_string);
     ctx.save_sources(&sources)?;
 
-    println!("rejected  {}", short_hash(&candidate));
+    say!("rejected  {}", short_hash(&candidate));
     if let Some(note) = note {
-        println!("note      {}", truncate(&visible_line(note).0, 120));
+        say!("note      {}", truncate(&visible_line(note).0, 120));
     }
-    println!("ledger    {}", store_rel(ctx, &ctx.sources_path()));
-    println!();
-    println!(
+    say!("ledger    {}", store_rel(ctx, &ctx.sources_path()));
+    say!();
+    say!(
         "next      commit the store. `pacrat updates` lists this as rejected rather \
          than pending until upstream moves past {}",
         short_hash(&candidate)
@@ -395,9 +510,9 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
 // ------------------------------------------------------------ the package
 
 /// A package these verbs can work on: in the ledger, with a tree.
-struct Curated {
-    entry: SourceEntry,
-    tree: PathBuf,
+pub struct Curated {
+    pub entry: SourceEntry,
+    pub tree: PathBuf,
 }
 
 /// Resolve the package, or say which of the four states it is in instead.
@@ -406,7 +521,7 @@ struct Curated {
 /// seen from the other side — vendoring refuses the one thing reviewing
 /// requires — and describing them twice, differently, would leave a reader
 /// wondering whether they are the same problem.
-fn curated(ctx: &Ctx, package: &str) -> Result<Curated, String> {
+pub fn curated(ctx: &Ctx, package: &str) -> Result<Curated, String> {
     if !valid_name(package) {
         return Err(format!(
             "{package:?} is not a package name — expected letters, digits, \
@@ -433,18 +548,18 @@ fn curated(ctx: &Ctx, package: &str) -> Result<Curated, String> {
 
 /// The upstream tree these verbs are deciding about, staged beside a copy of
 /// the store's.
-struct Candidate {
+pub struct Candidate {
     /// Scratch root, holding `clone/`, `reviewed/` and `candidate/`.
-    scratch: PathBuf,
+    pub scratch: PathBuf,
     /// The staged candidate tree: validated, and without the clone's `.git`.
-    tree: PathBuf,
+    pub tree: PathBuf,
     /// Its files, as [`fstree::files`] lists them — the exact set that would
     /// be installed.
-    files: Vec<String>,
-    commit: String,
+    pub files: Vec<String>,
+    pub commit: String,
     /// The candidate tree's content digest: what a grading of this candidate
     /// is a grading *of*.
-    digest: String,
+    pub digest: String,
 }
 
 /// Clone the upstream and stage both trees for comparison.
@@ -454,7 +569,7 @@ struct Candidate {
 /// it, `.git` never reaches the diff, and the digest computed here is the
 /// digest the store tree will have if this candidate is adopted — so a
 /// grading of the candidate stays valid across the adoption.
-fn fetch(package: &str, entry: &SourceEntry, store_tree: &Path) -> Result<Candidate, String> {
+pub fn fetch(package: &str, entry: &SourceEntry, store_tree: &Path) -> Result<Candidate, String> {
     let scratch = vendor::scratch_dir("review", package)?;
     match stage(&scratch, entry, store_tree) {
         Ok(candidate) => Ok(candidate),
@@ -524,7 +639,7 @@ fn clone_upstream(upstream: &str, dest: &Path) -> Result<(), String> {
     let dest_s = dest.to_string_lossy().into_owned();
     // `--` so that an upstream cannot be read as a git option.
     let argv = ["clone", "--", upstream, &dest_s];
-    println!("run       git {}", shown(&argv));
+    say!("run       git {}", shown(&argv));
 
     let mut cmd = Command::new("git");
     cmd.args(argv)
@@ -572,12 +687,12 @@ fn safe(text: &str) -> String {
 
 /// Scratch is ours either way; when it is not removed it is because someone
 /// still needs it, so it is named rather than merely left behind.
-fn finish(cand: &Candidate, remove: bool) {
+pub fn finish(cand: &Candidate, remove: bool) {
     if remove {
         let _ = fs::remove_dir_all(&cand.scratch);
     } else {
-        println!();
-        println!(
+        say!();
+        say!(
             "trees     {} — `{REVIEWED}` and `{CANDIDATE}` are the two sides of the \
              diff, yours to read with anything you like",
             cand.scratch.display()
@@ -589,30 +704,30 @@ fn finish(cand: &Candidate, remove: bool) {
 
 /// What is known before the network is touched — printed first, so the argv
 /// lines that follow are read as "this is what it is doing about that".
-fn preamble(package: &str, curated: &Curated) {
-    println!("package   {package}");
-    println!(
+pub fn preamble(package: &str, curated: &Curated) {
+    say!("package   {package}");
+    say!(
         "role      {}",
         crate::custody::label(Some(curated.entry.role.into()))
     );
-    println!("upstream  {}", safe(&curated.entry.upstream));
+    say!("upstream  {}", safe(&curated.entry.upstream));
 }
 
 /// What the fetch found: the two commits, their versions, and the bytes.
-fn header(curated: &Curated, cand: &Candidate) {
-    println!(
+pub fn header(curated: &Curated, cand: &Candidate) {
+    say!(
         "reviewed  {}{}",
         short_hash(&curated.entry.reviewed),
         version_of(&curated.tree)
     );
-    println!(
+    say!(
         "candidate {}{}",
         short_hash(&cand.commit),
         version_of(&cand.tree)
     );
-    println!("digest    {}", cand.digest);
+    say!("digest    {}", cand.digest);
     if !valid_commit(curated.entry.reviewed.trim()) {
-        println!(
+        say!(
             "warning   the ledger's reviewed commit is not an object id — the diff \
              below is against the store tree, which is the truth about what is there"
         );
@@ -642,7 +757,7 @@ fn pkgver(tree: &Path) -> Option<String> {
 }
 
 /// What the two trees do and do not share.
-struct Changes {
+pub struct Changes {
     changed: Vec<String>,
     added: Vec<String>,
     removed: Vec<String>,
@@ -653,7 +768,7 @@ struct Changes {
 ///
 /// Shared by `review` and `adopt-update` so the summary a human is shown
 /// before the prompt is the same summary the viewer showed them.
-fn changes_between(curated: &Curated, cand: &Candidate) -> Result<Changes, String> {
+pub fn changes_between(curated: &Curated, cand: &Candidate) -> Result<Changes, String> {
     let reviewed_files = fstree::files(&curated.tree)?;
     Ok(changes(&reviewed_files, &cand.files, |rel| {
         // Unreadable either side counts as changed: the diff will say what
@@ -697,19 +812,19 @@ fn changes(reviewed: &[String], candidate: &[String], same: impl Fn(&str) -> boo
 }
 
 impl Changes {
-    fn render(&self) {
-        println!();
+    pub fn render(&self) {
+        say!();
         for (label, names) in [
             ("changed", &self.changed),
             ("added", &self.added),
             ("removed", &self.removed),
         ] {
             if !names.is_empty() {
-                println!("{label:<9} {}", names_of(names));
+                say!("{label:<9} {}", names_of(names));
             }
         }
         if !self.unchanged.is_empty() {
-            println!("unchanged {}", names_of(&self.unchanged));
+            say!("unchanged {}", names_of(&self.unchanged));
         }
 
         // `*.install` runs as root at install time, which is the classic
@@ -722,7 +837,7 @@ impl Changes {
             .cloned()
             .collect();
         if !installs.is_empty() {
-            println!(
+            say!(
                 "install   {} — unchanged, and still run as root at install time",
                 names_of(&installs)
             );
@@ -779,7 +894,7 @@ fn diff(scratch: &Path) -> Result<Diff, String> {
         REVIEWED,
         CANDIDATE,
     ];
-    println!("run       git {}", shown(&argv));
+    say!("run       git {}", shown(&argv));
 
     let mut cmd = Command::new("git");
     cmd.args(argv);
@@ -847,30 +962,30 @@ fn render_diff(diff: &Diff, changes: &Changes) -> bool {
     let (safe, hidden) = visible(&diff.text);
     let total = safe.lines().count();
     for line in safe.lines().take(DIFF_LINES) {
-        println!("{line}");
+        say!("{line}");
     }
     // "end diff" cannot be forged from inside the diff: every content line
     // git prints is prefixed with '+', '-' or a space, and its own headers
     // all begin with other words.
-    println!("end diff  {}", changes.summary());
+    say!("end diff  {}", changes.summary());
 
     let over = total.saturating_sub(DIFF_LINES);
     if over > 0 {
-        println!(
+        say!(
             "…         {over} further line{} not shown — a diff this long is itself \
              worth a second look",
             if over == 1 { "" } else { "s" }
         );
     }
     if diff.cut {
-        println!(
+        say!(
             "warning   the diff hit pacrat's {} MB ceiling and is not all of it — \
              read the trees themselves before deciding",
             proc::PIPE_LIMIT / (1024 * 1024)
         );
     }
     if hidden > 0 {
-        println!(
+        say!(
             "warning   {hidden} control character{} in the diff shown as ␛-style \
              stand-ins — text that tries to hide from a reviewer",
             if hidden == 1 { "" } else { "s" }
@@ -879,29 +994,35 @@ fn render_diff(diff: &Diff, changes: &Changes) -> bool {
     over > 0 || diff.cut
 }
 
-/// The gradings on file for this candidate's bytes, and the verdict they
-/// come to.
+/// The gradings on file for this candidate's bytes, the verdict they come
+/// to, and the grade behind it — which a recorded override has to name.
 ///
 /// Read-only, deliberately: `review` does not grade, and neither does
 /// `adopt-update`. Running an LLM because someone asked to look at a diff
 /// would be a surprise with a bill attached, and a grading made *during* a
-/// decision is one the decider never had the chance to weigh.
-fn show_gradings(ctx: &Ctx, package: &str, cand: &Candidate) -> Result<Verdict, String> {
+/// decision is one the decider never had the chance to weigh. The verb that
+/// does grade a candidate is `update`, where grading is a step of its own
+/// with its own gate.
+fn show_gradings(
+    ctx: &Ctx,
+    package: &str,
+    cand: &Candidate,
+) -> Result<(Verdict, Option<u8>), String> {
     let gradings = grade::cached(ctx, package, &cand.commit, &cand.digest)?;
 
-    println!();
+    say!();
     if gradings.is_empty() {
-        println!("gradings  none on file for these bytes");
-        println!(
+        say!("gradings  none on file for these bytes");
+        say!(
             "reason    `pacrat grade` reads the *store* tree, so this candidate can be \
-             graded after it is adopted — or before, through the update loop \
-             (`pacrat update`, not yet implemented)"
+             graded after it is adopted — or before it is, by `pacrat update`, which \
+             grades the staged candidate and is the only verb that does"
         );
     } else {
-        println!("gradings  {} on file for these bytes", gradings.len());
+        say!("gradings  {} on file for these bytes", gradings.len());
     }
     for g in &gradings {
-        println!();
+        say!();
         grade::print_cached(g);
     }
 
@@ -911,28 +1032,26 @@ fn show_gradings(ctx: &Ctx, package: &str, cand: &Candidate) -> Result<Verdict, 
         if gradings.iter().any(|g| g.grader == grader.name) {
             continue;
         }
-        println!();
-        println!("grader    {}", truncate(&grader.name, 40));
+        say!();
+        say!("grader    {}", truncate(&grader.name, 40));
         match grade::cached_failure(package, &cand.commit, &cand.digest, &grader.name) {
-            Some(reason) => println!("result    no grading — it failed: {reason}"),
-            None => println!("result    no grading on file for this candidate"),
+            Some(reason) => say!("result    no grading — it failed: {reason}"),
+            None => say!("result    no grading on file for this candidate"),
         }
     }
 
-    println!();
-    Ok(grade::verdict_line(
-        &ctx.config.thresholds,
-        grade::cached_grade(&gradings),
-    ))
+    say!();
+    let grade = grade::cached_grade(&gradings);
+    Ok((grade::verdict_line(&ctx.config.thresholds, grade), grade))
 }
 
 fn next_steps(package: &str, cand: &Candidate) {
-    println!();
-    println!(
+    say!();
+    say!(
         "next      pacrat adopt-update {package} --commit {}",
         cand.commit
     );
-    println!(
+    say!(
         "          pacrat reject {package} --note \"…\"  ·  pacrat grade {package} \
          --grade N --note \"…\" (after adopting)"
     );
@@ -941,7 +1060,7 @@ fn next_steps(package: &str, cand: &Candidate) {
 // ---------------------------------------------------------------- helpers
 
 /// A store path as the user thinks of it: relative to the store root.
-fn store_rel(ctx: &Ctx, path: &Path) -> String {
+pub fn store_rel(ctx: &Ctx, path: &Path) -> String {
     path.strip_prefix(&ctx.store)
         .unwrap_or(path)
         .display()

@@ -64,6 +64,7 @@ use pacrat_core::pkg::valid_name;
 use crate::ctx::Ctx;
 use crate::fstree;
 use crate::out::{list_preview, shell_quote, visible};
+use crate::say;
 use crate::setup;
 
 /// Exit code for "ran fine, but deliberately did not do all of it" —
@@ -131,17 +132,17 @@ pub fn run(ctx: &Ctx, packages: &[String]) -> Result<(), String> {
     let plan = resolve(&ledger, packages)?;
 
     if plan.build.is_empty() && plan.no_tree.is_empty() {
-        println!(
+        say!(
             "nothing to build — {} lists no vendored package yet;",
             ctx.sources_path().display()
         );
-        println!("`pacrat vendor <package>` puts one there.");
+        say!("`pacrat vendor <package>` puts one there.");
         return Ok(());
     }
 
-    println!("repo      [{}] {}", repo.name, repo_path.display());
-    println!("db        {}", db.display());
-    println!(
+    say!("repo      [{}] {}", repo.name, repo_path.display());
+    say!("db        {}", db.display());
+    say!(
         "packages  {}",
         if plan.build.is_empty() {
             "none buildable".to_string()
@@ -151,7 +152,7 @@ pub fn run(ctx: &Ctx, packages: &[String]) -> Result<(), String> {
     );
 
     let scratch = scratch_root()?;
-    println!("scratch   {}", scratch.display());
+    say!("scratch   {}", scratch.display());
 
     let mut results: Vec<(String, Outcome)> = Vec::new();
     for package in &plan.build {
@@ -186,12 +187,12 @@ pub fn run(ctx: &Ctx, packages: &[String]) -> Result<(), String> {
         .filter(|(_, o)| matches!(o, Outcome::Built(_)))
         .map(|(name, _)| name.clone())
         .collect();
-    println!();
-    println!("repo      {}", db.display());
+    say!();
+    say!("repo      {}", db.display());
     if built.is_empty() {
-        println!("served    nothing — no package reached the repo in this run");
+        say!("served    nothing — no package reached the repo in this run");
     } else {
-        println!("served    {}", list_preview(&built, 12));
+        say!("served    {}", list_preview(&built, 12));
     }
     if !plan.no_tree.is_empty() {
         // In a mixed run a failure owns the exit code, so name the code only
@@ -201,26 +202,26 @@ pub fn run(ctx: &Ctx, packages: &[String]) -> Result<(), String> {
         } else {
             String::from(" (a failure owns the exit code);")
         };
-        println!(
+        say!(
             "held      {} — not built,{exit_note} whatever is",
             list_preview(&plan.no_tree, 12)
         );
-        println!("          listed as served above is in the repo regardless");
+        say!("          listed as served above is in the repo regardless");
     }
     let state = setup::state(repo);
     if state.conf_section {
         // Only worth saying when pacman has actually been told about the
         // repo; otherwise the line is advice that cannot work.
-        println!("next      sudo pacman -Sy && sudo pacman -S <package>");
+        say!("next      sudo pacman -Sy && sudo pacman -S <package>");
     } else {
-        println!(
+        say!(
             "note      [{}] is not in /etc/pacman.conf, so nothing can install from",
             repo.name
         );
-        println!("          this repo yet — `pacrat setup` prints the section to add.");
+        say!("          this repo yet — `pacrat setup` prints the section to add.");
     }
     if failed > 0 {
-        println!(
+        say!(
             "scratch   kept at {} (build trees and makepkg output)",
             scratch.display()
         );
@@ -253,8 +254,8 @@ fn report(results: &[(String, Outcome)]) {
         .map(|(name, _)| name.len())
         .max()
         .unwrap_or(0);
-    println!();
-    println!("summary");
+    say!();
+    say!("summary");
     for (name, outcome) in results {
         let (verdict, why) = match outcome {
             Outcome::Built(n) => (
@@ -265,12 +266,12 @@ fn report(results: &[(String, Outcome)]) {
             Outcome::Skipped(why) => ("skipped", why.clone()),
         };
         let mut lines = why.lines();
-        println!(
+        say!(
             "  {verdict}  {name:<width$}  {}",
             lines.next().unwrap_or_default()
         );
         for line in lines {
-            println!("{:indent$}{line}", "", indent = 13 + width);
+            say!("{:indent$}{line}", "", indent = 13 + width);
         }
     }
 }
@@ -365,8 +366,8 @@ fn build_one(
     repo_path: &Path,
     db: &Path,
 ) -> Result<usize, String> {
-    println!();
-    println!("── {package}");
+    say!();
+    say!("── {package}");
 
     let tree = tree_path(ctx, package);
     // Validates as it walks — a symlink that appeared in the store since the
@@ -389,15 +390,15 @@ fn build_one(
     fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     fs::create_dir_all(&build).map_err(|e| format!("{}: {e}", build.display()))?;
     fstree::install(&tree, &files, &src)?;
-    println!(
+    say!(
         "tree      {} ({} file{})",
         tree.display(),
         files.len(),
         if files.len() == 1 { "" } else { "s" }
     );
-    println!("copy      {}", src.display());
-    println!("pkgdest   {}", out.display());
-    println!("builddir  {}", build.display());
+    say!("copy      {}", src.display());
+    say!("pkgdest   {}", out.display());
+    say!("builddir  {}", build.display());
 
     // Asked before the build, so this is the reviewed text's own account of
     // what it produces — `package()` has not run yet and cannot have edited
@@ -407,7 +408,7 @@ fn build_one(
     // through the same escape as every other untrusted print keeps the rule
     // uniform instead of resting on an upstream lint staying put.
     let (declared_shown, _) = visible(&list_preview(&sorted(&declared), 8));
-    println!("declares  {declared_shown}");
+    say!("declares  {declared_shown}");
 
     let mut makepkg = makepkg_in(&src, &build, &out);
     makepkg.args(MAKEPKG_ARGV);
@@ -487,7 +488,7 @@ fn build_one(
             };
             match place(&from, &to) {
                 Ok(p) => {
-                    println!("serve     {}", safe(&to));
+                    say!("serve     {}", safe(&to));
                     placed.push(p);
                 }
                 Err(e) => {
@@ -807,8 +808,14 @@ enum RunErr {
 fn run_visible(cmd: &mut Command) -> Result<(), RunErr> {
     let program = cmd.get_program().to_string_lossy().into_owned();
     let shown = argv_line(cmd);
-    println!("run       {shown}");
+    say!("run       {shown}");
     let status = cmd
+        // makepkg writes to the descriptor it inherits, so a run whose
+        // chatter belongs on stderr has to move the child's stdout too — a
+        // build transcript would otherwise sit in front of a JSON object
+        // just as surely as one of pacrat's own lines would. Ordinarily
+        // this *is* inherit.
+        .stdout(crate::out::child_stdout())
         .status()
         .map_err(|e| RunErr::Spawn(format!("{program}: {e}")))?;
     if !status.success() {
@@ -822,7 +829,7 @@ fn run_visible(cmd: &mut Command) -> Result<(), RunErr> {
 /// parse says why in the place the user is already looking.
 fn run_capture(cmd: &mut Command) -> Result<String, RunErr> {
     let shown = argv_line(cmd);
-    println!("run       {shown}");
+    say!("run       {shown}");
     let out = cmd
         .stderr(Stdio::inherit())
         .output()

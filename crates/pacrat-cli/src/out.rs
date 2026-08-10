@@ -1,5 +1,71 @@
 //! Tiny output helpers shared by the CLI verbs.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Is this run's human-readable chatter going to stderr?
+///
+/// One verb needs this: `pacrat update --format json`, whose stdout belongs
+/// to a single object a machine parses. The loop drives `build`, and `build`
+/// talks — argv lines, makepkg's whole transcript, a summary table — so
+/// "chatter to stderr" has to be a property of the *run* rather than an
+/// argument threaded through a module that has no idea a JSON caller exists.
+/// It is set once, before any work, and never changes again.
+///
+/// stdout is still the default, and every other verb is untouched: this
+/// switches where a line lands, never whether it is printed. ADR-001's
+/// always-visible-calls rule has no quiet mode.
+static CHATTER_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// Send this run's chatter to stderr. Call before anything prints.
+pub fn chatter_to_stderr(on: bool) {
+    CHATTER_TO_STDERR.store(on, Ordering::Relaxed);
+}
+
+pub fn chatter_is_stderr() -> bool {
+    CHATTER_TO_STDERR.load(Ordering::Relaxed)
+}
+
+/// `println!`, to wherever this run's chatter goes.
+///
+/// Used by the modules the one-shot drives. A verb that can never run under
+/// `--format json` may keep using `println!` — and most do, because a rule
+/// nobody has to think about is better than one applied everywhere for
+/// symmetry.
+#[macro_export]
+macro_rules! say {
+    () => { $crate::out::say_line("") };
+    ($($arg:tt)*) => { $crate::out::say_line(&format!($($arg)*)) };
+}
+
+pub fn say_line(line: &str) {
+    if chatter_is_stderr() {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+}
+
+/// A child process's stdout, pointed wherever this run's chatter goes.
+///
+/// makepkg writes to the descriptor it inherits, so routing pacrat's own
+/// lines is only half the job — a build transcript on stdout would sit in
+/// front of the JSON object just as surely. Opened in **append** mode: `Z`
+/// creating `/dev/stderr` with `O_TRUNC` would empty the file when stderr is
+/// a redirect rather than a terminal.
+///
+/// A failure to open it falls back to inheriting, which is the honest
+/// degradation — losing a build's output would be worse than a caller
+/// having to cope with a stray line.
+pub fn child_stdout() -> std::process::Stdio {
+    if !chatter_is_stderr() {
+        return std::process::Stdio::inherit();
+    }
+    match std::fs::OpenOptions::new().append(true).open("/dev/stderr") {
+        Ok(f) => std::process::Stdio::from(f),
+        Err(_) => std::process::Stdio::inherit(),
+    }
+}
+
 /// Comma-joined list capped at `max` items, with an "… and N more" tail —
 /// the scroll-don't-truncate rule belongs to the TUI; the CLI previews.
 pub fn list_preview(items: &[String], max: usize) -> String {
@@ -78,6 +144,32 @@ pub fn epoch_date(secs: i64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// A unix timestamp as `YYYY-MM-DDTHH:MM:SSZ` — the one spelling the
+/// decision ledger accepts ([`pacrat_core::decisions::valid_timestamp`]).
+///
+/// The date half is [`epoch_date`]'s arithmetic; the time half is three
+/// divisions. A calendar crate would bring a timezone database along to
+/// answer a question that has no timezone in it: pacrat records when
+/// something happened in UTC, and reading it back is a string comparison.
+pub fn epoch_rfc3339(secs: i64) -> String {
+    let day = secs.rem_euclid(86_400);
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        epoch_date(secs),
+        day / 3_600,
+        (day % 3_600) / 60,
+        day % 60
+    )
+}
+
+/// Now, as the ledger writes it.
+pub fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    epoch_rfc3339(secs as i64)
 }
 
 /// Make untrusted text safe to show a reviewer, and say how much was hidden.
@@ -212,6 +304,24 @@ mod tests {
         assert_eq!(epoch_date(1_709_164_800), "2024-02-29");
         assert_eq!(epoch_date(1_709_251_199), "2024-02-29");
         assert_eq!(epoch_date(1_709_251_200), "2024-03-01");
+    }
+
+    /// The ledger's own validator is the spec; this is the writer, and the
+    /// two are checked against each other rather than by eye.
+    #[test]
+    fn a_recorded_timestamp_is_one_the_ledger_will_read_back() {
+        assert_eq!(epoch_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(epoch_rfc3339(1_765_883_803), "2025-12-16T11:16:43Z");
+        // The last second of a day, and the first of the next.
+        assert_eq!(epoch_rfc3339(1_709_251_199), "2024-02-29T23:59:59Z");
+        assert_eq!(epoch_rfc3339(1_709_251_200), "2024-03-01T00:00:00Z");
+        for secs in [0, 1, 59, 3_599, 86_399, 1_765_883_803, 4_102_444_800] {
+            assert!(
+                pacrat_core::decisions::valid_timestamp(&epoch_rfc3339(secs)),
+                "{secs}"
+            );
+        }
+        assert!(pacrat_core::decisions::valid_timestamp(&now_rfc3339()));
     }
 
     #[test]

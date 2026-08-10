@@ -58,6 +58,7 @@ use pacrat_core::{Thresholds, Verdict};
 use crate::ctx::{self, Ctx};
 use crate::fstree;
 use crate::out::{shell_quote, short_hash, truncate, visible_line};
+use crate::say;
 use crate::HELD;
 
 /// How often the runner asks whether the child has exited. Short enough that
@@ -238,15 +239,15 @@ fn record_manual(
     write_grading(&path, &digest, &report.to_json())?;
     let _ = fs::remove_file(failed_path(&dir, commit, MANUAL));
 
-    println!("package   {package}");
-    println!("commit    {commit}");
-    println!("tree      {}", tree.display());
-    println!("digest    {digest}");
-    println!("grader    {MANUAL}");
-    println!("recorded  {}", path.display());
+    say!("package   {package}");
+    say!("commit    {commit}");
+    say!("tree      {}", tree.display());
+    say!("digest    {digest}");
+    say!("grader    {MANUAL}");
+    say!("recorded  {}", path.display());
     let (safe_note, _) = visible_line(note);
-    println!("note      {safe_note}");
-    println!();
+    say!("note      {safe_note}");
+    say!();
     hold_if_held(verdict_line(&ctx.config.thresholds, Some(grade)));
     Ok(())
 }
@@ -272,34 +273,91 @@ fn run_graders(
 
     let dir = cache_dir(package)?;
 
-    // Gradings nobody asked for this run — a manual one, or a grader since
-    // removed from the config. Read before the early exit below, because a
-    // recorded manual grading must be readable back on a host with no
-    // external graders at all.
-    let others = other_cached(&dir, commit, &digest, &ctx.config.graders, package);
-    if ctx.config.graders.is_empty() && others.is_empty() {
+    // A host with no graders and nothing on file has been asked to do
+    // something impossible, and says so before it prints a header for work
+    // that will not happen. Only reached when the config is empty, which is
+    // exactly when the scan it costs is cheapest.
+    if ctx.config.graders.is_empty() && scan_cached(&dir, commit, &digest, package).is_empty() {
         return Err(no_graders_message(package));
     }
 
-    println!("package   {package}");
-    println!("commit    {commit}");
-    println!("tree      {}", tree.display());
-    println!("digest    {digest}");
+    say!("package   {package}");
+    say!("commit    {commit}");
+    say!("tree      {}", tree.display());
+    say!("digest    {digest}");
+
+    let graded = grade_tree(ctx, package, commit, &tree, &digest, refresh)?;
+    hold_if_held(graded.verdict);
+    Ok(())
+}
+
+/// What a grading run came to.
+pub struct Graded {
+    pub verdict: Verdict,
+    /// The worst grade among the gradings entitled to answer, or `None` when
+    /// nobody answered. Carried beside the verdict because a decision that
+    /// overrides one has to record *what* it overrode.
+    pub grade: Option<u8>,
+    /// Nothing ran and nothing was on file: this host has no graders
+    /// configured and no cached or manual grading of these bytes. Ungraded
+    /// either way — the distinction is for the caller's wording, never for
+    /// its decision.
+    pub no_graders: bool,
+}
+
+/// Run this host's graders against a tree, fold in what is already on file,
+/// and come to a verdict. Prints the per-grader report as it goes.
+///
+/// **The tree is a parameter, and that is the whole point of this function
+/// existing.** `pacrat grade` runs it against the store tree, where the
+/// bytes are the reviewed ones; the update loop runs it against a *staged
+/// candidate* — bytes upstream has published and nobody has adopted — which
+/// is the only way a gate can decide about a candidate before it is in the
+/// store. Everything else is identical, deliberately: same argv, same
+/// timeout, same cache format, same aggregation. Two grading paths that
+/// differed anywhere would be two paths that could come to different
+/// answers about the same bytes.
+///
+/// The cache key is unchanged too — `(commit, grader)` as the filename, the
+/// tree digest as the authority — so a candidate graded here and then
+/// adopted is *still graded* afterwards: adoption installs exactly these
+/// bytes, so the digest that made this grading matches the store tree the
+/// next reader hashes. Idempotent across runs for the same reason: a second
+/// `pacrat update` over an unmoved candidate reads the file rather than
+/// paying for the grader again.
+pub fn grade_tree(
+    ctx: &Ctx,
+    package: &str,
+    commit: &str,
+    tree: &Path,
+    digest: &str,
+    refresh: bool,
+) -> Result<Graded, String> {
+    // Re-checked here rather than trusted from the caller: this value becomes
+    // a path component of the cache, and this function now has two callers.
+    let commit = check_commit(commit)?;
+    let dir = cache_dir(package)?;
+
+    // Gradings nobody asked for this run — a manual one, or a grader since
+    // removed from the config. Read first, because a recorded manual grading
+    // must be readable back on a host with no external graders at all.
+    let others = other_cached(&dir, commit, digest, &ctx.config.graders, package);
+    let no_graders = ctx.config.graders.is_empty() && others.is_empty();
 
     let subj = Subj {
         package,
         commit,
         tree: &tree.to_string_lossy(),
-        digest: &digest,
+        digest,
         refresh,
     };
     let mut answers: Vec<Answer> = Vec::new();
 
     for grader in &ctx.config.graders {
-        println!();
-        println!("grader    {}", grader.name);
+        say!();
+        say!("grader    {}", grader.name);
         let outcome = grade_with(grader, &dir, &subj);
-        report_outcome(&dir, commit, &digest, &grader.name, &outcome);
+        report_outcome(&dir, commit, digest, &grader.name, &outcome);
         answers.push(Answer {
             name: grader.name.clone(),
             standing: Standing::Configured,
@@ -308,11 +366,11 @@ fn run_graders(
     }
 
     for found in others {
-        println!();
-        println!("grader    {}", found.grader);
-        println!("cache     {}", found.path.display());
+        say!();
+        say!("grader    {}", found.grader);
+        say!("cache     {}", found.path.display());
         if found.same_bytes_elsewhere(commit) {
-            println!("bytes     {}", same_bytes_line(&found.filed_under));
+            say!("bytes     {}", same_bytes_line(&found.filed_under));
         }
         let standing = if found.grader == MANUAL {
             Standing::Manual
@@ -323,7 +381,7 @@ fn run_graders(
             report: found.report,
             took: None,
         };
-        report_outcome(&dir, commit, &digest, &found.grader, &outcome);
+        report_outcome(&dir, commit, digest, &found.grader, &outcome);
         answers.push(Answer {
             name: found.grader,
             standing,
@@ -331,9 +389,13 @@ fn run_graders(
         });
     }
 
-    println!();
-    hold_if_held(summarize(ctx, &answers));
-    Ok(())
+    say!();
+    let (verdict, grade) = summarize(ctx, &answers);
+    Ok(Graded {
+        verdict,
+        grade,
+        no_graders,
+    })
 }
 
 /// One grader's answer, and whether it is entitled to answer for this run.
@@ -396,23 +458,23 @@ fn grade_with(grader: &Grader, dir: &Path, subj: &Subj) -> Outcome {
     // optimisation, not a correctness fix (task #28).
     let cache = ok_path(dir, subj.commit, &grader.name);
     if subj.refresh {
-        println!("refresh   ignoring any cached grading (--refresh)");
+        say!("refresh   ignoring any cached grading (--refresh)");
     } else {
         match read_cache(&cache, subj.package, subj.commit, subj.digest) {
             CacheLook::Hit(report) => {
-                println!("cache     {}", cache.display());
+                say!("cache     {}", cache.display());
                 return Outcome::Graded { report, took: None };
             }
             CacheLook::Miss => {}
             // The tree is not the tree that was graded. Not an error and not
             // a hit: the grading was true about bytes that are gone.
             CacheLook::Stale => {
-                println!("stale     the store tree changed since it was graded — grading again")
+                say!("stale     the store tree changed since it was graded — grading again")
             }
             // A cache entry we cannot trust is not a reason to hold — it is a
             // reason to ask again — but the user should know it was there.
             CacheLook::Unusable(e) => {
-                println!("warning   ignoring {}: {e}", cache.display())
+                say!("warning   ignoring {}: {e}", cache.display())
             }
         }
     }
@@ -425,7 +487,7 @@ fn grade_with(grader: &Grader, dir: &Path, subj: &Subj) -> Outcome {
         .join(" ");
     // Announced before it runs: a grader may sit for its whole timeout, and
     // ADR-001's always-visible-calls rule has no exception for slow ones.
-    println!("run       {shown}");
+    say!("run       {shown}");
 
     let timeout = Duration::from_secs(grader.timeout_s);
     let ran = match run_with_timeout(&argv, timeout) {
@@ -482,7 +544,7 @@ fn grade_with(grader: &Grader, dir: &Path, subj: &Subj) -> Outcome {
     // hits — the grader would be re-run, and paid for, on every invocation.
     // The tree digest recorded alongside is what the next read checks.
     if let Err(e) = write_grading(&cache, subj.digest, &text) {
-        println!("warning   {e}");
+        say!("warning   {e}");
     }
     let _ = fs::remove_file(failed_path(dir, subj.commit, &grader.name));
     Outcome::Graded {
@@ -507,14 +569,14 @@ fn print_grading(name: &str, report: &GradeReport, freshness: &str) {
     if report.scale != PACRAT_SCALE {
         line.push_str(&format!(" · pacrat {} of 0-4", report.pacrat_grade()));
     }
-    println!("result    {line}");
+    say!("result    {line}");
 
     let (reported, _) = visible_line(&report.grader);
     if reported != name {
-        println!("reports   as {:?}", truncate(&reported, 40));
+        say!("reports   as {:?}", truncate(&reported, 40));
     }
     if let Some(note) = report.meta.get("note").and_then(|v| v.as_str()) {
-        println!("note      {}", truncate(&visible_line(note).0, 90));
+        say!("note      {}", truncate(&visible_line(note).0, 90));
     }
 
     for f in report.top_findings(FINDINGS_SHOWN) {
@@ -523,10 +585,10 @@ fn print_grading(name: &str, report: &GradeReport, freshness: &str) {
             Some(s) => format!("{} · ", truncate(&visible_line(s).0, 30)),
             None => String::new(),
         };
-        println!("finding   [{}] {span}{}", f.level, truncate(&title, 80));
+        say!("finding   [{}] {span}{}", f.level, truncate(&title, 80));
     }
     if report.findings.len() > FINDINGS_SHOWN {
-        println!(
+        say!(
             "          … and {} more finding(s)",
             report.findings.len() - FINDINGS_SHOWN
         );
@@ -543,7 +605,7 @@ fn report_outcome(dir: &Path, commit: &str, digest: &str, name: &str, outcome: &
             print_grading(name, report, &freshness);
         }
         Outcome::Failed { reason, elapsed } => {
-            println!(
+            say!(
                 "result    {} · {} · {:.1}s",
                 Verdict::Ungraded,
                 truncate(reason, 120),
@@ -553,20 +615,22 @@ fn report_outcome(dir: &Path, commit: &str, digest: &str, name: &str, outcome: &
             match record_failure(&path, name, commit, digest, reason) {
                 // Kept so a later run — or the jobs view — can say why this
                 // grader contributed nothing, without re-running it.
-                Ok(()) => println!("recorded  {}", path.display()),
-                Err(e) => println!("warning   {e}"),
+                Ok(()) => say!("recorded  {}", path.display()),
+                Err(e) => say!("warning   {e}"),
             }
         }
     }
 }
 
-/// Print the caveats, then the verdict.
+/// Print the caveats, then the verdict. Returns the verdict and the grade it
+/// was derived from — a caller that records a decision has to be able to say
+/// what it decided against.
 ///
-/// In that order on purpose: the verdict is the last line, which is what a
+/// Caveats first on purpose: the verdict is the last line, which is what a
 /// reader scrolled to the bottom sees and what a screenshot catches. A
 /// caveat printed *after* it reads as a footnote to a decision already made,
 /// when it is really a qualification of it.
-fn summarize(ctx: &Ctx, answers: &[Answer]) -> Verdict {
+fn summarize(ctx: &Ctx, answers: &[Answer]) -> (Verdict, Option<u8>) {
     let contributions: Vec<Contribution> = answers.iter().map(Answer::contribution).collect();
     let quorum = has_quorum(&contributions);
     let worst = worst_grade(&contributions);
@@ -590,7 +654,7 @@ fn summarize(ctx: &Ctx, answers: &[Answer]) -> Verdict {
         if quorum {
             // Worst-wins over what answered is only sound if the reader
             // knows what did not: the missing grader could have been worse.
-            println!(
+            say!(
                 "warning   {} of {} configured grader{} produced no grading ({}) — this \
                  verdict rests on what did answer",
                 failed.len(),
@@ -603,7 +667,7 @@ fn summarize(ctx: &Ctx, answers: &[Answer]) -> Verdict {
                 failed.join(", ")
             );
         } else {
-            println!(
+            say!(
                 "reason    no configured grader answered ({} failed: {}) and there is no \
                  manual grading — ungraded holds; it is never read as proceed",
                 failed.len(),
@@ -611,7 +675,7 @@ fn summarize(ctx: &Ctx, answers: &[Answer]) -> Verdict {
             );
         }
     } else if !quorum && manual.is_empty() && answered.is_empty() {
-        println!(
+        say!(
             "reason    nothing graded this subject — ungraded holds; it is never read \
              as proceed"
         );
@@ -623,13 +687,13 @@ fn summarize(ctx: &Ctx, answers: &[Answer]) -> Verdict {
     for a in &retired {
         let grade = a.grade().unwrap_or_default();
         if quorum {
-            println!(
+            say!(
                 "note      {} is not in this host's config; its cached grade {grade} still \
                  counts toward the worst",
                 a.name
             );
         } else {
-            println!(
+            say!(
                 "note      {} has a cached grade of {grade} on file, but a grader this host \
                  no longer runs cannot answer for this run — it can only make a verdict \
                  worse, never make one exist",
@@ -638,7 +702,8 @@ fn summarize(ctx: &Ctx, answers: &[Answer]) -> Verdict {
         }
     }
 
-    verdict_line(&ctx.config.thresholds, if quorum { worst } else { None })
+    let grade = if quorum { worst } else { None };
+    (verdict_line(&ctx.config.thresholds, grade), grade)
 }
 
 /// The line the whole command exists to print. The thresholds are named on
@@ -652,11 +717,12 @@ pub fn verdict_line(t: &Thresholds, grade: Option<u8>) -> Verdict {
     let verdict = t.verdict(grade);
     let named = format!("pacrat thresholds warn≥{} block≥{}", t.warn_at, t.block_at);
     match grade {
-        Some(g) => println!(
+        Some(g) => say!(
             "grade {g} of {}-{} → {verdict} ({named})",
-            PACRAT_SCALE.min, PACRAT_SCALE.max
+            PACRAT_SCALE.min,
+            PACRAT_SCALE.max
         ),
-        None => println!("no grade → {verdict} ({named})"),
+        None => say!("no grade → {verdict} ({named})"),
     }
     verdict
 }
@@ -1175,13 +1241,13 @@ fn read_failure(path: &Path, digest: &str) -> Option<String> {
 /// a reviewer reading `grade` must be reading the same report.
 pub fn print_cached(c: &Cached) {
     let (name, _) = visible_line(&c.grader);
-    println!("grader    {}", truncate(&name, 40));
+    say!("grader    {}", truncate(&name, 40));
     print_grading(&c.grader, &c.report, "cached");
     if let Some(filed_as) = &c.filed_as {
-        println!("bytes     {}", same_bytes_line(filed_as));
+        say!("bytes     {}", same_bytes_line(filed_as));
     }
     if c.standing == Standing::Retired {
-        println!(
+        say!(
             "standing  {} is not in this host's config — its grade can make this \
              verdict worse, and can never make one exist",
             truncate(&name, 40)

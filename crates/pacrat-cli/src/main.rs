@@ -5,6 +5,7 @@ mod aur;
 mod build;
 mod ctx;
 mod custody;
+mod decisions;
 mod fstree;
 mod grade;
 mod hosts;
@@ -18,6 +19,7 @@ mod search;
 mod setup;
 mod status;
 mod sync;
+mod update;
 mod updates;
 mod vendor;
 
@@ -65,8 +67,24 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// One-shot update loop: detect → grade → decide → build
-    Update,
+    /// One-shot update loop: detect → grade → decide → build → served
+    ///
+    /// The headless half of every verb below it, and the entry point a timer
+    /// uses. BLOCK always holds here and there is no override — that door is
+    /// `adopt-update --override-block`, where a human writes down why.
+    ///
+    /// Exits 0 when there was nothing to do or everything pending was
+    /// adopted and built, 10 when anything was held, and 1 when the loop
+    /// could not do its job (a failed build, or an upstream it could not ask
+    /// about at all).
+    Update {
+        /// How much runs without asking (default: config `update_mode`, semi)
+        #[arg(long, value_enum)]
+        mode: Option<update::ModeArg>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = updates::Format::Text)]
+        format: updates::Format,
+    },
     /// List pending updates with grades
     ///
     /// Exits 0 when nothing is pending, 10 when there are updates to look at,
@@ -98,6 +116,16 @@ enum Command {
         /// candidate that was rejected
         #[arg(long)]
         yes: bool,
+        /// Adopt past a BLOCK. The only path there is, it needs --commit and
+        /// --reason, and it records the decision in the store's ledger
+        /// permanently (ADR-001 decision 2).
+        #[arg(long)]
+        override_block: bool,
+        /// Why the BLOCK is being accepted. Required with --override-block;
+        /// this sentence is the friction, and it is what a reader six months
+        /// from now will have to go on.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Refuse the current candidate, so `updates` stops calling it pending
     Reject {
@@ -125,6 +153,8 @@ enum Command {
     /// Build vendored packages into the local repo (no args: all of them).
     /// Builds and serves only — installing is `sudo pacman -Sy <package>`.
     Build { packages: Vec<String> },
+    /// Accepted risks on the record: overrides and trust decisions
+    Decisions,
     /// Host-vs-manifest matrix
     Hosts,
     /// Plan this host toward the manifest (prints commands, runs none)
@@ -163,6 +193,50 @@ enum Command {
 /// verb that can decline shares it: a refused review and a pending update are
 /// the same kind of answer to a script or a timer.
 pub const HELD: i32 = 10;
+
+/// `--reason` belongs to `--override-block` and to nothing else.
+///
+/// Checked here rather than in `review`, because this is a statement about
+/// the *command line* — a reason with no override is a user who thinks they
+/// asked for something they did not, and the quiet reading of it (adopt
+/// normally, discard the sentence) is the one that ends with somebody
+/// believing an override was recorded.
+fn adopt_update(
+    ctx: &ctx::Ctx,
+    package: &str,
+    commit: Option<&str>,
+    yes: bool,
+    override_block: bool,
+    reason: &Option<String>,
+) -> Result<(), String> {
+    let override_block = match (override_block, reason.as_deref()) {
+        (true, None) => {
+            return Err(
+                "--override-block needs --reason \"…\": the justification is the \
+                 friction, and it is what the decision ledger records"
+                    .into(),
+            )
+        }
+        (false, Some(_)) => {
+            return Err(
+                "--reason has no meaning without --override-block — nothing else \
+                 about an adoption is recorded as a decision"
+                    .into(),
+            )
+        }
+        (true, some) => some,
+        (false, None) => None,
+    };
+    review::adopt(
+        ctx,
+        package,
+        &review::Adopt {
+            commit,
+            yes,
+            override_block,
+        },
+    )
+}
 
 fn main() {
     let cli = Cli::parse();
@@ -204,7 +278,18 @@ fn main() {
             ref package,
             ref commit,
             yes,
-        }) => review::adopt(&ctx, package, commit.as_deref(), yes),
+            override_block,
+            ref reason,
+        }) => adopt_update(
+            &ctx,
+            package,
+            commit.as_deref(),
+            yes,
+            override_block,
+            reason,
+        ),
+        Some(Command::Update { mode, format }) => update::run(&ctx, mode.map(Into::into), format),
+        Some(Command::Decisions) => decisions::run(&ctx),
         Some(Command::Reject {
             ref package,
             ref note,

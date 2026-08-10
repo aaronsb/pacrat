@@ -299,3 +299,27 @@ host accepted is a fact the fleet should be able to read. The exact file
 shape lands with the first implementer (the one-shot update loop's override
 path); what is decided here is that both flows write to the same ledger
 rather than growing parallel bookkeeping.
+
+**The shape, as implemented.** `aur/decisions.toml`, an append-only list
+beside `sources.toml`:
+
+```toml
+[[decision]]
+kind = "override-block"     # or "trust-unsigned" — modelled, writer is phase 2
+package = "mdcat"
+commit = "5a4705a4…"        # validated exactly as `reviewed` is
+grade = 4                   # the overridden verdict's worst grade; absent if none
+reason = "…"                # 1-500 chars, required, neutered at every render
+host = "north"
+at = "2026-08-10T12:34:56Z" # UTC, second precision, the only accepted spelling
+```
+
+Three properties are load-bearing and were chosen rather than fallen into. A
+decision names a **commit**, not a package, because "we decided mdcat was
+fine" is not a statement anybody can act on later. There is **no expiry, no
+revocation and no inheritance** by a later commit: the gate re-asks its
+question every time, which is what keeps one accepted risk from becoming a
+standing exemption. And the list is **append-only with a re-read before every
+write**, so a second host's record cannot be erased by the first host's next
+override. `pacrat decisions` lists it; nothing removes an entry but a human
+editing the file.

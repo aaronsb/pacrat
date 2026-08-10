@@ -24,6 +24,45 @@ pub enum Ui {
     Tui,
 }
 
+/// How much of the update loop runs without being asked.
+///
+/// ADR-001 describes the loop's three transitions — grade, decide, build —
+/// as gates, each auto | verbose | manual, and bundles them into presets.
+/// This is the preset, as one word, because the gates are not independent in
+/// practice: a host that wants to be asked about a decision wants to be
+/// asked before the build that follows it, and three orthogonal knobs would
+/// let a user configure combinations that mean nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Never ask. The timer's mode: a clean PROCEED is adopted and built,
+    /// and everything else holds for a human.
+    Auto,
+    /// Ask when the answer is not clean — the default, and the one that
+    /// fits a person running `pacrat update` after coffee.
+    #[default]
+    Semi,
+    /// Ask about everything, including a PROCEED, and once more before the
+    /// build.
+    Manual,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Auto => "auto",
+            Mode::Semi => "semi",
+            Mode::Manual => "manual",
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// The local pacman repo pacrat builds into and serves from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -303,6 +342,8 @@ fn substitute(arg: &str, values: &[(&str, &str)]) -> String {
 #[serde(default)]
 pub struct Config {
     pub default_ui: Ui,
+    /// What `pacrat update` does when nobody passed `--mode`.
+    pub update_mode: Mode,
     pub thresholds: Thresholds,
     pub repo: Repo,
     /// External graders, run in the order configured.
@@ -351,6 +392,25 @@ mod tests {
         assert_eq!(c.repo.name, "dotfiles-aur");
         assert_eq!(c.thresholds.warn_at, 2);
         assert_eq!(c.thresholds.block_at, 4);
+        // Semi, not auto: the default posture asks rather than acts, and a
+        // host that wants the timer's silence says so.
+        assert_eq!(c.update_mode, Mode::Semi);
+    }
+
+    #[test]
+    fn the_update_mode_is_a_preset_word() {
+        for (word, mode) in [
+            ("auto", Mode::Auto),
+            ("semi", Mode::Semi),
+            ("manual", Mode::Manual),
+        ] {
+            let c = Config::from_toml(&format!("update_mode = {word:?}\n")).unwrap();
+            assert_eq!(c.update_mode, mode);
+            assert_eq!(mode.to_string(), word);
+        }
+        // A mode this pacrat does not have is a config error, not a silent
+        // fallback to whichever default happens to be least surprising.
+        assert!(Config::from_toml("update_mode = \"yolo\"\n").is_err());
     }
 
     #[test]

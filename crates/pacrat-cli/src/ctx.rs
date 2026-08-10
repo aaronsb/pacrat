@@ -5,9 +5,10 @@
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pacrat_core::config::Config;
+use pacrat_core::decisions::Decisions;
 use pacrat_core::pkg::{normalize, valid_name, Source};
 use pacrat_core::sources::Sources;
 
@@ -75,19 +76,58 @@ impl Ctx {
     /// modify: this replaces the whole file, so a stale copy silently
     /// reverts whatever another process wrote in the meantime.
     pub fn save_sources(&self, sources: &Sources) -> Result<(), String> {
-        let path = self.sources_path();
+        self.write_atomic(&self.sources_path(), &sources.to_toml())
+    }
+
+    pub fn decisions_path(&self) -> PathBuf {
+        self.store.join("aur").join("decisions.toml")
+    }
+
+    /// The decision ledger; a store without one is a store where nobody has
+    /// accepted a named risk yet, which is an empty ledger and not an error.
+    ///
+    /// A ledger that exists and will not parse *is* an error, unlike a
+    /// missing one. The difference matters more here than anywhere else in
+    /// pacrat: this file is append-only and the writer replaces the whole
+    /// thing, so treating an unreadable file as empty would let one bad
+    /// entry turn the next override into a deletion of every record before
+    /// it.
+    pub fn load_decisions(&self) -> Result<Decisions, String> {
+        match fs::read_to_string(self.decisions_path()) {
+            Ok(text) => Decisions::from_toml(&text)
+                .map_err(|e| format!("{}: {e}", self.decisions_path().display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Decisions::default()),
+            Err(e) => Err(format!("{}: {e}", self.decisions_path().display())),
+        }
+    }
+
+    /// Write the decision ledger, atomically — `save_sources`' rule, for the
+    /// same reason: a crash mid-write must not leave the fleet with half a
+    /// file, and callers load immediately before they modify.
+    pub fn save_decisions(&self, decisions: &Decisions) -> Result<(), String> {
+        self.write_atomic(&self.decisions_path(), &decisions.to_toml())
+    }
+
+    /// Bytes into a store file, all or nothing: a sibling temp file and a
+    /// rename. Shared by the two ledgers, which is the point — a second
+    /// hand-rolled copy of this is a second chance to get it subtly wrong.
+    fn write_atomic(&self, path: &Path, contents: &str) -> Result<(), String> {
         let dir = path
             .parent()
             .ok_or_else(|| format!("{}: no parent directory", path.display()))?;
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let tmp = dir.join(format!(".sources.toml.{}.new", std::process::id()));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("{}: unusable file name", path.display()))?;
+        let tmp = dir.join(format!(".{name}.{}.new", std::process::id()));
         let write = || -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
-            f.write_all(sources.to_toml().as_bytes())?;
+            f.write_all(contents.as_bytes())?;
             f.sync_all()
         };
         write().map_err(|e| format!("{}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &path).map_err(|e| {
+        fs::rename(&tmp, path).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             format!("{}: {e}", path.display())
         })

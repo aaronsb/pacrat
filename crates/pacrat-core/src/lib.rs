@@ -3,6 +3,7 @@
 //! the CLI crate.
 
 pub mod config;
+pub mod decisions;
 pub mod grading;
 pub mod hash;
 pub mod pkg;

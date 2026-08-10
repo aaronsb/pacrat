@@ -32,6 +32,7 @@ use pacrat_core::sources::{Role, SourceEntry, Sources};
 use crate::ctx::Ctx;
 use crate::fstree;
 use crate::out::{list_preview, short_hash, visible};
+use crate::say;
 
 /// The ledger `Role` as a CLI flag; core owns the model, clap owns the words.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -182,7 +183,7 @@ pub fn run(
         }
         Ok(Outcome::Declined) => {
             let _ = fs::remove_dir_all(&plan.clone);
-            println!("not vendored");
+            say!("not vendored");
             std::process::exit(crate::HELD);
         }
         Err(e) if plan.clone.exists() => Err(format!(
@@ -199,8 +200,8 @@ enum Outcome {
 }
 
 fn execute(ctx: &Ctx, plan: &Plan) -> Result<Outcome, String> {
-    println!("package   {}", plan.package);
-    println!("upstream  {}", plan.upstream);
+    say!("package   {}", plan.package);
+    say!("upstream  {}", plan.upstream);
     // `--` so that an upstream cannot be read as a git option.
     git([
         OsStr::new("clone"),
@@ -235,8 +236,8 @@ fn execute(ctx: &Ctx, plan: &Plan) -> Result<Outcome, String> {
         OsStr::new("rev-parse"),
         OsStr::new("HEAD"),
     ])?;
-    println!("commit    {commit}");
-    println!("files     {}", list_preview(&files, 12));
+    say!("commit    {commit}");
+    say!("files     {}", list_preview(&files, 12));
 
     render_review(&plan.clone, &files)?;
 
@@ -260,17 +261,17 @@ fn render_review(clone: &Path, files: &[String]) -> Result<(), String> {
     shown.sort_by_key(|f| (*f != "PKGBUILD", (*f).clone()));
 
     for rel in &shown {
-        println!();
-        println!("--- {rel} ---");
+        say!();
+        say!("--- {rel} ---");
         let text = read_untrusted(&clone.join(rel))?;
         let (safe, hidden) = visible(&text);
         print!("{safe}");
         if !safe.ends_with('\n') {
-            println!();
+            say!();
         }
-        println!("--- end {rel} ---");
+        say!("--- end {rel} ---");
         if hidden > 0 {
-            println!(
+            say!(
                 "warning   {hidden} control character{} in {rel} shown as ␛-style \
                  stand-ins — text that tries to hide from a reviewer",
                 if hidden == 1 { "" } else { "s" }
@@ -283,11 +284,11 @@ fn render_review(clone: &Path, files: &[String]) -> Result<(), String> {
     let pkgbuild = read_untrusted(&clone.join("PKGBUILD"))?;
     let declared = source_lines(&pkgbuild);
     if !declared.is_empty() {
-        println!();
-        println!("declared sources (PKGBUILD text, not evaluated):");
+        say!();
+        say!("declared sources (PKGBUILD text, not evaluated):");
         for line in declared {
             let (safe, _) = visible(&line);
-            println!("  {}", safe.trim());
+            say!("  {}", safe.trim());
         }
     }
 
@@ -297,13 +298,13 @@ fn render_review(clone: &Path, files: &[String]) -> Result<(), String> {
         .cloned()
         .collect();
     if !others.is_empty() {
-        println!();
-        println!(
+        say!();
+        say!(
             "also in the tree (not shown): {}",
             list_preview(&others, 20)
         );
     }
-    println!();
+    say!();
     Ok(())
 }
 
@@ -381,21 +382,21 @@ fn commit_to_store(ctx: &Ctx, plan: &Plan, files: &[String], commit: &str) -> Re
         )
     })?;
 
-    println!(
+    say!(
         "vendored  {} file{} → {}",
         files.len(),
         if files.len() == 1 { "" } else { "s" },
         store_rel(&ctx.store, &plan.tree)
     );
-    println!(
+    say!(
         "ledger    {} · {} @ {} ({})",
         store_rel(&ctx.store, &ctx.sources_path()),
         plan.package,
         short_hash(commit),
         plan.role.name()
     );
-    println!();
-    println!(
+    say!();
+    say!(
         "next      commit the store, then `pacrat build {}`",
         plan.package
     );
@@ -442,7 +443,7 @@ pub fn git<const N: usize>(argv: [&OsStr; N]) -> Result<String, String> {
         .map(|a| a.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(" ");
-    println!("run       git {shown}");
+    say!("run       git {shown}");
     let out = Command::new("git")
         .args(argv)
         .output()
@@ -470,20 +471,41 @@ fn store_rel(store: &Path, path: &Path) -> String {
 /// `verb` is the word for what is about to happen (`vendor`, `adopt`), so
 /// the prompt and the "use --yes" hint name the command the human ran.
 pub fn confirm(verb: &str, package: &str, commit: &str) -> Result<bool, String> {
-    print!("{verb} {package} at {commit}? [y/N] ");
-    io::stdout().flush().map_err(|e| format!("stdout: {e}"))?;
+    ask(
+        &format!("{verb} {package} at {commit}?"),
+        &format!("use --yes to {verb} unattended"),
+    )
+}
+
+/// The same question, asked about something that is not one package at one
+/// commit — the update loop's build stage, for instance. `hint` is what the
+/// caller would have done differently to not be asked; it is printed only
+/// when there is nobody there to answer.
+pub fn ask(question: &str, hint: &str) -> Result<bool, String> {
+    // The question follows this run's chatter. It is not decoration: under
+    // `pacrat update --format json` stdout carries one object and nothing
+    // else, and a prompt printed into it would corrupt the answer of a run
+    // that was, at that moment, waiting to be told what to do.
+    let question = format!("{question} [y/N] ");
+    if crate::out::chatter_is_stderr() {
+        eprint!("{question}");
+        io::stderr().flush().map_err(|e| format!("stderr: {e}"))?;
+    } else {
+        print!("{question}");
+        io::stdout().flush().map_err(|e| format!("stdout: {e}"))?;
+    }
     let mut answer = String::new();
     let read = io::stdin()
         .read_line(&mut answer)
         .map_err(|e| format!("stdin: {e}"))?;
     if read == 0 {
-        println!();
-        println!("no answer on stdin (use --yes to {verb} unattended)");
+        crate::say!();
+        crate::say!("no answer on stdin ({hint})");
         return Ok(false);
     }
     if !io::stdin().is_terminal() {
         // The typed newline is not echoed when stdin is a pipe.
-        println!();
+        crate::say!();
     }
     Ok(matches!(answer.trim(), "y" | "Y"))
 }
