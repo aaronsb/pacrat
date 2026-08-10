@@ -40,6 +40,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// silent kind of wrong (`review`'s diff).
 pub const PIPE_LIMIT: u64 = 1 << 20;
 
+#[derive(Debug)]
 pub struct Ran {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,

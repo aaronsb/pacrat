@@ -6,6 +6,7 @@ mod build;
 mod ctx;
 mod custody;
 mod fstree;
+mod git;
 mod grade;
 mod hosts;
 mod info;

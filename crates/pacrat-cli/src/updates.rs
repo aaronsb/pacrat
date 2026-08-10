@@ -63,8 +63,6 @@
 //! again — see `sources::SourceEntry::rejected`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Command;
-use std::time::Duration;
 
 use clap::ValueEnum;
 use pacrat_core::pkg::Source;
@@ -75,20 +73,15 @@ use serde::Serialize;
 use crate::aur::{self, AurPkg};
 use crate::ctx::Ctx;
 use crate::custody;
-use crate::out::{list_preview, shell_quote, short_hash, truncate, visible, visible_line};
+use crate::git::{self, Git, Trace};
+use crate::out::{list_preview, shell_quote, short_hash, truncate, visible_line};
 use crate::pacman;
-use crate::proc;
 
 /// How many upstream rows the CLI prints before counting the rest. The
 /// pending list is the actionable one and is never capped; the upstream
 /// region is awareness, and a host tracking three hundred AUR packages
 /// should not bury it (`out::list_preview`'s rule, one row per line).
 const UPSTREAM_CAP: usize = 20;
-
-/// Wall-clock bound on one `git ls-remote`. Sized against the AUR RPC's
-/// `--max-time 10` — the same order of patience for the same kind of wait —
-/// with room for a slow forge's TLS handshake on top.
-const REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Widest package name a column will show before it is clipped.
 const NAME_CAP: usize = 32;
@@ -110,18 +103,23 @@ pub enum Format {
     Json,
 }
 
+/// In JSON mode stdout belongs to the object alone, so everything that is not
+/// the answer goes to stderr rather than being dropped. ADR-001's "external
+/// calls are always visible" has no quiet mode — `--format json` changes where
+/// the trace lands, never whether it exists.
+impl From<Format> for Trace {
+    fn from(format: Format) -> Self {
+        match format {
+            Format::Text => Trace::Stdout,
+            Format::Json => Trace::Stderr,
+        }
+    }
+}
+
 impl Format {
     /// Say something that is not the answer: an argv, a warning, a count.
-    ///
-    /// In JSON mode stdout belongs to the object alone, so this goes to
-    /// stderr rather than being dropped. ADR-001's "external calls are always
-    /// visible" has no quiet mode — `--format json` changes where the trace
-    /// lands, never whether it exists.
     fn trace(self, line: &str) {
-        match self {
-            Format::Text => println!("{line}"),
-            Format::Json => eprintln!("{line}"),
-        }
+        Trace::from(self).line(line);
     }
 }
 
@@ -309,7 +307,7 @@ fn verdict(o: Outcome) -> Verdict {
 
 /// `git ls-remote -- <upstream> HEAD` for one ledger entry.
 fn probe(package: &str, entry: &SourceEntry, fmt: Format) -> Row {
-    let probe = match ls_remote(&entry.upstream, |line| fmt.trace(line)) {
+    let probe = match ls_remote(&entry.upstream, fmt.into()) {
         Err(e) => Probe::Unreachable(e),
         Ok(candidate) if !drifted(&entry.reviewed, &candidate) => Probe::Current,
         Ok(candidate) if refused(entry, &candidate) => Probe::Rejected(candidate),
@@ -343,44 +341,23 @@ pub fn refused(entry: &SourceEntry, candidate: &str) -> bool {
         .is_some_and(|commit| !drifted(commit, candidate))
 }
 
-/// Ask a remote for its HEAD, argv first.
+/// Ask a remote for its HEAD.
 ///
-/// Three things bound what a hostile or merely broken upstream can do here,
-/// because the ledger is a synced file and this verb runs from a timer:
+/// The guards — `--` before the URL, no interactive doors, a wall-clock bound
+/// — are [`crate::git`]'s, and they matter most here: this is the call a
+/// systemd timer makes against every upstream in a ledger any host can write
+/// to. `trace` is where the argv line goes: stdout for a human, stderr when
+/// the answer is JSON.
 ///
-/// * `--` guards the URL the way `vendor` guards its clone — an upstream that
-///   begins with a hyphen is a git option otherwise.
-/// * The env closes the interactive doors. A private-repo upstream would
-///   otherwise ask for credentials in the middle of the table, and a timer
-///   unit has no one to answer. (ssh's own passphrase and host-key prompts
-///   are not reachable through these; `GIT_SSH_COMMAND` is deliberately left
-///   alone rather than clobbering a user's ssh setup for their maintained
-///   repos, so the timeout is what covers that case.)
-/// * The timeout makes "never answers" a reportable outcome. A TCP connect to
-///   a host that drops packets does not return on its own, and one such
-///   upstream would otherwise hang the whole run.
-///
-/// `trace` is where the argv line goes: stdout for a human, stderr when the
-/// answer is JSON. Shared with `review`, whose verbs ask the same question of
-/// the same remotes and must ask it the same guarded way.
-pub fn ls_remote(upstream: &str, trace: impl Fn(&str)) -> Result<String, String> {
-    // Quoted so the line can be pasted, and neutered so it cannot paint:
-    // the URL comes out of a ledger every host in the fleet can write to.
-    trace(&format!(
-        "run       git ls-remote -- {} HEAD",
-        visible_line(&shell_quote(upstream)).0
-    ));
-    let mut cmd = Command::new("git");
-    cmd.args(["ls-remote", "--", upstream, "HEAD"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "/bin/true");
-
-    let ran = proc::run_with_timeout(cmd, REMOTE_TIMEOUT).map_err(|e| format!("git: {e}"))?;
-    if ran.timed_out {
-        return Err(format!("timed out after {}s", REMOTE_TIMEOUT.as_secs()));
-    }
+/// Shared with `review`, whose verbs ask the same question of the same
+/// remotes and must ask it the same guarded way.
+pub fn ls_remote(upstream: &str, trace: Trace) -> Result<String, String> {
+    let ran = Git::new(["ls-remote", "--", git::url_arg(upstream)?, "HEAD"])
+        .timeout(git::REMOTE)
+        .trace(trace)
+        .run()?;
     if !ran.status.success() {
-        let reason = git_error(&String::from_utf8_lossy(&ran.stderr));
+        let reason = git::error(&String::from_utf8_lossy(&ran.stderr));
         return Err(if reason.is_empty() {
             format!("git ls-remote exited {}", ran.status)
         } else {
@@ -390,37 +367,6 @@ pub fn ls_remote(upstream: &str, trace: impl Fn(&str)) -> Result<String, String>
     parse_ls_remote(&String::from_utf8_lossy(&ran.stdout))
         .map(str::to_string)
         .ok_or_else(|| "upstream has no HEAD (an empty repository?)".to_string())
-}
-
-/// Boil git's stderr down to one line fit for a table cell.
-///
-/// Three things happen here, each for its own reason. The text is a *remote's*
-/// text, so it goes through the same neutering a PKGBUILD does — a server that
-/// can name itself can otherwise paint the terminal. It collapses to one line,
-/// so it cannot forge extra rows. And git's advice prose ("Please make sure you
-/// have the correct access rights…") is dropped in favour of its `fatal:` /
-/// `error:` lines, which are the part that says what actually went wrong.
-fn git_error(stderr: &str) -> String {
-    /// Long enough for a URL and a reason; short enough not to reflow a table.
-    const CAP: usize = 120;
-
-    let (safe, _) = visible(stderr.trim());
-    let lines: Vec<&str> = safe
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let diagnostic: Vec<&str> = lines
-        .iter()
-        .copied()
-        .filter(|l| l.starts_with("fatal:") || l.starts_with("error:"))
-        .collect();
-    let kept = if diagnostic.is_empty() {
-        lines
-    } else {
-        diagnostic
-    };
-    truncate(&kept.join("; "), CAP)
 }
 
 /// Could this string name a commit?
@@ -503,7 +449,7 @@ fn drift_cell(reviewed: &str, candidate: &str) -> String {
 /// pacrat has no forge-specific behavior (sources.rs) — this is not an
 /// exception, it is how the verb knows which upstreams the AUR RPC can price.
 /// A GitHub-hosted PKGBUILD is perfectly valid and simply shows its hashes.
-fn aur_repo(upstream: &str) -> Option<&str> {
+pub fn aur_repo(upstream: &str) -> Option<&str> {
     // https://aur.archlinux.org/x.git · ssh://aur@aur.archlinux.org/x.git ·
     // aur@aur.archlinux.org:x.git — the three forms the AUR hands out.
     let rest = upstream
@@ -1030,36 +976,6 @@ mod tests {
         );
         // A bare hash with no ref column names nothing.
         assert_eq!(parse_ls_remote(&format!("{head}\n")), None);
-    }
-
-    #[test]
-    fn git_stderr_becomes_one_diagnostic_line() {
-        // Captured from `git ls-remote -- file:///nonexistent/x.git HEAD`.
-        let stderr = "fatal: '/nonexistent/x.git' does not appear to be a git repository\n\
-                      fatal: Could not read from remote repository.\n\
-                      \n\
-                      Please make sure you have the correct access rights\n\
-                      and the repository exists.\n";
-        assert_eq!(
-            git_error(stderr),
-            "fatal: '/nonexistent/x.git' does not appear to be a git repository; \
-             fatal: Could not read from remote repository."
-        );
-    }
-
-    #[test]
-    fn git_stderr_that_hides_or_sprawls_cannot_reshape_the_table() {
-        // A remote naming itself in escape codes does not get to paint, and
-        // one that answers in newlines does not get to forge rows.
-        assert_eq!(git_error("fatal: \x1b[2Kx\n"), "fatal: ␛[2Kx");
-        assert!(!git_error("fatal: a\nfatal: b\n").contains('\n'));
-        // No fatal/error line: keep what there is rather than say nothing.
-        assert_eq!(git_error("something odd\n"), "something odd");
-        assert_eq!(git_error("   \n\n"), "");
-        // A wall of text is clipped, and the clip is marked.
-        let long = format!("fatal: {}\n", "x".repeat(500));
-        assert_eq!(git_error(&long).chars().count(), 120);
-        assert!(git_error(&long).ends_with('…'));
     }
 
     #[test]
