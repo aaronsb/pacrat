@@ -12,12 +12,14 @@
 //!
 //! ## Degradation
 //!
-//! Both halves reach the network, and either may fail without taking the run
-//! down — the rule `search` follows for its two worlds. A package whose
-//! remote will not answer is reported as unreachable and the others still
-//! report; a dead AUR RPC costs the version column and nothing else. Only
-//! when *nothing* could be asked does the verb fail, because at that point a
-//! "nothing pending" would be a claim pacrat cannot make.
+//! Both halves reach the network, and neither is allowed to take the run down
+//! — the rule `search` follows for its two worlds. A remote that will not
+//! answer costs its own row and no other; a dead AUR RPC costs the version
+//! column and the upstream half, while the ledger's commit-level answer
+//! survives intact, because that one comes from git.
+//!
+//! What a failure *does* cost is the right to say "nothing pending". Degraded
+//! output still prints; it just cannot exit 0. See the lattice below.
 //!
 //! ## Exit codes
 //!
@@ -28,9 +30,31 @@
 //! updates` wants exactly that distinction: 0 means go back to sleep, 10
 //! means a human has something to look at, 1 means the check itself is
 //! broken and the silence is not evidence of calm.
+//!
+//! The lattice, in order — the first rule that applies wins:
+//!
+//! | Condition                                        | Exit |
+//! |--------------------------------------------------|------|
+//! | anything pending, from either half                | 10   |
+//! | a ledger row could not be probed                  | 1    |
+//! | the upstream half was asked and could not answer  | 1    |
+//! | otherwise                                         | 0    |
+//!
+//! Two things about that order are load-bearing, and both are about what a
+//! *zero* claims. Exit 0 says "I checked, and there is nothing" — so a single
+//! unreachable ledger row disqualifies it, even when every other row came
+//! back current. A partial probe cannot support a total claim, and the two
+//! halves answer different questions: the upstream half finding nothing says
+//! nothing whatsoever about the ledger rows that went unasked.
+//!
+//! Pending outranks broken because either way there is real work, and 10 is
+//! the code that gets a human looking. A run that is both partly broken and
+//! has something pending exits 10; the unreachable rows are in the table
+//! above it, where the human who came for the 10 will see them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
+use std::time::Duration;
 
 use clap::ValueEnum;
 use pacrat_core::pkg::Source;
@@ -41,14 +65,20 @@ use serde::Serialize;
 use crate::aur::{self, AurPkg};
 use crate::ctx::Ctx;
 use crate::custody;
-use crate::out::{shell_quote, short_hash, truncate, visible};
+use crate::out::{list_preview, shell_quote, short_hash, truncate, visible};
 use crate::pacman;
+use crate::proc;
 
 /// How many upstream rows the CLI prints before counting the rest. The
 /// pending list is the actionable one and is never capped; the upstream
 /// region is awareness, and a host tracking three hundred AUR packages
 /// should not bury it (`out::list_preview`'s rule, one row per line).
 const UPSTREAM_CAP: usize = 20;
+
+/// Wall-clock bound on one `git ls-remote`. Sized against the AUR RPC's
+/// `--max-time 10` — the same order of patience for the same kind of wait —
+/// with room for a slow forge's TLS handshake on top.
+const REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Widest package name a column will show before it is clipped.
 const NAME_CAP: usize = 32;
@@ -125,8 +155,8 @@ struct UpstreamHalf {
     answered: Option<bool>,
     error: Option<String>,
     /// Tracked on some host but not installed here, so there is no local
-    /// version to compare. Counted rather than guessed at.
-    unchecked: usize,
+    /// version to compare. Named rather than guessed at.
+    unchecked: Vec<String>,
 }
 
 pub fn run(ctx: &Ctx, fmt: Format) -> Result<(), String> {
@@ -137,23 +167,30 @@ pub fn run(ctx: &Ctx, fmt: Format) -> Result<(), String> {
         .iter()
         .map(|(package, entry)| probe(package, entry, fmt))
         .collect();
-
-    // Versions are a display nicety on top of the commit hashes, so they are
-    // fetched only for the rows that will print, and only for the ones the
-    // AUR can be asked about at all.
-    let wanted: Vec<String> = rows
-        .iter()
-        .filter(|r| matches!(r.probe, Probe::Pending(_)))
-        .filter_map(|r| r.aur.clone())
-        .collect();
-    let (versions, version_error) = fetch_versions(&wanted, fmt);
-
-    let upstream = upstream_section(ctx, &sources.packages, fmt);
-
     // The ledger is a BTreeMap, so this is already the order — stated anyway,
     // because a stable table is a property of the output, not an accident of
     // which container the ledger happens to use.
     rows.sort_by(|a, b| a.package.cmp(&b.package));
+
+    // Both halves want the same thing from the AUR — a version for a name —
+    // so they ask together. Splitting it in two would double the round trips
+    // and give one outage two different-sounding warnings.
+    let candidates = upstream_candidates(&tracked_aur(ctx), &sources.packages);
+    let (versions, rpc_error) = fetch_versions(&rpc_names(&rows, &candidates), fmt);
+    if let Some(e) = &rpc_error {
+        fmt.trace(&format!(
+            "warning: the AUR RPC could not be asked ({e}) — pending rows show \
+             commits without versions, and tracked-but-not-vendored packages \
+             went unexamined"
+        ));
+    }
+    let upstream = upstream_half(&candidates, &versions, rpc_error.as_deref(), fmt);
+    if let Some(e) = &upstream.error {
+        fmt.trace(&format!(
+            "warning: tracked-but-not-vendored AUR packages went unexamined ({e})"
+        ));
+    }
+
     let (pending, unreachable): (Vec<&Row>, Vec<&Row>) = rows
         .iter()
         .filter(|r| r.probe != Probe::Current)
@@ -161,36 +198,80 @@ pub fn run(ctx: &Ctx, fmt: Format) -> Result<(), String> {
 
     let current = rows.len() - pending.len() - unreachable.len();
 
+    // Decided before the report is written, not after: the headline "nothing
+    // pending" is exactly the claim a broken run has not earned, and it
+    // should not be printed and then contradicted by the exit code.
+    let verdict = verdict(Outcome {
+        pending: pending.len(),
+        upstream: upstream.rows.len(),
+        unreachable: unreachable.len(),
+        upstream_failed: upstream.answered == Some(false),
+    });
+    let complete = !matches!(verdict, Verdict::Broken(_));
+
     match fmt {
-        Format::Text => report_text(&pending, &unreachable, &versions, current, &upstream),
-        Format::Json => report_json(&pending, &unreachable, &versions, &upstream.rows)?,
+        Format::Text => report_text(
+            &pending,
+            &unreachable,
+            &versions,
+            current,
+            &upstream,
+            complete,
+        ),
+        Format::Json => report_json(&pending, &unreachable, &versions, current, &upstream)?,
     }
 
-    if let Some(e) = &version_error {
-        fmt.trace(&format!(
-            "warning: the AUR RPC could not be asked for versions ({e}) — \
-             the pending rows show commits only"
+    match verdict {
+        Verdict::Clean => Ok(()),
+        Verdict::Pending => std::process::exit(crate::HELD),
+        Verdict::Broken(why) => Err(why),
+    }
+}
+
+/// What one run learned, stripped of everything the exit code does not turn on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Outcome {
+    pending: usize,
+    upstream: usize,
+    /// Ledger rows whose remote could not be probed at all.
+    unreachable: usize,
+    /// The upstream half had something to ask about and could not ask it.
+    upstream_failed: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Clean,
+    Pending,
+    Broken(String),
+}
+
+/// Apply the lattice documented in the module header.
+///
+/// Pure, so that "exit 0 means pacrat checked and found nothing" is a
+/// property with a test behind it rather than a claim in a doc comment.
+fn verdict(o: Outcome) -> Verdict {
+    if o.pending > 0 || o.upstream > 0 {
+        // Real work exists either way, and 10 is the code that fetches a
+        // human. Any unreachable rows are in the table they will be reading.
+        return Verdict::Pending;
+    }
+    if o.unreachable > 0 {
+        return Verdict::Broken(format!(
+            "{} ledger upstream{} could not be probed — with rows unasked, \
+             \"nothing pending\" is not a claim this run can make",
+            o.unreachable,
+            plural(o.unreachable)
         ));
     }
-    if let Some(e) = &upstream.error {
-        fmt.trace(&format!(
-            "warning: tracked-but-not-vendored AUR packages could not be checked ({e})"
-        ));
+    if o.upstream_failed {
+        return Verdict::Broken(
+            "the tracked-but-not-vendored check could not run — packages that \
+             update outside curation went unexamined"
+                .into(),
+        );
     }
-
-    // Everything-failed. One half down is degradation and the table above
-    // says so; both halves down means the run learned nothing, and exiting 0
-    // there would tell a timer all is well on no evidence at all.
-    let ledger_answered = (!rows.is_empty()).then_some(rows.len() > unreachable.len());
-    let halves = [ledger_answered, upstream.answered];
-    if halves.contains(&Some(false)) && !halves.contains(&Some(true)) {
-        return Err("could not reach any upstream — nothing was checked".into());
-    }
-
-    if pending.is_empty() && upstream.rows.is_empty() {
-        return Ok(());
-    }
-    std::process::exit(crate::HELD)
+    Verdict::Clean
 }
 
 /// `git ls-remote -- <upstream> HEAD` for one ledger entry.
@@ -211,28 +292,43 @@ fn probe(package: &str, entry: &SourceEntry, fmt: Format) -> Row {
 
 /// Ask a remote for its HEAD, argv first.
 ///
-/// `--` guards the URL the way `vendor` guards its clone: an upstream that
-/// begins with a hyphen is a git option otherwise, and the ledger is a file
-/// that syncs between hosts.
+/// Three things bound what a hostile or merely broken upstream can do here,
+/// because the ledger is a synced file and this verb runs from a timer:
+///
+/// * `--` guards the URL the way `vendor` guards its clone — an upstream that
+///   begins with a hyphen is a git option otherwise.
+/// * The env closes the interactive doors. A private-repo upstream would
+///   otherwise ask for credentials in the middle of the table, and a timer
+///   unit has no one to answer. (ssh's own passphrase and host-key prompts
+///   are not reachable through these; `GIT_SSH_COMMAND` is deliberately left
+///   alone rather than clobbering a user's ssh setup for their maintained
+///   repos, so the timeout is what covers that case.)
+/// * The timeout makes "never answers" a reportable outcome. A TCP connect to
+///   a host that drops packets does not return on its own, and one such
+///   upstream would otherwise hang the whole run.
 fn ls_remote(upstream: &str, fmt: Format) -> Result<String, String> {
     fmt.trace(&format!(
         "run       git ls-remote -- {} HEAD",
         shell_quote(upstream)
     ));
-    let out = Command::new("git")
-        .args(["ls-remote", "--", upstream, "HEAD"])
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !out.status.success() {
-        let raw = String::from_utf8_lossy(&out.stderr);
-        let reason = git_error(&raw);
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", "--", upstream, "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/bin/true");
+
+    let ran = proc::run_with_timeout(cmd, REMOTE_TIMEOUT).map_err(|e| format!("git: {e}"))?;
+    if ran.timed_out {
+        return Err(format!("timed out after {}s", REMOTE_TIMEOUT.as_secs()));
+    }
+    if !ran.status.success() {
+        let reason = git_error(&String::from_utf8_lossy(&ran.stderr));
         return Err(if reason.is_empty() {
-            format!("git ls-remote exited {}", out.status)
+            format!("git ls-remote exited {}", ran.status)
         } else {
             reason
         });
     }
-    parse_ls_remote(&String::from_utf8_lossy(&out.stdout))
+    parse_ls_remote(&String::from_utf8_lossy(&ran.stdout))
         .map(str::to_string)
         .ok_or_else(|| "upstream has no HEAD (an empty repository?)".to_string())
 }
@@ -268,15 +364,39 @@ fn git_error(stderr: &str) -> String {
     truncate(&kept.join("; "), CAP)
 }
 
-/// The commit in `git ls-remote`'s `<sha>\tHEAD` output.
+/// Could this string name a commit?
 ///
-/// Anything that is not a plausible object id is skipped rather than trusted:
-/// git puts warnings and redirect notices on stdout in some configurations,
-/// and a hash is the one thing this function is allowed to return.
+/// One predicate, because two would eventually disagree: `drifted` deciding a
+/// value is comparable while `reviewed_cell` calls the same value malformed
+/// would put "malformed → 5a4705a4  current" on a row, which is nonsense the
+/// reader has no way to resolve. Between git's own floor for an abbreviation
+/// and the length of a full object id, hex only.
+fn names_a_commit(s: &str) -> bool {
+    /// git's own floor for an abbreviated object id.
+    const MIN_ABBREV: usize = 7;
+    /// A full SHA-1. Longer is not a hash that was abbreviated; it is a
+    /// mangled field.
+    const FULL: usize = 40;
+
+    let n = s.chars().count();
+    (MIN_ABBREV..=FULL).contains(&n) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The commit `git ls-remote <url> HEAD` reports for HEAD.
+///
+/// The ref is matched by name rather than the hash being picked out by shape.
+/// git writes warnings and redirect notices to this stream in some
+/// configurations, and "the first thing that looks like a hash" would be
+/// right only for as long as those happen to sort after the answer. Asking
+/// for the row labelled HEAD is right by construction.
 fn parse_ls_remote(text: &str) -> Option<&str> {
-    text.lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .find(|field| field.len() >= 7 && field.chars().all(|c| c.is_ascii_hexdigit()))
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let object = fields.next()?;
+        // `ref: refs/heads/master  HEAD` — a symref line names HEAD too, but
+        // its first field is a path, not an object.
+        (fields.next() == Some("HEAD") && names_a_commit(object)).then_some(object)
+    })
 }
 
 /// Has upstream moved past what was reviewed?
@@ -285,22 +405,18 @@ fn parse_ls_remote(text: &str) -> Option<&str> {
 /// (`3f9c21ab`) while `ls-remote` always answers with forty characters, and a
 /// plain `!=` would report every such package as drifted forever.
 ///
-/// The prefix only runs one way, and only for a `reviewed` long enough to name
-/// a commit. Everything else — a value too short to identify anything, a
-/// value *longer* than the hash it is supposed to abbreviate, an empty one —
-/// is a ledger pacrat cannot read, and an unreadable ledger is reported as
-/// drift. This verb's whole job is to notice; the failure it must not have is
-/// calling something current on a comparison that did not really happen.
+/// The prefix only runs one way, and only for a `reviewed` that could name a
+/// commit at all. Everything else — too short to identify anything, longer
+/// than the hash it is supposed to abbreviate, empty, not hex — is a ledger
+/// pacrat cannot read, and an unreadable ledger is reported as drift. This
+/// verb's whole job is to notice; the failure it must not have is calling
+/// something current on a comparison that did not really happen.
 fn drifted(reviewed: &str, candidate: &str) -> bool {
-    /// git's own floor for an abbreviated object id.
-    const MIN_ABBREV: usize = 7;
-
     let reviewed = reviewed.trim().to_ascii_lowercase();
-    let candidate = candidate.trim().to_ascii_lowercase();
-    if reviewed.len() < MIN_ABBREV {
+    if !names_a_commit(&reviewed) {
         return true;
     }
-    !candidate.starts_with(&reviewed)
+    !candidate.trim().to_ascii_lowercase().starts_with(&reviewed)
 }
 
 /// The reviewed commit as a table cell.
@@ -311,9 +427,7 @@ fn drifted(reviewed: &str, candidate: &str) -> bool {
 /// wolf over two identical-looking commits.
 fn reviewed_cell(reviewed: &str) -> String {
     let reviewed = reviewed.trim();
-    let plausible = (7..=40).contains(&reviewed.chars().count())
-        && reviewed.chars().all(|c| c.is_ascii_hexdigit());
-    if plausible {
+    if names_a_commit(reviewed) {
         short_hash(reviewed).to_string()
     } else {
         "malformed".into()
@@ -366,69 +480,86 @@ fn by_name(hits: Vec<AurPkg>) -> BTreeMap<String, String> {
 /// The tracked-but-not-vendored half: AUR packages some host's manifest lists
 /// that the ledger has never taken custody of, and that the AUR has since
 /// moved past what is installed here.
-fn upstream_section(
-    ctx: &Ctx,
-    ledger: &BTreeMap<String, SourceEntry>,
+fn upstream_half(
+    candidates: &[String],
+    available: &BTreeMap<String, String>,
+    rpc_error: Option<&str>,
     fmt: Format,
 ) -> UpstreamHalf {
-    let nothing = |answered, error| UpstreamHalf {
+    let nothing = |answered, error: Option<&str>| UpstreamHalf {
         rows: Vec::new(),
         answered,
-        error,
-        unchecked: 0,
+        error: error.map(str::to_string),
+        unchecked: Vec::new(),
     };
 
-    let mut tracked: BTreeSet<String> = BTreeSet::new();
-    for host in ctx.tracked_hosts() {
-        tracked.extend(ctx.tracked(&host, Source::Aur));
-    }
-    let candidates = upstream_candidates(&tracked, ledger);
     if candidates.is_empty() {
         return nothing(None, None);
     }
-
-    for url in aur::info_urls(&candidates) {
-        fmt.trace(&format!("run       {}", aur::argv(&url)));
+    if rpc_error.is_some() {
+        // No `error` text: the caller shares this RPC with the version column
+        // and has already said so once. Twice would read as two outages.
+        return nothing(Some(false), None);
     }
-    let available = match aur::info_many(&candidates) {
-        Ok(hits) => by_name(hits),
-        Err(e) => return nothing(Some(false), Some(e)),
-    };
-    // Traced here rather than with the URLs above: a call announced and then
+
+    // Traced here rather than beside the RPC: a call announced and then
     // skipped because the RPC died first would be a printed argv that never
     // ran, which is the opposite of what the visibility rule is for.
     fmt.trace(&format!("run       {}", pacman::query_versions_argv()));
     let installed = match pacman::installed_versions() {
         Ok(map) => map,
-        Err(e) => return nothing(Some(false), Some(e)),
+        Err(e) => return nothing(Some(false), Some(&e)),
     };
 
     let mut half = UpstreamHalf {
         rows: Vec::new(),
         answered: Some(true),
         error: None,
-        unchecked: 0,
+        unchecked: Vec::new(),
     };
     for package in candidates {
         // No local install means no local version, and that is another host's
         // drift to answer for — inventing a number here would be worse than
-        // counting the gap.
-        let Some(have) = installed.get(&package) else {
-            half.unchecked += 1;
+        // naming the gap.
+        let Some(have) = installed.get(package) else {
+            half.unchecked.push(package.clone());
             continue;
         };
-        let Some(theirs) = available.get(&package) else {
+        let Some(theirs) = available.get(package) else {
             continue;
         };
         if is_newer(have, theirs) {
             half.rows.push(Upstream {
-                package,
+                package: package.clone(),
                 installed: have.clone(),
                 available: theirs.clone(),
             });
         }
     }
     half
+}
+
+/// Every AUR package name any host tracks.
+fn tracked_aur(ctx: &Ctx) -> BTreeSet<String> {
+    let mut tracked = BTreeSet::new();
+    for host in ctx.tracked_hosts() {
+        tracked.extend(ctx.tracked(&host, Source::Aur));
+    }
+    tracked
+}
+
+/// The names worth one RPC: the pkgbases behind pending ledger rows, plus
+/// every tracked-but-not-vendored package. Deduped — the two sets are
+/// disjoint by construction today, but a pkgbase that matches a tracked name
+/// would otherwise be asked about twice.
+fn rpc_names(rows: &[Row], candidates: &[String]) -> Vec<String> {
+    let mut names: BTreeSet<String> = rows
+        .iter()
+        .filter(|r| matches!(r.probe, Probe::Pending(_)))
+        .filter_map(|r| r.aur.clone())
+        .collect();
+    names.extend(candidates.iter().cloned());
+    names.into_iter().collect()
 }
 
 /// Tracked AUR names the ledger does not carry, sorted.
@@ -449,118 +580,141 @@ fn report_text(
     versions: &BTreeMap<String, String>,
     current: usize,
     upstream: &UpstreamHalf,
+    complete: bool,
 ) {
     println!();
     if pending.is_empty() && unreachable.is_empty() && upstream.rows.is_empty() {
         println!(
-            "nothing pending — {current} curated {}",
+            "{} — {current} curated {}",
+            // The unqualified headline is a claim about everything. A run
+            // that could not ask every question has not earned it, and the
+            // exit code is about to say so.
+            if complete {
+                "nothing pending"
+            } else {
+                "nothing pending in what could be checked"
+            },
             if current == 1 {
-                "package at its reviewed commit".to_string()
+                "package at its reviewed commit"
             } else {
-                "packages at their reviewed commits".to_string()
+                "packages at their reviewed commits"
             }
         );
-        if upstream.unchecked > 0 {
-            println!("{}", unchecked_note(upstream.unchecked));
+    } else {
+        if !pending.is_empty() || !unreachable.is_empty() {
+            render_pending(pending, unreachable, versions, current);
         }
-        return;
-    }
-
-    if !pending.is_empty() || !unreachable.is_empty() {
-        let name_w = column(
-            pending
-                .iter()
-                .chain(unreachable)
-                .map(|r| r.package.as_str()),
-            "package",
-        );
-        // gradings join here (task #13): a `grade` column goes between role
-        // and version, and the header grows with it.
-        println!(
-            "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  version",
-            "package", "reviewed → candidate", "role"
-        );
-        for row in pending {
-            let Probe::Pending(candidate) = &row.probe else {
-                continue;
-            };
-            let version = row
-                .aur
-                .as_ref()
-                .and_then(|name| versions.get(name))
-                .map_or("—", String::as_str);
-            println!(
-                "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  {version}",
-                truncate(&row.package, name_w),
-                drift_cell(&row.reviewed, short_hash(candidate)),
-                custody::label(Some(row.role.into())),
-            );
-        }
-        for row in unreachable {
-            let Probe::Unreachable(why) = &row.probe else {
-                continue;
-            };
-            println!(
-                "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  —",
-                truncate(&row.package, name_w),
-                drift_cell(&row.reviewed, "unreachable"),
-                custody::label(Some(row.role.into())),
-            );
-            println!("{:<name_w$}  {why}", "");
-        }
-        println!();
-        println!(
-            "{} pending · {current} current{}",
-            pending.len(),
-            if unreachable.is_empty() {
-                String::new()
-            } else {
-                format!(" · {} unreachable", unreachable.len())
-            }
-        );
-    }
-
-    if !upstream.rows.is_empty() {
-        println!();
-        println!("upstream · tracked, not yet vendored");
-        let name_w = column(upstream.rows.iter().map(|u| u.package.as_str()), "package");
-        // "installed → aur" is a single cell, so its width is the widest
-        // pair plus the arrow — the versions are unbounded in principle and
-        // clipped at a width that fits an epoch and a long git-describe.
-        let ver_w = upstream
-            .rows
-            .iter()
-            .map(|u| u.installed.chars().count() + u.available.chars().count() + 3)
-            .chain(std::iter::once("installed → aur".chars().count()))
-            .max()
-            .unwrap_or(16)
-            .min(48);
-        println!(
-            "{:<name_w$}  {:<ver_w$}  bring it through curation",
-            "package", "installed → aur"
-        );
-        for u in upstream.rows.iter().take(UPSTREAM_CAP) {
-            println!(
-                "{:<name_w$}  {:<ver_w$}  pacrat vendor {}",
-                truncate(&u.package, name_w),
-                truncate(&format!("{} → {}", u.installed, u.available), ver_w),
-                u.package,
-            );
-        }
-        if upstream.rows.len() > UPSTREAM_CAP {
-            println!("… and {} more", upstream.rows.len() - UPSTREAM_CAP);
+        if !upstream.rows.is_empty() {
+            render_upstream(&upstream.rows);
         }
     }
-    if upstream.unchecked > 0 {
-        println!("{}", unchecked_note(upstream.unchecked));
+    if !upstream.unchecked.is_empty() {
+        println!("{}", unchecked_note(&upstream.unchecked));
     }
 }
 
-fn unchecked_note(unchecked: usize) -> String {
+/// The ledger half: what has moved, and what could not be asked.
+fn render_pending(
+    pending: &[&Row],
+    unreachable: &[&Row],
+    versions: &BTreeMap<String, String>,
+    current: usize,
+) {
+    let name_w = column(
+        pending
+            .iter()
+            .chain(unreachable)
+            .map(|r| r.package.as_str()),
+        "package",
+    );
+    // gradings join here (task #13): a `grade` column goes between role and
+    // version, and the header grows with it.
+    println!(
+        "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  version",
+        "package", "reviewed → candidate", "role"
+    );
+    for row in pending {
+        let Probe::Pending(candidate) = &row.probe else {
+            continue;
+        };
+        let version = row
+            .aur
+            .as_ref()
+            .and_then(|name| versions.get(name))
+            .map_or("—", String::as_str);
+        println!(
+            "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  {version}",
+            truncate(&row.package, name_w),
+            drift_cell(&row.reviewed, short_hash(candidate)),
+            custody::label(Some(row.role.into())),
+        );
+    }
+    for row in unreachable {
+        let Probe::Unreachable(why) = &row.probe else {
+            continue;
+        };
+        println!(
+            "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  —",
+            truncate(&row.package, name_w),
+            drift_cell(&row.reviewed, "unreachable"),
+            custody::label(Some(row.role.into())),
+        );
+        println!("{:<name_w$}  {why}", "");
+    }
+    println!();
+    println!(
+        "{} pending · {current} current{}",
+        pending.len(),
+        if unreachable.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} unreachable", unreachable.len())
+        }
+    );
+}
+
+/// The upstream half: packages that would update outside curation.
+fn render_upstream(rows: &[Upstream]) {
+    println!();
+    println!("upstream · tracked, not yet vendored");
+    let name_w = column(rows.iter().map(|u| u.package.as_str()), "package");
+    // "installed → aur" is a single cell, so its width is the widest pair
+    // plus the arrow — the versions are unbounded in principle and clipped at
+    // a width that fits an epoch and a long git-describe.
+    let ver_w = rows
+        .iter()
+        .map(|u| u.installed.chars().count() + u.available.chars().count() + 3)
+        .chain(std::iter::once("installed → aur".chars().count()))
+        .max()
+        .unwrap_or(16)
+        .min(48);
+    println!(
+        "{:<name_w$}  {:<ver_w$}  bring it through curation",
+        "package", "installed → aur"
+    );
+    for u in rows.iter().take(UPSTREAM_CAP) {
+        println!(
+            "{:<name_w$}  {:<ver_w$}  pacrat vendor {}",
+            truncate(&u.package, name_w),
+            truncate(&format!("{} → {}", u.installed, u.available), ver_w),
+            // The name comes out of a host's tracked list, which is a text
+            // file a human edits — the suggestion is meant to be pasted, so
+            // it is quoted like every other argv pacrat prints.
+            shell_quote(&u.package),
+        );
+    }
+    if rows.len() > UPSTREAM_CAP {
+        println!("… and {} more", rows.len() - UPSTREAM_CAP);
+    }
+}
+
+fn unchecked_note(unchecked: &[String]) -> String {
     format!(
-        "note   {unchecked} tracked AUR package{} not installed here — no local \
-         version to compare",
-        plural(unchecked)
+        "note   {} tracked AUR package{} not installed here — no local version \
+         to compare: {}",
+        unchecked.len(),
+        plural(unchecked.len()),
+        list_preview(unchecked, 8)
     )
 }
 
@@ -582,14 +736,28 @@ fn column<'a>(values: impl Iterator<Item = &'a str>, header: &str) -> usize {
         .clamp(header.len(), NAME_CAP)
 }
 
+/// The machine-readable answer.
+///
+/// Everything the exit code turns on is in here, because a consumer that has
+/// to parse stderr to learn why it got a 1 does not have a machine format.
+/// In particular `ledger_checked` plus `unreachable` reconstruct the one
+/// distinction that matters most: an empty `pending` means "nothing is
+/// pending" only when the ledger half actually answered for every row.
 #[derive(Serialize)]
 struct Report<'a> {
     pending: Vec<PendingJson<'a>>,
     upstream: Vec<UpstreamJson<'a>>,
-    /// Not in the brief, but the difference between "no update" and "could
-    /// not ask" is the whole reason this verb degrades instead of failing,
-    /// and a machine reader needs it as much as a human does.
+    /// Ledger rows whose remote could not be probed. The difference between
+    /// "no update" and "could not ask" is the whole reason this verb degrades
+    /// instead of failing.
     unreachable: Vec<UnreachableJson<'a>>,
+    /// Tracked AUR packages with no local install to compare against.
+    unchecked: &'a [String],
+    /// Ledger rows found at their reviewed commit.
+    current: usize,
+    /// Every ledger row was probed successfully. False means `pending` is a
+    /// floor, not a total.
+    ledger_checked: bool,
 }
 
 #[derive(Serialize)]
@@ -620,9 +788,13 @@ fn report_json(
     pending: &[&Row],
     unreachable: &[&Row],
     versions: &BTreeMap<String, String>,
-    upstream: &[Upstream],
+    current: usize,
+    upstream: &UpstreamHalf,
 ) -> Result<(), String> {
     let report = Report {
+        unchecked: &upstream.unchecked,
+        current,
+        ledger_checked: unreachable.is_empty(),
         pending: pending
             .iter()
             .filter_map(|row| {
@@ -643,6 +815,7 @@ fn report_json(
             })
             .collect(),
         upstream: upstream
+            .rows
             .iter()
             .map(|u| UpstreamJson {
                 package: &u.package,
@@ -702,6 +875,29 @@ mod tests {
         // Too short to be an object id, and not hex.
         assert_eq!(parse_ls_remote("abc123\tHEAD\n"), None);
         assert_eq!(parse_ls_remote("zzzzzzzzzz\tHEAD\n"), None);
+    }
+
+    #[test]
+    fn only_the_row_labelled_head_is_read() {
+        let head = "5a4705a4aaa2e7f10a7dd6c302256dd373516e56";
+        let other = "1111111111111111111111111111111111111111";
+        // A ref that is not HEAD is not the answer, wherever it sits — the
+        // old shape-matching version returned whichever came first.
+        assert_eq!(
+            parse_ls_remote(&format!("{other}\trefs/heads/master\n{head}\tHEAD\n")),
+            Some(head)
+        );
+        assert_eq!(
+            parse_ls_remote(&format!("{other}\trefs/tags/v1\n{other}\trefs/heads/x\n")),
+            None
+        );
+        // A ref whose name merely ends in HEAD is a different ref.
+        assert_eq!(
+            parse_ls_remote(&format!("{other}\trefs/remotes/origin/HEAD\n")),
+            None
+        );
+        // A bare hash with no ref column names nothing.
+        assert_eq!(parse_ls_remote(&format!("{head}\n")), None);
     }
 
     #[test]
@@ -861,6 +1057,140 @@ mod tests {
         // A ledger entry no host tracks is not an upstream row either — it is
         // curated, which is the whole point.
         assert!(upstream_candidates(&tracked(&[]), &ledger(&["mdcat", "yay"])).is_empty());
+    }
+
+    fn outcome(pending: usize, upstream: usize, unreachable: usize, failed: bool) -> Outcome {
+        Outcome {
+            pending,
+            upstream,
+            unreachable,
+            upstream_failed: failed,
+        }
+    }
+
+    fn code(o: Outcome) -> i32 {
+        match verdict(o) {
+            Verdict::Clean => 0,
+            Verdict::Pending => crate::HELD,
+            Verdict::Broken(_) => 1,
+        }
+    }
+
+    #[test]
+    fn exit_zero_requires_that_everything_was_actually_checked() {
+        // The clean run: a ledger fully probed, nothing to report.
+        assert_eq!(code(outcome(0, 0, 0, false)), 0);
+        // A ledger row that could not be probed disqualifies "nothing
+        // pending" — a partial probe cannot support a total claim, however
+        // many other rows came back current.
+        assert_eq!(code(outcome(0, 0, 1, false)), 1);
+        // Nor can the upstream half rescue it. The halves answer different
+        // questions, and one finding nothing says nothing about the other.
+        assert_eq!(code(outcome(0, 0, 2, false)), 1);
+        // The upstream half asked and could not answer: also not a zero.
+        assert_eq!(code(outcome(0, 0, 0, true)), 1);
+    }
+
+    #[test]
+    fn pending_outranks_broken_because_either_way_there_is_work() {
+        assert_eq!(code(outcome(1, 0, 0, false)), crate::HELD);
+        assert_eq!(code(outcome(0, 1, 0, false)), crate::HELD);
+        // Partly broken and partly pending: 10 is the code that fetches a
+        // human, and the unreachable rows are in the table they will read.
+        assert_eq!(code(outcome(1, 0, 3, false)), crate::HELD);
+        assert_eq!(code(outcome(0, 1, 3, true)), crate::HELD);
+    }
+
+    #[test]
+    fn a_broken_run_says_which_half_broke() {
+        let Verdict::Broken(ledger) = verdict(outcome(0, 0, 2, false)) else {
+            panic!("unreachable rows must be a failure");
+        };
+        assert!(ledger.contains("2 ledger upstreams"), "{ledger}");
+        let Verdict::Broken(up) = verdict(outcome(0, 0, 0, true)) else {
+            panic!("an unanswerable upstream half must be a failure");
+        };
+        assert!(up.contains("outside curation"), "{up}");
+        // With both halves down, the ledger's failure is the one named: it
+        // owns the reviewed-commit claim, which is what a zero would assert.
+        let Verdict::Broken(both) = verdict(outcome(0, 0, 1, true)) else {
+            panic!("both halves down must be a failure");
+        };
+        assert_eq!(both, verdict_message(outcome(0, 0, 1, false)));
+    }
+
+    fn verdict_message(o: Outcome) -> String {
+        match verdict(o) {
+            Verdict::Broken(why) => why,
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_predicate_decides_what_names_a_commit() {
+        let full = "5a4705a4aaa2e7f10a7dd6c302256dd373516e56";
+        // The comparison and the cell must never disagree about a value:
+        // "comparable, but shown as malformed" is a row nobody can resolve.
+        for value in [
+            full,
+            "5a4705a4",
+            "5a4705a",
+            "5a4705",
+            "",
+            "  ",
+            "v2.10.1",
+            &full.repeat(2),
+            "zzzzzzzz",
+        ] {
+            let names_one = names_a_commit(value.trim());
+            assert_eq!(
+                reviewed_cell(value) != "malformed",
+                names_one,
+                "the cell disagrees for {value:?}"
+            );
+            // A value that names a commit is current against itself; one
+            // that does not is drift no matter what upstream answers.
+            assert_eq!(
+                !drifted(value, value),
+                names_one,
+                "the comparison disagrees for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_rpc_batch_covers_both_halves_without_asking_twice() {
+        let rows = vec![
+            Row {
+                package: "mdcat".into(),
+                reviewed: "3f9c21ab".into(),
+                role: Role::Vendored,
+                aur: Some("mdcat".into()),
+                probe: Probe::Pending("aa".into()),
+            },
+            // Current, so its version is never shown and never fetched.
+            Row {
+                package: "pacseek".into(),
+                reviewed: "3f9c21ab".into(),
+                role: Role::Vendored,
+                aur: Some("pacseek".into()),
+                probe: Probe::Current,
+            },
+            // A non-AUR forge has no name the RPC would recognise.
+            Row {
+                package: "inhouse".into(),
+                reviewed: "3f9c21ab".into(),
+                role: Role::Maintained,
+                aur: None,
+                probe: Probe::Pending("bb".into()),
+            },
+        ];
+        let candidates = vec!["archi".to_string(), "mdcat".to_string()];
+        // Sorted, deduped, and `mdcat` — wanted by both halves — asked once.
+        assert_eq!(rpc_names(&rows, &candidates), ["archi", "mdcat"]);
+        assert!(rpc_names(&rows, &[]).contains(&"mdcat".to_string()));
+        assert!(rpc_names(&[], &candidates).len() == 2);
+        assert!(rpc_names(&[], &[]).is_empty());
     }
 
     #[test]

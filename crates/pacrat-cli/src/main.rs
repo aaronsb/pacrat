@@ -10,6 +10,7 @@ mod info;
 mod live;
 mod out;
 mod pacman;
+mod proc;
 mod search;
 mod setup;
 mod status;
@@ -21,12 +22,6 @@ mod vendor;
 /// Bare `pacrat` will open the default UI (config: default_ui); any
 /// subcommand is always CLI. See docs/design/mockup-rev3.html for the
 /// screen-by-screen design and docs/architecture/ADR-001 for the decisions.
-/// Exit code for "ran fine, deliberately did not act". ADR-001 gives 10 that
-/// meaning across the update loop — 0 clean, 10 held, 1 failure — and every
-/// verb that can decline shares it: a refused review and a pending update are
-/// the same kind of answer to a script or a timer.
-pub const HELD: i32 = 10;
-
 #[derive(Parser)]
 #[command(name = "pacrat", version, about)]
 struct Cli {
@@ -100,6 +95,12 @@ enum Command {
     /// The petit chef
     About,
 }
+
+/// Exit code for "ran fine, deliberately did not act". ADR-001 gives 10 that
+/// meaning across the update loop — 0 clean, 10 held, 1 failure — and every
+/// verb that can decline shares it: a refused review and a pending update are
+/// the same kind of answer to a script or a timer.
+pub const HELD: i32 = 10;
 
 fn main() {
     let cli = Cli::parse();

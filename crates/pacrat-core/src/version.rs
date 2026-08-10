@@ -56,7 +56,12 @@ pub fn is_newer(installed: &str, candidate: &str) -> bool {
 ///
 /// An epoch is only an epoch when a run of digits is followed by a colon —
 /// `https://…` has a colon and no epoch, and this is the rule that says so.
-/// The release is everything past the *first* hyphen, matching alpm.
+///
+/// The release is everything past the *last* hyphen (alpm uses `strrchr`),
+/// which matters because a pkgver may legally contain one: `1.0-1-2` is
+/// version `1.0-1` at release `2`, not version `1.0` at release `1-2`. Split
+/// at the first hyphen instead and `1.0-1-2` compares *equal* to `1.0`, since
+/// the versions match and one side's release then goes unexamined.
 fn parse_evr(s: &str) -> (&str, &str, Option<&str>) {
     let digits = s.bytes().take_while(u8::is_ascii_digit).count();
     let (epoch, rest) = match s.as_bytes().get(digits) {
@@ -65,7 +70,7 @@ fn parse_evr(s: &str) -> (&str, &str, Option<&str>) {
     };
     // `:1.0` — a colon with nothing in front of it — is epoch zero.
     let epoch = if epoch.is_empty() { "0" } else { epoch };
-    match rest.find('-') {
+    match rest.rfind('-') {
         Some(i) => (epoch, &rest[..i], Some(&rest[i + 1..])),
         None => (epoch, rest, None),
     }
@@ -196,6 +201,15 @@ mod tests {
             // A stated release is not compared against an unstated one.
             ("1.0", "1.0-1", 0),
             ("1:1.0-1", "1:1.0-2", -1),
+            // A pkgver containing a hyphen: the split is at the *last* one,
+            // so these are version `1.0-1` release `2`. Splitting at the
+            // first would make the first case compare equal.
+            ("1.0-1-2", "1.0", 1),
+            ("1.0-1-2", "1.0-2", 1),
+            ("1.0-1-2", "1.0-1-3", -1),
+            ("1.0-1-2", "1.0-1-1", 1),
+            ("1.0-2", "1.0-1-2", -1),
+            ("1:1.0-1-2", "1:1.0-3", 1),
             ("0.10.15", "0.10.16", -1),
             ("4.15", "4.16", -1),
             ("1.0alpha", "1.0", -1),
@@ -249,6 +263,62 @@ mod tests {
         // and `é` being two bytes makes the separator run longer, which is
         // itself how pacman decides. Captured, not reasoned about.
         assert_eq!(vercmp("1.é.2", "1.2"), Ordering::Greater);
+    }
+
+    /// Differential test against the real thing, over generated input.
+    ///
+    /// Ignored by default: it shells out to pacman's `vercmp(8)`, which CI
+    /// does not have and which this crate is otherwise pure without. Run it
+    /// on an Arch box after touching anything above —
+    /// `cargo test -p pacrat-core -- --ignored` — because the captured
+    /// battery only proves agreement on cases someone thought to write down,
+    /// and the interesting disagreements are the ones nobody predicted.
+    #[test]
+    #[ignore = "needs pacman's vercmp(8); run manually on Arch"]
+    fn agrees_with_the_real_vercmp_over_generated_input() {
+        use std::process::Command;
+
+        // A deterministic LCG: a failure has to be reproducible to be worth
+        // reporting, and this crate takes no dependencies for a test.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as usize
+        };
+        // The alphabet is the one that makes rpmvercmp branch: digits, letters,
+        // every separator it treats specially, and the epoch and release marks.
+        let atoms = [
+            "0", "1", "2", "9", "10", "07", "a", "b", "rc", "alpha", ".", ".", "-", "_", "+", ":",
+            "~",
+        ];
+
+        let mut cases = Vec::new();
+        for _ in 0..4000 {
+            let mut build = || {
+                let n = 1 + next() % 7;
+                (0..n)
+                    .map(|_| atoms[next() % atoms.len()])
+                    .collect::<String>()
+            };
+            cases.push((build(), build()));
+        }
+
+        for (a, b) in cases {
+            let out = Command::new("vercmp")
+                .args([&a, &b])
+                .output()
+                .expect("vercmp(8) must be installed to run this test");
+            let want: i32 = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("vercmp {a:?} {b:?} said nothing"));
+            let got = match vercmp(&a, &b) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            };
+            assert_eq!(got, want, "vercmp({a:?}, {b:?})");
+        }
     }
 
     #[test]
