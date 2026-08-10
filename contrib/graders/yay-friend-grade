@@ -2,10 +2,22 @@
 #
 # yay-friend → pacrat-grade/v1
 #
-# An output-format adapter, and nothing else. yay-friend already does the
-# work pacrat wants — it reads a PKGBUILD with an LLM and files the answer
-# under the AUR commit hash it read, which is the same idempotency model
-# pacrat's grade cache uses (ADR-001). All that is missing is the shape.
+# A shim on yay-friend's side of the boundary, and nothing else.
+#
+# pacrat's interface is the contract, specified tool-neutrally in
+# docs/grading-contract.md: any program that emits pacrat-grade/v1 is a
+# first-class grader, and pacrat's own code contains nothing about yay-friend
+# or about any other analyzer. This file exists only because yay-friend does
+# not emit the contract yet. It already does the work — it reads a PKGBUILD
+# with an LLM and files the answer under the AUR commit hash it read, which
+# is the same idempotency model the contract asks for — so all that is
+# missing is the shape.
+#
+# It is therefore deprecated by construction. The day yay-friend emits
+# pacrat-grade/v1 natively, delete this file and point `cmd` at yay-friend
+# itself; nothing on pacrat's side changes, because there is nothing on
+# pacrat's side to change. Do not fix a pacrat problem in here, and do not
+# fix a yay-friend problem in pacrat.
 #
 # Configure it in ~/.config/pacrat/config.toml:
 #

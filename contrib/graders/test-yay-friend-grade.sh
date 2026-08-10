@@ -10,8 +10,12 @@
 #
 #     ./contrib/graders/test-yay-friend-grade.sh
 #
-# The end-to-end counterpart — the same fake cache read through pacrat's own
-# grade engine — is crates/pacrat-cli/tests/yay_friend_adapter.rs.
+# The last stage drives a real `pacrat grade` if a pacrat binary can be
+# found, which is the only way to show that what this emits is a grading
+# pacrat *accepts* rather than merely valid JSON. It lives here rather than
+# in pacrat's own test suite on purpose: pacrat tests the contract against a
+# generic fake grader (crates/pacrat-cli/tests/grader_contract.rs) and knows
+# nothing about yay-friend. Set PACRAT=/path/to/pacrat to point it at one.
 
 set -uo pipefail
 
@@ -374,6 +378,53 @@ for bad in "--package hello --tree $tmp/tree" "--package hello --commit $COMMIT"
 		ok "rejected: $bad"
 	fi
 done
+
+# --- through pacrat itself --------------------------------------------------
+
+# Everything above proves the adapter emits what the contract describes. Only
+# pacrat can prove it emits what pacrat accepts: the contract is enforced on
+# the reader's side, so a report can pass every check here and still be
+# refused there for its scale pin or its subject.
+pacrat=${PACRAT:-$here/../../target/debug/pacrat}
+if [ ! -x "$pacrat" ]; then
+	printf '  skip pacrat end-to-end (no binary at %s; set PACRAT=…)\n' "$pacrat"
+else
+	e2e="$tmp/e2e"
+	mkdir -p "$e2e/store/aur/packages/hello" "$e2e/config/pacrat"
+	printf '[packages.hello]\nupstream = "https://aur.archlinux.org/hello.git"\nreviewed = "%s"\nrole = "vendored"\n' \
+		"$COMMIT" >"$e2e/store/aur/sources.toml"
+	printf 'pkgname=hello\npkgver=2.12.1\npkgrel=1\n' >"$e2e/store/aur/packages/hello/PKGBUILD"
+	cp "$tmp/tree/.SRCINFO" "$e2e/store/aur/packages/hello/.SRCINFO"
+	# The stanza the docs tell people to paste, scale pin included.
+	printf '[[graders]]\nname = "yay-friend"\ncmd = ["%s", "--package", "{package}", "--tree", "{tree}", "--commit", "{commit}"]\ntimeout_s = 600\nscale = { min = 0, max = 4 }\n' \
+		"$adapter" >"$e2e/config/pacrat/config.toml"
+
+	e2e_out=$(env HOME="$e2e" PATH="$PATH" \
+		DOTFILES_DIR="$e2e/store" XDG_CONFIG_HOME="$e2e/config" \
+		XDG_STATE_HOME="$e2e/state" XDG_DATA_HOME="$XDG_DATA_HOME" \
+		"$pacrat" grade hello 2>&1)
+	e2e_status=$?
+
+	if [ $e2e_status -eq 0 ]; then
+		ok "pacrat accepts the grading (exit 0)"
+	else
+		no "pacrat rejected the grading (exit $e2e_status)" "$e2e_out"
+	fi
+	case $e2e_out in
+	*"grade 1 of 0-4"*) ok "pacrat read the grade the adapter emitted" ;;
+	*) no "pacrat did not read the grade" "$e2e_out" ;;
+	esac
+	case $e2e_out in
+	*PROCEED*) ok "pacrat derived a verdict from it" ;;
+	*) no "no verdict" "$e2e_out" ;;
+	esac
+	# Only a grading that survived every check is written to pacrat's cache.
+	if [ -f "$e2e/state/pacrat/grades/hello/$COMMIT.yay-friend.json" ]; then
+		ok "pacrat cached the grading"
+	else
+		no "pacrat did not cache the grading" "$e2e_out"
+	fi
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
