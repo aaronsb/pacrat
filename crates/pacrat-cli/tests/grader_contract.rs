@@ -288,5 +288,21 @@ fn grader_text_cannot_forge_a_line_of_pacrats_report() {
         !text.lines().any(|l| l.starts_with("grade 0 of 0-4")),
         "a finding forged a verdict line:\n{text}"
     );
+    // Absence alone would also pass if the finding were dropped entirely,
+    // which is a different behavior with the same symptom. Pin the one that
+    // is actually wanted: the text is *shown*, flattened onto pacrat's own
+    // finding line, with the newline gone rather than the finding.
+    let shown = text
+        .lines()
+        .find(|l| l.contains("fine"))
+        .unwrap_or_else(|| panic!("the finding was dropped, not flattened:\n{text}"));
+    assert!(
+        shown.trim_start().starts_with("finding"),
+        "the finding did not render on a finding line: {shown:?}"
+    );
+    assert!(
+        shown.contains("grade 0 of 0-4"),
+        "the forged text was truncated away, so this proves nothing: {shown:?}"
+    );
     assert!(text.contains("BLOCK"), "{text}");
 }

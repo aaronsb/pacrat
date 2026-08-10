@@ -321,19 +321,32 @@ else
 	esac
 fi
 
-# An entropy the adapter cannot place on 0-4 is not a grade.
+# An entropy the adapter cannot place on 0-4 is not a grade. The numeric
+# cases matter more than the "banana" one: clamping a negative to 0 would
+# turn a broken analysis into a PROCEED, which is the one failure mode a
+# grading gate cannot have, and clamping a 70 to 4 would invent a BLOCK
+# nobody reported.
+mkdir -p "$cache/negative" "$cache/huge" "$cache/fractional"
 as_package garbage | jq '.analysis.overall_entropy = "banana"' \
 	>"$cache/garbage/$COMMIT.json"
-if run --package garbage --tree "$tmp/tree" --commit "$COMMIT"; then
-	no "an unplaceable entropy must be refused" "$out"
-else
-	ok "an entropy that is not a 0-4 level is refused"
-	if [ -z "$out" ]; then
-		ok "no partial grading on stdout"
+as_package negative | jq '.analysis.overall_entropy = -1' \
+	>"$cache/negative/$COMMIT.json"
+as_package huge | jq '.analysis.overall_entropy = 70' \
+	>"$cache/huge/$COMMIT.json"
+as_package fractional | jq '.analysis.overall_entropy = null' \
+	>"$cache/fractional/$COMMIT.json"
+for bad_entropy in garbage negative huge fractional; do
+	if run --package "$bad_entropy" --tree "$tmp/tree" --commit "$COMMIT"; then
+		no "unplaceable entropy ($bad_entropy) must be refused, not clamped" "$out"
 	else
-		no "partial grading on stdout" "$out"
+		ok "an entropy that is not a 0-4 level is refused ($bad_entropy)"
+		if [ -z "$out" ]; then
+			ok "no partial grading on stdout ($bad_entropy)"
+		else
+			no "partial grading on stdout ($bad_entropy)" "$out"
+		fi
 	fi
-fi
+done
 
 # yay-friend's own prompt asks the model for MINIMAL..CRITICAL, so the word
 # form has to translate even though today's cache holds integers.
@@ -345,6 +358,65 @@ if run --package worded --tree "$tmp/tree" --commit "$COMMIT"; then
 		"named entropy levels translate (CRITICAL → 4, HIGH → 3)"
 else
 	no "named entropy levels should translate" "$err"
+fi
+
+# A finding level, by contrast, is advisory and *is* clamped: pacrat's
+# parser takes 0-255 and rejects the whole grading outside it, so a broken
+# annotation must not be allowed to cost the grade.
+mkdir -p "$cache/wildlevel"
+as_package wildlevel |
+	jq '.analysis.findings[0].entropy = 4000 | .analysis.findings[0].severity = null
+		| .analysis.findings[1].entropy = -7' \
+		>"$cache/wildlevel/$COMMIT.json"
+if run --package wildlevel --tree "$tmp/tree" --commit "$COMMIT"; then
+	check '.grade == 1 and (.findings | map(.level) == [4, 0])' \
+		"a wild finding level is clamped, not fatal"
+else
+	no "a wild finding level must not cost the grading" "$err"
+fi
+
+# Control characters are stripped here rather than left to pacrat's
+# visible_line to neuter. The escapes are written as \u sequences so this
+# fixture stays plain ASCII in the repo.
+mkdir -p "$cache/control"
+as_package control |
+	jq '.analysis.findings[0].type = "source_analysis"
+		| .analysis.findings[0].description = "before\u001b[31m\u0007mid\u007fafter"' \
+		>"$cache/control/$COMMIT.json"
+if run --package control --tree "$tmp/tree" --commit "$COMMIT"; then
+	# By code point, for the same reason the adapter strips by code point.
+	check 'all(.findings[].title; explode | all(. > 31 and . != 127))' \
+		"control characters are stripped from titles"
+	check '.findings[0].title == "source_analysis: before[31mmidafter"' \
+		"the printable text around them survives"
+else
+	no "control characters should not fail the grading" "$err"
+fi
+
+# Hex case is not meaningful, and pacrat's own comparison ignores it. Both
+# directions matter and they are different code paths: the recorded hash is
+# a string comparison, the requested one is a filename.
+mkdir -p "$cache/upper"
+as_package upper | jq --arg c "${COMMIT^^}" '.cache_metadata.commit_hash = $c' \
+	>"$cache/upper/$COMMIT.json"
+if run --package upper --tree "$tmp/tree" --commit "$COMMIT"; then
+	ok "an uppercase recorded commit is the same commit"
+else
+	no "commit comparison should ignore hex case" "$err"
+fi
+
+# An uppercase *request* must find the lowercase cache file rather than miss
+# and spend an analyze on a tree that was already graded.
+if run --package hello --tree "$tmp/tree" --commit "${COMMIT^^}"; then
+	ok "an uppercase requested commit still hits the cache"
+	check ".subject.commit == \"${COMMIT^^}\"" \
+		"the grading reports the commit as pacrat spelled it"
+	case $err in
+	*"analyzing AUR HEAD"*) no "an uppercase request ran analyze instead of hitting" "$err" ;;
+	*) ok "no analyze was run for an uppercase request" ;;
+	esac
+else
+	no "an uppercase requested commit should hit the cache" "$err"
 fi
 
 # --- bounds -----------------------------------------------------------------
@@ -370,7 +442,8 @@ fi
 for bad in "--package hello --tree $tmp/tree" "--package hello --commit $COMMIT" \
 	"--tree $tmp/tree --commit $COMMIT" "--package ../etc --tree $tmp/tree --commit $COMMIT" \
 	"--package hello --tree $tmp/tree --commit nothex" \
-	"--package hello --tree $tmp/tree --commit abc123"; do
+	"--package hello --tree $tmp/tree --commit abc123" \
+	"--package hello --tree $tmp/tree --commit $(printf '0%.0s' $(seq 65))"; do
 	# shellcheck disable=SC2086 # deliberate word splitting: these are argv
 	if run $bad; then
 		no "should have been rejected: $bad"

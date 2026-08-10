@@ -29,9 +29,16 @@
 #     scale = { min = 0, max = 4 }
 #
 # `timeout_s` is doubled from pacrat's default because the miss path calls an
-# LLM. `scale` is worth pinning: yay-friend's entropy is 0-4 today, and a
-# tool that silently moved to 0-100 would otherwise have every grade quietly
-# become four times less alarming.
+# LLM.
+#
+# `scale` pins what *this file* declares, which is not the same protection
+# pacrat's scale pin usually buys. The scale below is hardcoded 0-4, so a
+# change in yay-friend can never reach pacrat as a changed `scale` field —
+# what the pin catches is an edit to this adapter. The defense against
+# yay-friend moving its own units lives here instead: an entropy outside 0-4
+# is refused rather than translated, so a hypothetical 70-of-100 becomes
+# UNGRADED and not a mild WARN. Both halves are needed; neither replaces the
+# other.
 #
 # Dependency: jq (extra). One, on purpose — the translation is a JSON
 # reshape, and doing it in sh would mean parsing JSON in sh.
@@ -118,12 +125,23 @@ case $commit in
 *[!0-9a-fA-F]*) die "$commit is not a commit hash" ;;
 esac
 [ ${#commit} -ge 7 ] || die "commit $commit is too short to name a tree"
+# Sixty-four admits SHA-256 object ids, which git is migrating toward.
+# Bounded at all so an impossible commit is refused before the miss path
+# spends a real analyze — and a paid provider call — discovering that no
+# such tree exists.
+[ ${#commit} -le 64 ] || die "commit $commit is longer than any git object id"
 
 command -v jq >/dev/null 2>&1 ||
 	die "jq is required (pacman -S jq) — this adapter is a JSON translation"
 
 cache_root="${XDG_DATA_HOME:-$HOME/.local/share}/yay-friend/cache"
-entry="$cache_root/$package/$commit.json"
+# Lowercased for the filename: git and yay-friend both spell object ids in
+# lowercase, so an uppercase request would miss a cache entry that is
+# sitting right there — and then spend a real analyze discovering it. The
+# grading still reports the commit as pacrat spelled it; pacrat compares
+# case-insensitively, so echoing the request back is the faithful answer.
+commit_key=${commit,,}
+entry="$cache_root/$package/$commit_key.json"
 cached=true
 
 if [ ! -f "$entry" ]; then
@@ -144,20 +162,24 @@ fi
 # The path says which commit this is; the file says so too, and they can
 # disagree — a copied or hand-edited cache entry is a grading of something
 # else wearing the right filename.
-meta_commit=$(jq -r '.cache_metadata.commit_hash // ""' "$entry") ||
+meta_commit=$(jq -r '.cache_metadata.commit_hash // ""' -- "$entry") ||
 	die "$entry is not readable JSON"
-meta_package=$(jq -r '.cache_metadata.package_name // .analysis.package_name // ""' "$entry")
+meta_package=$(jq -r '.cache_metadata.package_name // .analysis.package_name // ""' -- "$entry")
 
 [ "$meta_package" = "$package" ] ||
 	die "$entry is an analysis of ${meta_package:-nothing}, not $package"
 
-# Prefix comparison, like pacrat's own: either side may be abbreviated, and
-# seven is the shortest prefix git will abbreviate to.
-n=${#meta_commit}
-if [ ${#commit} -lt "$n" ]; then
-	n=${#commit}
+# Prefix comparison, like pacrat's own: either side may be abbreviated,
+# seven is the shortest prefix git will abbreviate to, and hex case is not
+# meaningful — pacrat's `commit_matches` compares case-insensitively, and an
+# adapter that did not would refuse entries pacrat would have accepted.
+lower_meta=${meta_commit,,}
+lower_commit=${commit,,}
+n=${#lower_meta}
+if [ ${#lower_commit} -lt "$n" ]; then
+	n=${#lower_commit}
 fi
-if [ "$n" -lt 7 ] || [ "${meta_commit:0:$n}" != "${commit:0:$n}" ]; then
+if [ "$n" -lt 7 ] || [ "${lower_meta:0:$n}" != "${lower_commit:0:$n}" ]; then
 	die "$entry records commit ${meta_commit:-none}, not $commit"
 fi
 
@@ -201,12 +223,34 @@ grading=$(
 		elif type == "string" then
 			{"MINIMAL":0,"LOW":1,"MODERATE":2,"HIGH":3,"CRITICAL":4}[ascii_upcase]
 		else null end;
+	# The *grade* must be a level yay-friend could actually have produced.
+	# Anything else is refused, never squeezed into range: clamping a
+	# negative to 0 would turn a broken analysis into a PROCEED, and
+	# clamping a 70 to 4 would invent a BLOCK nobody reported. Both are the
+	# approximation the contract says to refuse.
+	def place: if type == "number" and . >= 0 and . <= 4 then floor else null end;
+	# Finding levels are advisory and clamped instead, deliberately: they do
+	# not move the grade, and a level outside 0-255 would otherwise be
+	# rejected by the pacrat parser and cost a whole grading over one
+	# annotation. (No apostrophes in here: the jq program is inside a
+	# single-quoted shell string.)
 	def clamp: if . == null then null elif . < 0 then 0 elif . > 4 then 4 else . end;
-	def oneline: (. // "") | tostring | gsub("\\s+"; " ") | sub("^ ";"") | sub(" $";"");
+	def oneline:
+		(. // "") | tostring
+		# Whitespace first, so a newline becomes a space and does not weld
+		# two words together when the control strip below removes it.
+		| gsub("\\s+"; " ")
+		# Then every remaining control character, by code point rather than
+		# by regex class: a bracket expression written with backslash-u is
+		# a set of literal letters to Oniguruma, which silently eats text.
+		# pacrat neuters these too, but a grader that leans on its reader
+		# to sanitize is a grader that breaks the next reader.
+		| explode | map(select(. > 31 and . != 127)) | implode
+		| sub("^ ";"") | sub(" $";"");
 	def cap($n): if (. | length) > $n then (.[:$n - 1] + "…") else . end;
 
 	.analysis as $a
-	| ($a.overall_entropy | level | clamp) as $grade
+	| ($a.overall_entropy | level | place) as $grade
 	| if $grade == null then
 		error("overall_entropy is \($a.overall_entropy | tojson), which is not a 0-4 level")
 	  else . end
@@ -245,7 +289,7 @@ grading=$(
 				| if $r == "" then {} else { recommendation: $r } end)
 			+ ((.cache_metadata.yay_friend_version | oneline) as $v
 				| if $v == "" then {} else { yay_friend_version: $v } end))
-	}' "$entry"
+	}' -- "$entry"
 ) || die "$entry does not translate to a grading"
 
 printf '%s\n' "$grading"

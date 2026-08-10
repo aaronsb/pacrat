@@ -51,8 +51,15 @@ pacrat is asking about.
 no progress lines, no banner, no trailing log. If your tool prints, redirect
 its output to stderr.
 
-**stderr** is for diagnostics. pacrat captures it, bounds it at 64 KB, and
-shows one truncated line of it when the grader fails. It is never parsed.
+**stderr** is for diagnostics. pacrat captures it, bounds it at 64 KB, and is
+never parsed. One truncated line of it is shown **only** when the grader
+exits nonzero or dies of a signal — those are the two failures where the
+grader's own words are the best available explanation. Every other failure
+(timeout, unparseable stdout, the 4 MB cap, the wrong subject, a scale that
+does not match the pin, a spawn error) reports pacrat's reason and discards
+stderr, so do not rely on stderr to explain a malformed report: put the
+explanation in the exit status instead, by declining rather than printing
+something that will not parse.
 
 **stdin** is `/dev/null`. A grader that prompts fails fast rather than
 hanging on a terminal that is not listening. Do not prompt; there is no human
@@ -104,14 +111,25 @@ Higher is worse. Must lie within your own declared scale.
 when it is pacrat's own: it costs one line and it makes a later change to
 your output visible instead of silent.
 
+> **Every number in this document is an integer in 0–255.** `grade`,
+> `scale.min`, `scale.max` and a finding's `level` are all read as `u8`.
+> A negative number, a number above 255, or a fractional one is not an
+> out-of-range value that gets clamped or rounded — it fails to parse, and
+> the **whole grading** is discarded with a message about types rather than
+> about grades. Two practical consequences: a scale wider than 0–255 cannot
+> be expressed at all, and a single malformed finding level throws away the
+> grade that came with it. Clamp your own numbers before you print them.
+
 **`findings`** (array, optional, defaults to empty) — things a human should
 look at. Advisory: findings never move the grade, the grade moves the
 verdict.
 
 - `level` (integer, optional, defaults to 0) — severity on your scale. Not
-  validated against it, deliberately: a grader that mislabels one annotation
-  should still have its *grade* honored, since throwing away a whole grading
-  over a cosmetic bug would convert it into a hold.
+  validated *against your declared scale*, deliberately: a grader that
+  mislabels one annotation should still have its grade honored, since
+  throwing away a whole grading over a cosmetic bug would convert it into a
+  hold. This is tolerance about the scale only — the 0–255 bound above still
+  applies, and a level outside it does discard the grading.
 - `title` (string, optional, defaults to empty) — one line. See *Text*.
 - `span` (string, optional) — where to look, e.g. `PKGBUILD:3`. Free text.
 
@@ -159,6 +177,12 @@ makes the grading nothing at all, not a bad grading:
 
 There is no lenient path and no partial credit. A grading pacrat does not
 fully understand is not a grading.
+
+One exception, and it is about bytes rather than meaning: stdout is decoded
+**lossily**, so invalid UTF-8 inside a string becomes U+FFFD and the grading
+is accepted with that string mangled. Encoding is your responsibility — a
+title spliced out of a PKGBUILD in some other encoding will be displayed
+with replacement characters, not rejected.
 
 ## Requirements on a grader
 
@@ -219,9 +243,10 @@ single most common way an otherwise working adapter fails.
   read whose digest no longer matches is a miss, so an edited tree is
   re-graded rather than served an answer about bytes that are gone. Your JSON
   is stored verbatim, unknown fields and all.
-- **Every call is visible.** The argv is printed before the grader runs and
-  logged for the jobs view. There is no hidden invocation and no silent
-  retry.
+- **Every call is visible.** The argv is printed, shell-quoted, before the
+  grader runs — before, because a slow grader may sit for its whole timeout
+  and a call nobody can see is a call nobody can interrupt. There is no
+  hidden invocation and no silent retry.
 - **Only failures pacrat can explain are recorded as failures**, with their
   reason, so a later run can say why you contributed nothing without running
   you again.
@@ -245,6 +270,8 @@ scale = { min = 0, max = 4 }
   failure records). Unique across graders, because it is the cache key.
 - **`cmd`** — the argv template.
 - **`timeout_s`** — default 300. Raise it for anything that calls a model.
+  `0` is a config error, not "no limit": a grader killed before it ran would
+  turn every package into a hold.
 - **`scale`** — optional **pin**. When set, a report declaring any other
   scale is UNGRADED with a reason rather than rescaled. Worth setting for
   anything whose output format could change under you: a grader that silently
