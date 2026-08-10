@@ -72,8 +72,13 @@ pub enum Local {
     SelectAll,
     SelectNone,
     SelectInvert,
-    /// hosts `A` · `s` — adopt the selection · plan this host.
+    /// hosts `A` · `x` — the two manifest applies over the marks (ADR-002
+    /// amendment): add accepts installed-but-untracked reality, untrack
+    /// accepts a removal that already happened. Both ask first, naming
+    /// every package.
     AdoptSelection,
+    UntrackSelection,
+    /// hosts `s` — plan this host.
     Sync,
     /// jobs `p` — probe the AUR write path.
     Probe,
@@ -197,14 +202,20 @@ pub const BINDINGS: &[Binding] = &[
         },
     },
     Binding {
-        keys: "A / s",
-        what: "adopt the selection · sync this host — the command to run",
+        keys: "A / x",
+        what: "add · untrack the marks in this host's manifest — asks first",
         scope: Scope::On(Tab::Hosts),
         of: |key| match key.code {
             _ if bare(key, 'A') => Some(Action::Local(Local::AdoptSelection)),
-            _ if bare(key, 's') => Some(Action::Local(Local::Sync)),
+            _ if bare(key, 'x') => Some(Action::Local(Local::UntrackSelection)),
             _ => None,
         },
+    },
+    Binding {
+        keys: "s",
+        what: "sync this host — the command to run",
+        scope: Scope::On(Tab::Hosts),
+        of: |key| bare(key, 's').then_some(Action::Local(Local::Sync)),
     },
     Binding {
         keys: "p",
@@ -617,6 +628,29 @@ mod tests {
                 Tab::Hosts
             ),
             Some(Action::Local(Local::SelectAll))
+        );
+
+        // `x` means two different things on two screens — reject a
+        // candidate on updates, untrack the marks on hosts — and nothing
+        // anywhere else. The scope is what keeps one letter two verbs.
+        assert_eq!(
+            on(Tab::Hosts, KeyCode::Char('x')),
+            Some(Action::Local(Local::UntrackSelection))
+        );
+        assert_eq!(
+            on(Tab::Updates, KeyCode::Char('x')),
+            Some(Action::Local(Local::Reject))
+        );
+        assert_eq!(press(KeyCode::Char('x')), None);
+        // And the applies sit beside the plain suggestion: `A` applies,
+        // `s` still only shows commands.
+        assert_eq!(
+            on(Tab::Hosts, KeyCode::Char('A')),
+            Some(Action::Local(Local::AdoptSelection))
+        );
+        assert_eq!(
+            on(Tab::Hosts, KeyCode::Char('s')),
+            Some(Action::Local(Local::Sync))
         );
 
         // `enter` means two different things on two screens, which is the

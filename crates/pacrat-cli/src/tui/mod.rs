@@ -59,7 +59,7 @@ use prompt::{Prompt, Typed};
 use screens::about::About;
 use screens::browse::{Browse, Rung};
 use screens::config::Config;
-use screens::hosts::Hosts;
+use screens::hosts::{Hosts, Reconcile};
 use screens::jobs::Jobs;
 use screens::overview::Overview;
 use screens::updates::Updates;
@@ -454,6 +454,13 @@ enum Work {
     /// The override, once the friction has been paid: a write to the
     /// store's decision ledger, through the CLI's own writer.
     Override(String),
+    /// hosts `A`/`x`, once the confirm is answered: a manifest edit over
+    /// the named packages, through the CLI verbs' own writers.
+    ///
+    /// The names are snapshotted here rather than read back from the
+    /// selection at apply time: the confirm named exactly these packages,
+    /// and what was confirmed is what must be applied.
+    Reconcile(Reconcile, Vec<String>),
 }
 
 /// What is in front of the screen, if anything.
@@ -468,6 +475,21 @@ enum Overlay {
     Asking(Prompt, Asking),
     /// The hold-to-confirm bar. See [`childlock`].
     Childlock(Hold),
+    /// The apply step's question: a yes/no over a named set.
+    Confirm(Confirm),
+}
+
+/// A manifest apply waiting for its answer.
+///
+/// Its own overlay rather than a [`Prompt`], because the two collect
+/// different things: a prompt collects text, this collects a decision. It
+/// names every package, not a preview — ADR-002's guard for an
+/// *accumulated* selection is a confirm the reader can check against what
+/// they think they marked, and a truncated list is exactly the check
+/// removed.
+struct Confirm {
+    direction: Reconcile,
+    names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,6 +606,7 @@ impl App {
                 Ok("detail".to_string())
             }
             Work::Override(reason) => self.updates.record_override(ctx, &reason),
+            Work::Reconcile(direction, names) => self.hosts.apply(ctx, direction, &names),
         };
         self.log.finish(handle, outcome);
     }
@@ -593,6 +616,7 @@ impl App {
             Overlay::Help => return self.on_help_key(key),
             Overlay::Asking(..) => return self.on_prompt_key(key),
             Overlay::Childlock(_) => return self.on_childlock_key(key, flooded),
+            Overlay::Confirm(_) => return self.on_confirm_key(key),
             Overlay::None => {}
         }
         match action_for(key, self.tab) {
@@ -661,7 +685,8 @@ impl App {
             Local::SelectAll => self.hosts.select_all(),
             Local::SelectNone => self.hosts.select_none(),
             Local::SelectInvert => self.hosts.select_invert(),
-            Local::AdoptSelection => self.hosts.suggest_adopt(),
+            Local::AdoptSelection => self.open_apply(Reconcile::Add),
+            Local::UntrackSelection => self.open_apply(Reconcile::Untrack),
             Local::Sync => self.hosts.suggest_sync(),
             Local::Probe => self.jobs.suggest_probe(),
             Local::Retry => self.jobs.suggest_retry(),
@@ -732,6 +757,51 @@ impl App {
                     Asking::Justification => self.queue(Work::Override(value), "override"),
                 }
             }
+        }
+    }
+
+    /// `A` or `x` on hosts: open the naming confirm, or say why there is
+    /// nothing to apply.
+    ///
+    /// The screen decides what the apply would touch — the marks, or the
+    /// cursor row when nothing is marked — and refuses in the detail pane
+    /// with the data it already holds, before anyone is asked to confirm
+    /// an apply the writer would refuse anyway.
+    fn open_apply(&mut self, direction: Reconcile) {
+        match self.hosts.apply_candidates(direction) {
+            Err(why) => self.hosts.refuse_apply(&why),
+            Ok(names) => self.overlay = Overlay::Confirm(Confirm { direction, names }),
+        }
+    }
+
+    fn on_confirm_key(&mut self, key: KeyEvent) {
+        // ctrl-c first and unconditionally, the modal rule every overlay
+        // follows: a question must never be the only way out.
+        if action_for(key, self.tab) == Some(Action::Interrupt) {
+            self.quit = true;
+            return;
+        }
+        let Overlay::Confirm(confirm) = &self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let (direction, names) = (confirm.direction, confirm.names.clone());
+                self.overlay = Overlay::None;
+                let what = format!(
+                    "{} {} package{}",
+                    direction.verb(),
+                    names.len(),
+                    if names.len() == 1 { "" } else { "s" }
+                );
+                self.queue(Work::Reconcile(direction, names), &what);
+            }
+            // `q` closes the question, not the program — the same reading
+            // `Quit` has everywhere: back out of what is in front first.
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+            }
+            _ => {}
         }
     }
 
@@ -818,6 +888,7 @@ impl App {
             Overlay::Help => render_help(frame, area, self.tab),
             Overlay::Asking(prompt, _) => render_prompt(frame, area, prompt),
             Overlay::Childlock(hold) => render_childlock(frame, area, hold),
+            Overlay::Confirm(confirm) => render_confirm(frame, area, confirm),
         }
     }
 
@@ -997,6 +1068,68 @@ fn render_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt) {
         Line::from(vec![theme::dim(
             "─ enter accepts · esc cancels · ctrl-u clears ",
         )]),
+        lines,
+    );
+}
+
+/// The naming confirm: what a manifest apply is about to edit, every name
+/// of it (ADR-002 amendment).
+///
+/// The guard the amendment keeps for a selection that was *accumulated*
+/// rather than typed: before anything is written, the reader sees the
+/// count and the complete list, and can check it against what they think
+/// they marked. Both applies are manifest-only edits — the sentence under
+/// the question says what is and is not about to happen to the machine.
+fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
+    let n = confirm.names.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let (question, aside) = match confirm.direction {
+        Reconcile::Add => (
+            format!("Add {n} package{plural} to this host's tracked lists?"),
+            "a manifest edit in the store — the packages are already installed \
+             here, and committing the store is what shares it with the fleet",
+        ),
+        Reconcile::Untrack => (
+            format!("Untrack {n} package{plural} from this host's tracked lists?"),
+            "a manifest edit only — nothing is uninstalled, and anything still \
+             installed here appears in `pacrat sync --prune`'s plan",
+        ),
+    };
+    let mut lines = vec![
+        Line::default(),
+        Line::from(vec![theme::plain("  "), theme::plain(question)]),
+    ];
+    lines.extend(
+        screens::wrap(aside, 72)
+            .into_iter()
+            .map(|chunk| Line::from(vec![theme::plain("  "), theme::dim(chunk)])),
+    );
+    lines.push(Line::default());
+    // Every name, neutered on the way to the screen: these came out of
+    // tracked lists and pacman queries, not out of pacrat.
+    let list = confirm
+        .names
+        .iter()
+        .map(|name| out::visible_line(name).0)
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.extend(
+        screens::wrap(&list, 70)
+            .into_iter()
+            .map(|chunk| Line::from(vec![theme::plain("  "), theme::tinted(theme::INFO, chunk)])),
+    );
+    lines.push(Line::default());
+
+    let rect = centred(area, 76, lines.len() as u16 + 2);
+    overlay(
+        frame,
+        rect,
+        Line::from(vec![
+            theme::dim("─ "),
+            theme::accent(format!("{} the marks", confirm.direction.verb())),
+            theme::dim(" "),
+        ]),
+        Line::from(vec![theme::dim("─ enter or y applies · esc cancels ")]),
         lines,
     );
 }

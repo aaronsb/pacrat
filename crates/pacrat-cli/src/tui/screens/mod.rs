@@ -140,9 +140,50 @@ pub fn command(why: &str, argv: &[String]) -> Vec<Line<'static>> {
     lines
 }
 
+/// Break a sentence into lines that fit, on spaces.
+///
+/// The regions do not wrap, on purpose — the viewport counts content lines
+/// and a wrapped line is a different number of rows than the line it came
+/// from — so prose that has to fit is folded here, where the width is known
+/// and the count stays right. Shared: the updates screen folds its refusal
+/// prose with it, and the shell folds the confirm overlay's package list.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prose that has to fit is folded here, because the regions deliberately
+    /// do not wrap — the viewport counts content lines, and a wrapped line is
+    /// a different number of rows than the line it came from.
+    #[test]
+    fn wrapping_folds_on_spaces_and_never_loses_a_word() {
+        let text = "a human already refused this candidate and said why";
+        let folded = wrap(text, 20);
+        assert!(folded.iter().all(|line| line.chars().count() <= 20));
+        assert_eq!(folded.join(" "), text);
+        assert!(wrap("", 20).is_empty());
+        // A word longer than the width goes on a line of its own rather than
+        // being cut in half or looping forever.
+        let long = wrap("short aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa short", 10);
+        assert_eq!(long, ["short", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "short"]);
+    }
 
     /// Every character a line is actually made of, in order — what a
     /// terminal would receive if these spans reached it.
