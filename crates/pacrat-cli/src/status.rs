@@ -53,8 +53,8 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
         let marker = if *host == ctx.host { "*" } else { " " };
         let sizes: Vec<String> = Source::ALL
             .iter()
-            .map(|s| format!("{} {}", s.name(), ctx.tracked(host, *s).len()))
-            .collect();
+            .map(|s| Ok(format!("{} {}", s.name(), ctx.tracked(host, *s)?.len())))
+            .collect::<Result<_, String>>()?;
         println!(" {marker}{host:<10} {}", sizes.join(" · "));
     }
 
@@ -94,6 +94,7 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
         }
     }
     println!();
-    println!("       `pacrat sync` turns that into the commands that would close it");
+    println!("       `pacrat sync` turns that into commands that move this host toward");
+    println!("       the store — it prints them and runs none of them");
     Ok(())
 }

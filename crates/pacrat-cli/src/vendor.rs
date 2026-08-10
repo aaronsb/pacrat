@@ -26,6 +26,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::ValueEnum;
+use pacrat_core::pkg::valid_name;
 use pacrat_core::sources::{Role, SourceEntry, Sources};
 
 use crate::ctx::Ctx;
@@ -116,20 +117,6 @@ impl Held {
             ),
         }
     }
-}
-
-/// Package names: pacman's alphabet, as an allowlist. The name becomes a
-/// path component in the store and an argument to git, so anything outside
-/// this set is refused rather than escaped. Shared with `build`, which
-/// re-checks the names it reads back out of the ledger, and with `grade`,
-/// which puts the same name in a cache path and a grader's argv.
-pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('-')
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '+' | '-'))
 }
 
 pub fn run(
@@ -477,25 +464,12 @@ fn confirm(package: &str, commit: &str) -> Result<bool, String> {
 mod tests {
     use super::*;
 
+    /// The grammar itself is core's (`pkg::valid_name`, tested there); what
+    /// belongs here is that `vendor` refuses before it reaches the network.
     #[test]
-    fn names_are_an_allowlist() {
-        for ok in ["mdcat", "python-a", "gtk+", "a.b_c@1", "0ad", "lib32-glibc"] {
-            assert!(valid_name(ok), "{ok} should be valid");
-        }
-        for bad in [
-            "",
-            "-rf",
-            ".hidden",
-            "../escape",
-            "a/b",
-            "a b",
-            "a;rm -rf /",
-            "naïve",
-            "a\nb",
-            "$(id)",
-        ] {
-            assert!(!valid_name(bad), "{bad:?} should be rejected");
-        }
+    fn a_name_outside_the_grammar_never_becomes_a_git_argument() {
+        assert!(!valid_name("../escape"));
+        assert!(!valid_name("-upload-pack=touch /tmp/pwn"));
     }
 
     #[test]

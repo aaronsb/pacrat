@@ -99,7 +99,7 @@ enum Command {
     Build { packages: Vec<String> },
     /// Host-vs-manifest matrix
     Hosts,
-    /// Plan this host back into line with the manifest (prints, never runs)
+    /// Plan this host toward the manifest (prints commands, runs none)
     ///
     /// There is no <host> argument: sync transport — ssh to remote hosts, or
     /// each host syncing itself — is ADR-001's open question 4 and is not

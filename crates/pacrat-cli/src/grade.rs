@@ -52,12 +52,12 @@ use pacrat_core::grading::{
     commit_matches, has_quorum, worst_grade, Contribution, GradeReport, Standing, Subject,
     CONTRACT, PACRAT_SCALE,
 };
+use pacrat_core::pkg::valid_name;
 use pacrat_core::{Thresholds, Verdict};
 
 use crate::ctx::{self, Ctx};
 use crate::fstree;
 use crate::out::{shell_quote, truncate, visible_line};
-use crate::vendor::valid_name;
 use crate::HELD;
 
 /// How often the runner asks whether the child has exited. Short enough that

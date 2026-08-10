@@ -65,11 +65,17 @@ pub struct SourceDrift {
 /// against this machine's reality is a different question ("what would I need
 /// to look like slab?"), and giving it the same name as this one is how the
 /// two get confused.
+///
+/// All or nothing: one failing source query fails the call, so a caller never
+/// prints two sources' drift and then an error about the third. That is a
+/// change from the loop `status` used to run, and it is the behavior a report
+/// wants — a partial drift table invites the reader to treat what did print
+/// as the whole answer.
 pub fn host_drift(ctx: &Ctx) -> Result<Vec<SourceDrift>, String> {
     Source::ALL
         .iter()
         .map(|&source| {
-            let tracked = ctx.tracked(&ctx.host, source);
+            let tracked = ctx.tracked(&ctx.host, source)?;
             let installed = installed(source)?;
             let d = drift(&tracked, &installed);
             Ok(SourceDrift {

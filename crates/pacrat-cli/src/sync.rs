@@ -1,6 +1,12 @@
 //! `pacrat sync` — this host against the store: what the manifest says should
-//! be installed here, what actually is, and the exact commands that would
-//! close the gap. It prints them. It runs none of them.
+//! be installed here, what actually is, and the exact commands that move it
+//! toward the store. It prints them. It runs none of them.
+//!
+//! *Toward*, not *into line*: a plan is not always one pass. A package that
+//! has to be vendored and built is not installable until those steps have
+//! happened, so the install line of the first run cannot mention it. The
+//! report says so where it matters, and a second `pacrat sync` after the
+//! curation steps is the rest of the answer.
 //!
 //! ## Self-sync only
 //!
@@ -40,7 +46,7 @@
 //! work, it just found work whose resolution is a choice between two
 //! commands rather than one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -77,6 +83,10 @@ pub fn run(ctx: &Ctx, prune: bool, json: bool) -> Result<(), String> {
                 tracked: false,
                 in_sync: false,
                 installed,
+                // This path still asked the system three questions, and a
+                // count nobody can trace back to a command is a number with
+                // no provenance — the same rule the full report follows.
+                counted: counted(&drifts),
             })
             .map_err(|e| format!("json: {e}"))?;
             println!("{text}");
@@ -91,12 +101,22 @@ pub fn run(ctx: &Ctx, prune: bool, json: bool) -> Result<(), String> {
             println!("the store has no opinion about this host yet, so there is nothing to");
             println!("sync it *to* — all {installed} installed packages would read as extras.");
             println!("`pacrat add <packages>` adopts what belongs here first.");
+            println!();
+            println!("counted with");
+            for sd in &drifts {
+                println!(
+                    "  {:<8} {:>4}   [{}]",
+                    sd.source.name(),
+                    sd.installed.len(),
+                    live::query_argv(sd.source)
+                );
+            }
         }
         std::process::exit(crate::HELD);
     }
 
     let plan = plan(&drifts, &served, &ledger);
-    let commands = plan.commands(prune);
+    let commands = plan.commands(&repo.name, prune);
 
     if json {
         report_json(ctx, &drifts, &plan, &commands, prune, &state)?;
@@ -154,6 +174,10 @@ pub struct Plan {
     /// official one — something arrived outside curation — even though both
     /// leave by the same `pacman -Rns`.
     extras: Vec<(Source, Vec<String>)>,
+    /// Missing names that appear in more than one of this host's tracked
+    /// lists, with the lists that claim them. A store inconsistency, not a
+    /// drift: the plan resolves it by taking the stricter class, and says so.
+    double_tracked: Vec<(String, Vec<Source>)>,
 }
 
 /// Classify this host's drift. Pure: every input is data, so the matrix is
@@ -164,8 +188,12 @@ pub struct Plan {
 /// and if so has it been built here".
 fn plan(drifts: &[SourceDrift], served: &BTreeSet<String>, ledger: &Sources) -> Plan {
     let mut plan = Plan::default();
+    // Which source lists asked for each missing name. Almost always one; the
+    // exceptions are what `double_tracked` reports.
+    let mut asked_by: BTreeMap<&String, Vec<Source>> = BTreeMap::new();
     for sd in drifts {
         for package in &sd.drift.missing {
+            asked_by.entry(package).or_default().push(sd.source);
             let class = classify(package, sd.source, served, ledger);
             if class == Class::InstallCurated {
                 plan.curated.push(package.clone());
@@ -182,36 +210,59 @@ fn plan(drifts: &[SourceDrift], served: &BTreeSet<String>, ledger: &Sources) -> 
             plan.extras.push((sd.source, sd.drift.extra.clone()));
         }
     }
-    // Drift arrives sorted per source; merging native and curated names into
-    // one install list is the only place that ordering is disturbed.
-    plan.install.sort();
-    plan.install.dedup();
-    plan.curated.sort();
-    plan.curated.dedup();
+    // Drift arrives sorted per source; merging the sources into one bucket
+    // apiece is the only place that ordering is disturbed.
+    for bucket in [
+        &mut plan.install,
+        &mut plan.curated,
+        &mut plan.build_first,
+        &mut plan.vendor_first,
+        &mut plan.flatpak,
+    ] {
+        bucket.sort();
+        bucket.dedup();
+    }
+
+    // One name in two tracked lists otherwise plans two contradictory things
+    // for it — `pacrat vendor foo` *and* `sudo pacman -S foo`, the second of
+    // which is the bypass the first exists to prevent. The stricter class
+    // wins, so the name leaves the install line; the store inconsistency
+    // behind it is reported rather than silently absorbed, because one
+    // package belongs to one source and no plan can make that true again.
+    plan.install
+        .retain(|p| !contains(&plan.vendor_first, p) && !contains(&plan.build_first, p));
+    plan.curated
+        .retain(|p| !contains(&plan.build_first, p) && !contains(&plan.vendor_first, p));
+    plan.double_tracked = asked_by
+        .into_iter()
+        .filter(|(_, sources)| sources.len() > 1)
+        .map(|(package, sources)| (package.clone(), sources))
+        .collect();
     plan
 }
 
+/// Membership in one of the sorted buckets.
+fn contains(sorted: &[String], name: &str) -> bool {
+    sorted.binary_search_by(|p| p.as_str().cmp(name)).is_ok()
+}
+
 fn classify(package: &str, source: Source, served: &BTreeSet<String>, ledger: &Sources) -> Class {
-    if source == Source::Flatpak {
-        return Class::Flatpak;
-    }
-    // The ledger outranks the tracked list's source column, including for a
-    // name an official repo also carries: a human vendored it deliberately,
-    // and the curated build is the one this fleet decided to run.
-    if ledger.packages.contains_key(package) {
-        return if served.contains(package) {
-            Class::InstallCurated
-        } else {
-            Class::BuildFirst
-        };
-    }
-    match source {
+    // Pairing the source with the ledger answer in one match keeps every cell
+    // of the matrix visible and leaves no arm that cannot be reached.
+    match (source, ledger.packages.contains_key(package)) {
+        // Flatpaks are outside the custody ladder: no ledger, no curation.
+        (Source::Flatpak, _) => Class::Flatpak,
+        // The ledger outranks the tracked list's source column, including for
+        // a name an official repo also carries: a human vendored it
+        // deliberately, and the curated build is the one this fleet runs.
+        (_, true) if served.contains(package) => Class::InstallCurated,
+        (_, true) => Class::BuildFirst,
         // Tracked as native means pacman resolves it from an official repo.
-        Source::Native => Class::Install,
+        (Source::Native, false) => Class::Install,
         // Tracked as foreign and not in the ledger. There is no command that
         // installs this and stays inside the model — naming the curation step
         // is the whole answer, not a fallback for want of a better one.
-        Source::Aur | Source::Flatpak => Class::VendorFirst,
+        (Source::Aur, false) => Class::VendorFirst,
     }
 }
 
@@ -254,7 +305,10 @@ impl Plan {
     /// `vendor` and `build` are deliberately absent from the install line:
     /// they are not installable yet, and listing them there would produce a
     /// paste that fails halfway.
-    fn commands(&self, prune: bool) -> Vec<String> {
+    ///
+    /// Pure — `repo` is passed in rather than read from the config, so the
+    /// whole rendering stays testable as data.
+    fn commands(&self, repo: &str, prune: bool) -> Vec<String> {
         let mut cmds = Vec::new();
         // `vendor` takes one package and prompts for a review of it; there is
         // no batch form to print, and there should not be.
@@ -267,7 +321,11 @@ impl Plan {
         if !self.install.is_empty() {
             cmds.push(format!(
                 "sudo pacman -S --needed -- {}",
-                quoted(&self.install)
+                self.install
+                    .iter()
+                    .map(|p| shell_quote(&self.qualify(repo, p)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ));
         }
         if !self.flatpak.is_empty() {
@@ -290,6 +348,28 @@ impl Plan {
             }
         }
         cmds
+    }
+
+    /// A curated name written the way pacman disambiguates it: `<repo>/<pkg>`.
+    ///
+    /// Without the prefix, a curated package that shares a name with an
+    /// official one installs whichever repo pacman.conf lists first — and
+    /// `pacrat setup` appends the section deliberately, so official wins and
+    /// the human gets the uncurated build from a command pacrat printed. The
+    /// qualified form asks for the one that was reviewed, and it also retires
+    /// the "move the section above [core] by hand" advice for this path: that
+    /// edit exists to win name collisions globally, and a plan that names its
+    /// repo per package does not need to win anything.
+    ///
+    /// `/` is already a bare character in `shell_quote`, and `Repo::validate`
+    /// has rejected anything a shell would mind, so the pair quotes as one
+    /// word or not at all.
+    fn qualify(&self, repo: &str, package: &str) -> String {
+        if contains(&self.curated, package) {
+            format!("{repo}/{package}")
+        } else {
+            package.to_string()
+        }
     }
 }
 
@@ -328,11 +408,27 @@ fn served(repo_path: &Path) -> BTreeSet<String> {
 /// because this filename is the only place the four fields are ever joined —
 /// so the last three hyphen-separated fields are always version, release and
 /// architecture, and everything before them is the name however many hyphens
-/// it has. `.sig` files parse to the same name, which is harmless in a set,
-/// and the repo database (`<repo>.db.tar.zst`) has no `.pkg.tar.` in it at all.
+/// it has.
+///
+/// The name must *end* in the package extension, not merely contain it. A
+/// half-downloaded `…pkg.tar.zst.part` names a package that is not there, and
+/// counting it as served would send the human to `pacman -S` for something
+/// the repo cannot hand over. A lone `.sig` is excluded for the same reason:
+/// a signature is not a package. The repo database (`<repo>.db.tar.zst`) has
+/// no `.pkg.tar` in it at all.
 fn pkgname_of(file: &str) -> Option<String> {
-    let stem = &file[..file.find(".pkg.tar.")?];
-    let mut fields = stem.rsplitn(4, '-');
+    const EXT: &str = ".pkg.tar";
+    let cut = file.find(EXT)?;
+    // What follows `.pkg.tar` may be nothing (uncompressed) or exactly one
+    // compression suffix. A second dot means something was appended — `.part`,
+    // `.sig`, an editor's backup — and that file is not a served package.
+    let tail = &file[cut + EXT.len()..];
+    let bare_suffix = tail.is_empty()
+        || (tail.starts_with('.') && tail[1..].chars().all(|c| c.is_ascii_alphanumeric()));
+    if !bare_suffix {
+        return None;
+    }
+    let mut fields = file[..cut].rsplitn(4, '-');
     let (_arch, _pkgrel, _pkgver) = (fields.next()?, fields.next()?, fields.next()?);
     let name = fields.next()?;
     (!name.is_empty()).then(|| name.to_string())
@@ -453,6 +549,24 @@ fn report_text(
         }
     }
 
+    if !plan.double_tracked.is_empty() {
+        println!();
+        println!("store     this host's lists disagree with themselves:");
+        for (package, sources) in &plan.double_tracked {
+            println!(
+                "          {package} is tracked as {}",
+                sources
+                    .iter()
+                    .map(|s| s.name())
+                    .collect::<Vec<_>>()
+                    .join(" and as ")
+            );
+        }
+        println!("          a package belongs to one source. The plan above takes the");
+        println!("          stricter reading and names it once — but no command fixes");
+        println!("          this, only an edit to packages/{}/.", ctx.host);
+    }
+
     println!();
     println!("commands  nothing below has been run — `pacrat sync` only prints");
     for cmd in commands {
@@ -461,6 +575,11 @@ fn report_text(
     if commands.is_empty() {
         println!("  (none — every item above needs a decision first)");
     }
+    if !plan.vendor_first.is_empty() || !plan.build_first.is_empty() {
+        println!("          curation steps change what is installable — re-run");
+        println!("          `pacrat sync` afterwards for the install line they earn.");
+    }
+
     // Only worth saying when a curated name is actually in play: for an
     // official-repo-only plan, neither caveat can bite.
     let curated_in_play = !plan.curated.is_empty() || !plan.build_first.is_empty();
@@ -474,13 +593,18 @@ fn report_text(
     } else if !plan.curated.is_empty() {
         println!();
         println!(
-            "note      {} come{} from the curated repo. If pacman cannot find one,",
+            "note      {} come{} from [{}], not from an official repo. If pacman",
             list_preview(&plan.curated, CAP),
-            plural_verb(plan.curated.len())
+            plural_verb(plan.curated.len()),
+            repo.name
         );
-        println!("          its sync database predates the build: `sudo pacman -Syu`");
-        println!("          first. A bare `-Sy` before an install is the partial-upgrade");
-        println!("          footgun; don't.");
+        println!("          reports one of those as not found, there are two causes and");
+        println!("          pacrat does not read the database to tell them apart: the");
+        println!("          build may never have reached repo-add (that is `pacrat");
+        println!("          build`'s job, and it reports what it served), or this host's");
+        println!("          copy of the db may predate the build — `sudo pacman -Syu`");
+        println!("          refreshes it. A bare `-Sy` before an install is the");
+        println!("          partial-upgrade footgun; don't.");
     }
 }
 
@@ -516,6 +640,9 @@ struct Report<'a> {
     drift: Vec<DriftJson<'a>>,
     missing: MissingJson<'a>,
     extras: Vec<ExtrasJson<'a>>,
+    /// Names this host tracks in more than one list. A store inconsistency
+    /// the plan works around; empty is the normal case.
+    double_tracked: Vec<DoubleTrackedJson<'a>>,
     repo: RepoJson<'a>,
     /// Shell-ready, in the order they may be run. Never truncated.
     commands: &'a [String],
@@ -552,6 +679,33 @@ struct ExtrasJson<'a> {
 }
 
 #[derive(Serialize)]
+struct DoubleTrackedJson<'a> {
+    package: &'a str,
+    sources: Vec<&'static str>,
+}
+
+/// What a source query counted, and the command that counted it. Shared by
+/// the full report's `drift` rows and the untracked exit, so no path reports
+/// a number without the call behind it.
+#[derive(Serialize)]
+struct CountedJson {
+    source: &'static str,
+    installed: usize,
+    query: &'static str,
+}
+
+fn counted(drifts: &[SourceDrift]) -> Vec<CountedJson> {
+    drifts
+        .iter()
+        .map(|sd| CountedJson {
+            source: sd.source.name(),
+            installed: sd.installed.len(),
+            query: live::query_argv(sd.source),
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
 struct RepoJson<'a> {
     name: &'a str,
     path: &'a str,
@@ -568,6 +722,7 @@ struct Untracked<'a> {
     tracked: bool,
     in_sync: bool,
     installed: usize,
+    counted: Vec<CountedJson>,
 }
 
 fn report_json(
@@ -609,6 +764,14 @@ fn report_json(
                 packages,
             })
             .collect(),
+        double_tracked: plan
+            .double_tracked
+            .iter()
+            .map(|(package, sources)| DoubleTrackedJson {
+                package,
+                sources: sources.iter().map(|s| s.name()).collect(),
+            })
+            .collect(),
         repo: RepoJson {
             name: &ctx.config.repo.name,
             path: &ctx.config.repo.path,
@@ -643,6 +806,9 @@ mod tests {
             },
         }
     }
+
+    /// The repo name a curated install line is qualified with.
+    const REPO: &str = "dotfiles-aur";
 
     fn served_set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| (*s).to_string()).collect()
@@ -758,7 +924,7 @@ role = "maintained"
         let p = plan(&drifts, &served_set(&[]), &ledger());
         assert!(p.in_sync());
         assert_eq!(p, Plan::default());
-        assert!(p.commands(true).is_empty());
+        assert!(p.commands(REPO, true).is_empty());
     }
 
     /// Extras alone are still drift: something is installed that the store
@@ -770,7 +936,7 @@ role = "maintained"
         assert!(!p.in_sync());
         assert_eq!(p.missing(), 0);
         // ...but without --prune there is nothing to run.
-        assert!(p.commands(false).is_empty());
+        assert!(p.commands(REPO, false).is_empty());
     }
 
     // ---- the commands ----
@@ -784,11 +950,11 @@ role = "maintained"
         ];
         let p = plan(&drifts, &served_set(&["mdcat"]), &ledger());
         assert_eq!(
-            p.commands(true),
+            p.commands(REPO, true),
             vec![
                 "pacrat vendor pacseek",
                 "pacrat build playtimed",
-                "sudo pacman -S --needed -- mdcat ripgrep",
+                "sudo pacman -S --needed -- dotfiles-aur/mdcat ripgrep",
                 "flatpak install -y --noninteractive org.gnome.Loupe",
                 "sudo pacman -Rns -- cowsay",
                 "flatpak uninstall -y --noninteractive org.old.App",
@@ -802,7 +968,7 @@ role = "maintained"
         let drifts = vec![sd(Source::Native, &["ripgrep"], &["cowsay"])];
         let p = plan(&drifts, &served_set(&[]), &ledger());
         assert_eq!(
-            p.commands(false),
+            p.commands(REPO, false),
             vec!["sudo pacman -S --needed -- ripgrep"]
         );
     }
@@ -813,7 +979,7 @@ role = "maintained"
     fn uninstallable_names_stay_out_of_the_install_line() {
         let drifts = vec![sd(Source::Aur, &["pacseek", "playtimed"], &[])];
         let p = plan(&drifts, &served_set(&[]), &ledger());
-        let cmds = p.commands(false);
+        let cmds = p.commands(REPO, false);
         assert!(!cmds.iter().any(|c| c.contains("pacman -S")), "{cmds:?}");
         assert_eq!(
             cmds,
@@ -827,7 +993,7 @@ role = "maintained"
         let drifts = vec![sd(Source::Aur, &["a-pkg", "b-pkg", "c-pkg"], &[])];
         let p = plan(&drifts, &served_set(&[]), &Sources::default());
         assert_eq!(
-            p.commands(false),
+            p.commands(REPO, false),
             vec![
                 "pacrat vendor a-pkg",
                 "pacrat vendor b-pkg",
@@ -850,7 +1016,7 @@ role = "maintained"
             &["$(id)", "two words"],
         )];
         let p = plan(&drifts, &served_set(&[]), &Sources::default());
-        let cmds = p.commands(true);
+        let cmds = p.commands(REPO, true);
         assert_eq!(
             cmds,
             vec![
@@ -861,6 +1027,80 @@ role = "maintained"
         for cmd in &cmds {
             assert!(cmd.contains(" -- "), "no argument separator: {cmd}");
         }
+    }
+
+    /// The install line must ask for the *curated* build by name.
+    ///
+    /// `pacrat setup` appends its section, so official repos win a name
+    /// collision. A bare `pacman -S mdcat` would therefore install the
+    /// official mdcat from a command pacrat printed to install the reviewed
+    /// one — the curation model defeated by the resolution order. Qualifying
+    /// the name is what makes the printed command mean what it says.
+    #[test]
+    fn curated_names_are_repo_qualified_and_official_ones_are_not() {
+        let drifts = vec![sd(Source::Native, &["mdcat", "ripgrep"], &[])];
+        let p = plan(&drifts, &served_set(&["mdcat"]), &ledger());
+        assert_eq!(
+            p.commands(REPO, false),
+            vec!["sudo pacman -S --needed -- dotfiles-aur/mdcat ripgrep"]
+        );
+        // The prefix is the configured repo's, not a constant.
+        assert_eq!(
+            p.commands("other-repo", false),
+            vec!["sudo pacman -S --needed -- other-repo/mdcat ripgrep"]
+        );
+        // `/` needs no quoting, so the pair stays one readable word.
+        assert!(!p.commands(REPO, false)[0].contains('\''));
+    }
+
+    /// A name in two of this host's lists asked for two different things —
+    /// `pacrat vendor foo` and `sudo pacman -S foo`, the second being the
+    /// bypass the first exists to prevent. The stricter class wins, the name
+    /// is planned once, and the store's inconsistency is reported.
+    #[test]
+    fn a_double_tracked_name_yields_one_command_and_a_report() {
+        let drifts = vec![
+            sd(Source::Native, &["ripgrep", "vv"], &[]),
+            sd(Source::Aur, &["vv"], &[]),
+        ];
+        let p = plan(&drifts, &served_set(&[]), &Sources::default());
+        assert_eq!(p.vendor_first, v(&["vv"]));
+        assert_eq!(p.install, v(&["ripgrep"]), "vv must leave the install line");
+        assert_eq!(p.missing(), 2, "counted once, not twice");
+        assert_eq!(
+            p.double_tracked,
+            vec![("vv".to_string(), vec![Source::Native, Source::Aur])]
+        );
+        assert_eq!(
+            p.commands(REPO, false),
+            vec!["pacrat vendor vv", "sudo pacman -S --needed -- ripgrep"]
+        );
+    }
+
+    /// Same rule for the vendored-but-unbuilt class: build wins over install,
+    /// so the name is not proposed for an install that cannot resolve.
+    #[test]
+    fn build_first_also_outranks_the_install_line() {
+        let drifts = vec![
+            sd(Source::Native, &["playtimed"], &[]),
+            sd(Source::Aur, &["playtimed"], &[]),
+        ];
+        let p = plan(&drifts, &served_set(&[]), &ledger());
+        assert_eq!(p.build_first, v(&["playtimed"]));
+        assert!(p.install.is_empty());
+        assert!(p.curated.is_empty());
+        assert_eq!(p.commands(REPO, false), vec!["pacrat build playtimed"]);
+    }
+
+    /// One name, one list: the ordinary case reports no inconsistency.
+    #[test]
+    fn a_normal_plan_reports_no_double_tracking() {
+        let drifts = vec![
+            sd(Source::Native, &["ripgrep"], &[]),
+            sd(Source::Aur, &["pacseek"], &[]),
+        ];
+        let p = plan(&drifts, &served_set(&[]), &Sources::default());
+        assert!(p.double_tracked.is_empty());
     }
 
     /// The flatpak lines have no `--` because flatpak's own parser has no such
@@ -876,7 +1116,7 @@ role = "maintained"
         )];
         let p = plan(&drifts, &served_set(&[]), &Sources::default());
         assert_eq!(
-            p.commands(true),
+            p.commands(REPO, true),
             vec![
                 "flatpak install -y --noninteractive org.gnome.Loupe",
                 "flatpak uninstall -y --noninteractive 'org.evil.$(id)'",
@@ -896,20 +1136,33 @@ role = "maintained"
             pkgname_of("python-lsp-server-1.12.0-1-any.pkg.tar.zst").as_deref(),
             Some("python-lsp-server")
         );
-        // Other compressions, and a signature beside its package.
+        // Other compressions, and the uncompressed form.
         assert_eq!(
             pkgname_of("foo-1.0-2-any.pkg.tar.xz").as_deref(),
             Some("foo")
         );
-        assert_eq!(
-            pkgname_of("foo-1.0-2-any.pkg.tar.zst.sig").as_deref(),
-            Some("foo")
-        );
+        assert_eq!(pkgname_of("foo-1.0-2-any.pkg.tar").as_deref(), Some("foo"));
         // An epoch lives in pkgver, which is the field before pkgrel.
         assert_eq!(
             pkgname_of("bar-2:1.0-1-x86_64.pkg.tar.zst").as_deref(),
             Some("bar")
         );
+    }
+
+    /// A name that only *contains* the extension is a different file. The
+    /// `.part` case is the one that would lie: an interrupted download names
+    /// a package the repo cannot hand over, and calling it served sends the
+    /// human to `pacman -S` for something that is not there.
+    #[test]
+    fn an_appended_suffix_means_it_is_not_a_served_package() {
+        for file in [
+            "mdcat-2.7.1-1-x86_64.pkg.tar.zst.part",
+            "mdcat-2.7.1-1-x86_64.pkg.tar.zst.sig",
+            "mdcat-2.7.1-1-x86_64.pkg.tar.zst~",
+            "mdcat-2.7.1-1-x86_64.pkg.tar.zst.bak",
+        ] {
+            assert_eq!(pkgname_of(file), None, "{file:?} counted as served");
+        }
     }
 
     #[test]
@@ -926,15 +1179,23 @@ role = "maintained"
         }
     }
 
-    #[test]
-    fn served_reads_names_out_of_a_directory_and_survives_a_missing_one() {
-        let dir = std::env::temp_dir().join(format!("pacrat-sync-served-{}", std::process::id()));
+    /// Tagged by the test that owns it: two tests sharing a directory is a
+    /// failure that only shows up when they run in parallel, which is always.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pacrat-sync-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn served_reads_names_out_of_a_directory_and_survives_a_missing_one() {
+        let dir = temp_dir("served");
         for file in [
             "mdcat-2.7.1-1-x86_64.pkg.tar.zst",
             "mdcat-2.7.1-1-x86_64.pkg.tar.zst.sig",
             "python-lsp-server-1.12.0-1-any.pkg.tar.zst",
+            "half-1.0-1-any.pkg.tar.zst.part",
             "dotfiles-aur.db.tar.zst",
         ] {
             fs::write(dir.join(file), "").unwrap();

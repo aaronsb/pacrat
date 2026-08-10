@@ -56,7 +56,7 @@ pub fn run(ctx: &Ctx, packages: &[String], host: Option<&str>) -> Result<(), Str
         if adds.is_empty() {
             continue;
         }
-        let mut list = ctx.tracked(host, source);
+        let mut list = ctx.tracked(host, source)?;
         let before = list.len();
         for pkg in &adds {
             if !list.iter().any(|t| t == pkg) {

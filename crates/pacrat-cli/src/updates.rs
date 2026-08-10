@@ -175,7 +175,7 @@ pub fn run(ctx: &Ctx, fmt: Format) -> Result<(), String> {
     // Both halves want the same thing from the AUR — a version for a name —
     // so they ask together. Splitting it in two would double the round trips
     // and give one outage two different-sounding warnings.
-    let candidates = upstream_candidates(&tracked_aur(ctx), &sources.packages);
+    let candidates = upstream_candidates(&tracked_aur(ctx)?, &sources.packages);
     let (versions, rpc_error) = fetch_versions(&rpc_names(&rows, &candidates), fmt);
     if let Some(e) = &rpc_error {
         fmt.trace(&format!(
@@ -540,12 +540,12 @@ fn upstream_half(
 }
 
 /// Every AUR package name any host tracks.
-fn tracked_aur(ctx: &Ctx) -> BTreeSet<String> {
+fn tracked_aur(ctx: &Ctx) -> Result<BTreeSet<String>, String> {
     let mut tracked = BTreeSet::new();
     for host in ctx.tracked_hosts() {
-        tracked.extend(ctx.tracked(&host, Source::Aur));
+        tracked.extend(ctx.tracked(&host, Source::Aur)?);
     }
-    tracked
+    Ok(tracked)
 }
 
 /// The names worth one RPC: the pkgbases behind pending ledger rows, plus
