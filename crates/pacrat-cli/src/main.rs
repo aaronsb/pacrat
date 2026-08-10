@@ -62,9 +62,10 @@ fn main() {
         // Bare `pacrat`: the TUI once it exists; the overview meanwhile.
         None | Some(Command::Status) => status::run(&ctx),
         Some(Command::Hosts) => hosts::run(&ctx),
-        Some(Command::Add { ref packages, ref host }) => {
-            add::run(&ctx, packages, host.as_deref())
-        }
+        Some(Command::Add {
+            ref packages,
+            ref host,
+        }) => add::run(&ctx, packages, host.as_deref()),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {

@@ -87,6 +87,11 @@ server = "https://codeberg.org/aaronsb/fleet-repo/releases/latest/download"
         assert_eq!(c.thresholds.warn_at, 1);
         assert_eq!(c.thresholds.block_at, 4); // untouched default
         assert_eq!(c.repo.name, "fleet");
-        assert!(c.repo.server.as_deref().unwrap().starts_with("https://codeberg.org"));
+        assert!(c
+            .repo
+            .server
+            .as_deref()
+            .unwrap()
+            .starts_with("https://codeberg.org"));
     }
 }

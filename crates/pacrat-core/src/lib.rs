@@ -41,7 +41,10 @@ pub struct Thresholds {
 
 impl Default for Thresholds {
     fn default() -> Self {
-        Self { warn_at: 2, block_at: 4 }
+        Self {
+            warn_at: 2,
+            block_at: 4,
+        }
     }
 }
 

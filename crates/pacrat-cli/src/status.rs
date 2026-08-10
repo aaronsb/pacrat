@@ -68,7 +68,11 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
         let installed = live::installed(source)?;
         let d = drift(&tracked, &installed);
         if d.in_sync() {
-            println!("  {:<8} in sync ({} packages)", source.name(), tracked.len());
+            println!(
+                "  {:<8} in sync ({} packages)",
+                source.name(),
+                tracked.len()
+            );
         } else {
             println!(
                 "  {:<8} {} missing · {} extra   [{}]",

@@ -37,8 +37,9 @@ impl Ctx {
             .join("pacrat")
             .join("config.toml");
         let config = match fs::read_to_string(&config_path) {
-            Ok(text) => Config::from_toml(&text)
-                .map_err(|e| format!("{}: {e}", config_path.display()))?,
+            Ok(text) => {
+                Config::from_toml(&text).map_err(|e| format!("{}: {e}", config_path.display()))?
+            }
             Err(_) => Config::default(),
         };
 
