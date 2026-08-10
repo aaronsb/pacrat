@@ -19,7 +19,9 @@ use super::{field, note};
 /// Left margin for the art: centred on an 80-column terminal. The load
 /// cannot see the real width — regions get their geometry at render time —
 /// and a fixed margin that is roughly right beats a guess re-derived every
-/// frame. Narrower terminals clip the tail first, which he can spare.
+/// frame. Narrower terminals clip from the right, and below the margin
+/// width the art scrolls off entirely; either way the region truncates
+/// cleanly rather than wrapping.
 const MARGIN: usize = 20;
 
 pub struct About {
