@@ -283,6 +283,37 @@ each answer below was made against working code, not speculation.
    override in the decision ledger (below). The TUI affordance appears only
    after the friction, never as a plain keybinding.
 
+   > **Amendment (2026-08-10), on implementing the TUI form.** The
+   > parenthesis above claims more than any hold-to-confirm mechanism can
+   > deliver, and the implementation should not be read as delivering it.
+   > "No script or paste can trip it" is false: a script that opens a pty and
+   > paces its writes — one `sleep` between keystrokes — satisfies every
+   > timing condition a hold can test, and one was written to confirm it
+   > writes a ledger entry with no human present. No further hardening is
+   > proposed, for two reasons.
+   >
+   > First, it would buy nothing. The childlock guards a door that stands
+   > beside an open one: anyone able to drive a pty can invoke `pacrat
+   > adopt-update --override-block --reason "…"` directly and
+   > non-interactively, which this decision deliberately provides. A TUI gate
+   > that resisted automation would not make an override harder to automate;
+   > it would only make the CLI the way everyone automates it.
+   >
+   > Second, every sharper timing test is also a sharper way to lock a real
+   > keyboard out on hardware nobody has tested, and a lock that a person
+   > cannot open is a lock that gets removed.
+   >
+   > **What the TUI form does deliver, and what the decision should be read
+   > as asking for:** the override cannot be reached by a single keystroke, a
+   > misclick, a stray repeat, a naive paste, or anything arriving on a pipe
+   > rather than a terminal. It is *accident resistance* for an irreversible,
+   > fleet-visible act — not access control. That is the right bar because it
+   > matches the threat model this decision actually has: the adversary is
+   > the machine's own owner, later, having forgotten, and against them the
+   > **record** is the control and the friction is only what makes the record
+   > deliberate. Both surfaces still write that record, which is the part of
+   > this decision that carries the weight.
+
 3. **Jobs run in-process only.** Background gradings and builds live only as
    long as a pacrat process does; headless warmth is `pacrat update` on a
    systemd timer. No daemon, no IPC surface. Revisit only if the TUI feels

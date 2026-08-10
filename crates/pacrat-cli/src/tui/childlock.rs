@@ -2,16 +2,41 @@
 //!
 //! The CLI's friction for overriding a BLOCK is authoring a justification —
 //! `--override-block --reason "…"`. That friction does not survive being
-//! moved to a keybinding: `o` is one byte, and one byte is what a paste, a
-//! macro, a stuck key or a `yes o |` supplies. The ADR's answer is that the
-//! TUI's affordance must require *holding* a key until a progress bar fills,
-//! and it is specific about why: "a single keypress does nothing, so no
-//! script or paste can trip it".
+//! moved to a keybinding: `o` is one byte, and one byte is what a misclick,
+//! a paste or a stuck key supplies. So the affordance is a key that has to
+//! be *held* while a bar fills, and then the same justification the CLI
+//! demands.
 //!
-//! This is the state machine behind that bar. It is a plain struct over
-//! `Instant`s with no terminal in it, because the property it exists to have
-//! — that a burst of input cannot satisfy it — is exactly the kind of claim
-//! that has to be testable without a keyboard.
+//! ## What this is, and what it is not
+//!
+//! **It is a guard against fat-fingering an irreversible action.** It stops
+//! a misclick, a stray keystroke, a naive paste, and anything arriving down
+//! a pipe rather than a terminal. Those are the ways an override actually
+//! happens by accident, and they are worth stopping, because the thing on
+//! the other side is a permanent entry in a file the whole fleet reads.
+//!
+//! **It is not access control, and it must not be described as one.** The
+//! ADR originally said "no script or paste can trip it". That is not true
+//! and no timing mechanism can make it true: a forty-line script that opens
+//! a pty and sleeps 40ms between writes satisfies every gate below, and a
+//! reviewer wrote a ledger entry with one. The conditions here raise the
+//! cost of an accident to something no accident pays; they do not raise the
+//! cost of *deliberate* automation past trivial.
+//!
+//! Nor would it matter if they did. **The childlock grants no privilege the
+//! CLI does not already offer non-interactively** — anyone who can drive a
+//! pty can run `pacrat adopt-update --override-block --reason "…"` directly,
+//! and that door is open by design because ADR-001 decision 2 put it there.
+//! A TUI gate that was somehow unautomatable would guard a house with an
+//! open front door. The audit trail is what carries the weight in both
+//! surfaces: whichever door was used, an entry is written naming the
+//! package, the bytes, the host, the time and the reason.
+//!
+//! So the bar to clear here is *accident resistance*, and the reason that is
+//! the right bar is that it is the only one the threat model asks for. The
+//! adversary an override guards against is the person who owns the machine,
+//! six months from now, having forgotten. Against them a record beats a
+//! lock. See ADR-001's amendment of 2026-08-10.
 //!
 //! ## What "a human held a key" is made of
 //!
@@ -72,12 +97,31 @@
 //! has produced exactly one event and the next is 30ms away; a paste always
 //! has thousands queued behind it.
 //!
+//! ## Where the line actually is
+//!
+//! The floor is what a *naive* paste cannot cross: pasting is one operation
+//! and its timing is not under the pasting hand's control. It is not what a
+//! deliberate script cannot cross, and the difference is one `sleep`. A
+//! writer that opens a pty and paces itself at 40ms satisfies elapsed time,
+//! the gap, the floor and the event count together, with nothing queued
+//! behind any keystroke — every gate here, passed, by about forty lines of
+//! Python.
+//!
+//! That is not a hole to plug, and trying would be the wrong instinct
+//! twice over. Every sharper timing signal is also a sharper way to lock out
+//! a real keyboard on hardware nobody tested — and the automation it would
+//! turn away already has `pacrat adopt-update --override-block --reason "…"`
+//! sitting open beside it. The lock is worth exactly what it costs, which is
+//! nothing, and it should be described as what it is.
+//!
 //! ## What this does not do
 //!
-//! It does not decide whether the caller is a human. Nothing can. It makes
-//! the cheap ways of not being one fail, and it is paired at the call site
-//! with a check that stdin is a terminal — a hold satisfied by something
-//! that is not a tty is not a hold, however well-timed.
+//! It does not decide whether the caller is a human, and it does not stop
+//! anybody who has decided to be automatic. Nothing here can. It makes the
+//! *accidental* ways of tripping an override fail — the misclick, the stray
+//! key, the paste — and it is paired at the call site with a check that
+//! stdin is a terminal, which is what turns away a pipe. What stands behind
+//! all of it is the record, not the gate.
 
 use std::time::{Duration, Instant};
 
