@@ -1,0 +1,24 @@
+┌─ pacrat ── [1]overview [2]browse [3]updates [4]hosts [5]jobs [6]config [7]abo┐
+├─ search ─────────────────────────────────────────────────────────────────────┤
+│  search  rat                                                                 │
+│    pacman -Ss -- rat                                                         │
+│    curl -fsS --max-time 10 'https://aur.archlinux.org/rpc/v5/search?arg=rat' │
+│                                                                              │
+├ results — 3 across both worlds ──────────────────────────────────────────────┤
+│  name                         ver              source   state                │
+│▸ rat-hole                     1.2.0-1          extra                         │
+│  rat-trap                     0.9.1-2          extra                         │
+│  rat-stash                    2.0.0-1          aur                           │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+├─ rat-hole — everything pacrat knows ─────────────────────────────────── 8/9 ─┤
+│  name      rat-hole                                                         █│
+│  version   1.2.0-1                                                          █│
+│  summary   A place to stash things                                          █│
+│  upstream  https://example.invalid/rat-hole                                 █│
+│  install   not installed on this host                                       █│
+│                                                                             █│
+│  state     unmanaged — nothing here knows it                                █│
+│  tracked   no host tracks it                                                █│
+└─ / · enter · v / t / i · ? help · q quit ───────────────── tab · region 2/3 ─┘

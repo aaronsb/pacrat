@@ -1,0 +1,15 @@
+┌─ pacrat ── [1]overview [2]browse [3]u┐
+├ matrix — 6 packages across 2 h─ 6/6 ─┤
+│  package                      north ║│
+│  •cowsay                      ✗     █│
+│   fd                          ✓     █│
+│   ripgrep                     ✓     █│
+│▸ •zoxide                      +     █│
+├─ legend ─────────────────────────────┤
+│  ✓ installed   ✗ tracked here, not in│
+│  the north column is the manifest aga│
+│  sync is self-only (ADR-001 q4) — pac│
+├─ zoxide ────────────────────── 2/10 ─┤
+│  package   zoxide                   █│
+│  state     tracked                  ║│
+└─ space · * / - / ─ tab · region 1/3 ─┘
