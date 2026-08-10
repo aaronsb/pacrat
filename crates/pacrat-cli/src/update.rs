@@ -117,16 +117,17 @@ pub fn run(ctx: &Ctx, mode: Option<Mode>, fmt: Format) -> Result<(), String> {
     say!("mode      {mode}");
     say!("store     {}", ctx.sources_path().display());
     say!(
-        "gate      BLOCK always holds and this verb has no override; ungraded holds{}",
+        "gate      a BLOCK verdict always holds (this verb has no override); \
+         UNGRADED holds too{}",
         match mode {
-            Mode::Manual => " unless you say otherwise",
+            Mode::Manual => ", unless you approve it when asked",
             _ => "",
         }
     );
     if asks(mode) && !stdin_is_a_human() {
         say!(
-            "stdin     not a terminal — every question in this run answers no, so \
-             anything that would be asked about is held"
+            "stdin     not a terminal — no questions can be asked, so every prompt \
+             answers no and those candidates are held"
         );
     }
 
@@ -523,17 +524,18 @@ enum Decision {
 fn hold_line(mode: Mode, verdict: Verdict, package: &str) -> String {
     match verdict {
         Verdict::Block => format!(
-            "held      {verdict} — this verb has no override. `pacrat review {package}` \
-             is the diff; accepting the risk on the record is `pacrat adopt-update \
-             {package} --commit <c> --override-block --reason \"…\"`"
+            "held      {verdict} — this verb has no override. Run `pacrat review \
+             {package}` to read the diff; to accept the risk on the record, use \
+             `pacrat adopt-update {package} --commit <c> --override-block --reason \"…\"`"
         ),
         Verdict::Ungraded => format!(
-            "held      {verdict} — nothing graded these bytes, and failure is never \
-             read as proceed. `pacrat review {package}`"
+            "held      {verdict} — nothing has graded these bytes, and a missing \
+             grading never counts as approval. Run `pacrat review {package}` to inspect it"
         ),
         _ => format!(
-            "held      {verdict} — {mode} mode does not adopt a {verdict} unasked. \
-             `pacrat review {package}`, then `--mode semi` or `pacrat adopt-update`"
+            "held      {verdict} — {mode} mode does not adopt a {verdict} without \
+             asking. Review with `pacrat review {package}`, then re-run with \
+             `--mode semi` or adopt directly with `pacrat adopt-update`"
         ),
     }
 }
@@ -553,7 +555,7 @@ fn stdin_is_a_human() -> bool {
 
 fn ask(question: &str, hint: &str) -> Result<bool, String> {
     if !stdin_is_a_human() {
-        say!("asking    {question} — no terminal to ask, so the answer is no");
+        say!("asking    {question} — stdin is not a terminal, so the answer is no");
         return Ok(false);
     }
     vendor::ask(question, hint)
@@ -590,8 +592,8 @@ fn build_stage(ctx: &Ctx, mode: Mode, adopted: &[String]) -> Build {
             Err(e) => return Build::Ran(Err(e)),
             Ok(false) => {
                 say!(
-                    "not built — the store holds the adopted trees; `pacrat build` \
-                     serves them when you are ready"
+                    "not built — the adopted trees are in the store; run `pacrat \
+                     build` when you are ready"
                 );
                 return Build::Declined;
             }
@@ -710,16 +712,16 @@ fn report_text(s: &Summary, exit: &Exit) {
     match s.build {
         Build::Nothing => {}
         Build::Declined => say!(
-            "served    nothing — the build was declined; `pacrat build` serves the \
-             adopted trees when you are ready"
+            "served    nothing — the build was declined; run `pacrat build` when \
+             you are ready"
         ),
         Build::Ran(Ok(())) => say!("served    {}", list_preview(s.adopted, 12)),
         Build::Ran(Err(e)) => say!("served    build failed: {}", truncate(e, 90)),
     }
     if matches!(exit, Exit::Held) && s.holds() > 0 {
         say!(
-            "next      `pacrat review <package>` for anything held; nothing above was \
-             adopted past a gate"
+            "next      run `pacrat review <package>` on any held row; nothing above \
+             was adopted past a gate"
         );
     }
 }
@@ -728,10 +730,10 @@ fn report_text(s: &Summary, exit: &Exit) {
 fn why(row: &Row) -> String {
     match &row.outcome {
         Outcome::Adopted => "tree and ledger advanced".into(),
-        Outcome::HeldWarn => format!("{} holds unless a human says otherwise", Verdict::Warn),
-        Outcome::HeldBlock => format!("{} always holds; no override in this verb", Verdict::Block),
+        Outcome::HeldWarn => format!("{} holds without human approval", Verdict::Warn),
+        Outcome::HeldBlock => format!("{} always holds; this verb has no override", Verdict::Block),
         Outcome::HeldUngraded => "nothing graded these bytes".into(),
-        Outcome::Declined => "asked, and the answer was no".into(),
+        Outcome::Declined => "declined at the prompt".into(),
         Outcome::RejectedSkip => "a human refused this candidate".into(),
         Outcome::Unreachable(e) => format!("could not ask: {e}"),
         Outcome::Failed(e) => e.lines().next().unwrap_or_default().to_string(),

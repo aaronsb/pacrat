@@ -264,10 +264,10 @@ fn run_graders(
     // and a grading of it must not be filed under a different one.
     if commit != reviewed {
         return Err(format!(
-            "the store tree for {package} is at {reviewed}, not {commit} — a grader can \
-             only read the tree that is there, so pacrat will not record its answer \
-             against another commit. Grade the candidate through the update loop, or \
-             record your own reading with --grade N --note …"
+            "the store tree for {package} is at {reviewed}, not {commit} — graders \
+             read the tree that is on disk, and pacrat will not file their answer \
+             under a different commit. Run `pacrat update` to grade the candidate, \
+             or record your own grade with --grade N --note …"
         ));
     }
 
@@ -669,15 +669,16 @@ fn summarize(ctx: &Ctx, answers: &[Answer]) -> (Verdict, Option<u8>) {
         } else {
             say!(
                 "reason    no configured grader answered ({} failed: {}) and there is no \
-                 manual grading — ungraded holds; it is never read as proceed",
+                 manual grading — the verdict is UNGRADED, which holds; a failed \
+                 grader never counts as approval",
                 failed.len(),
                 failed.join(", ")
             );
         }
     } else if !quorum && manual.is_empty() && answered.is_empty() {
         say!(
-            "reason    nothing graded this subject — ungraded holds; it is never read \
-             as proceed"
+            "reason    nothing has graded these bytes — the verdict is UNGRADED, \
+             which holds"
         );
     }
 
@@ -694,9 +695,9 @@ fn summarize(ctx: &Ctx, answers: &[Answer]) -> (Verdict, Option<u8>) {
             );
         } else {
             say!(
-                "note      {} has a cached grade of {grade} on file, but a grader this host \
-                 no longer runs cannot answer for this run — it can only make a verdict \
-                 worse, never make one exist",
+                "note      {} has a cached grade of {grade} on file, but it is no longer \
+                 in this host's config — a retired grader's grade can make a verdict \
+                 worse, but cannot supply one on its own",
                 a.name
             );
         }
@@ -1152,7 +1153,7 @@ fn other_cached(
 fn same_bytes_line(filed_under: &str) -> String {
     format!(
         "graded as {} — the same bytes under a different commit id \
-         (an amended or rebased upstream renames a tree; it does not change it)",
+         (an upstream amend or rebase gives the same tree a new commit id)",
         short_hash(filed_under)
     )
 }
@@ -1249,7 +1250,7 @@ pub fn print_cached(c: &Cached) {
     if c.standing == Standing::Retired {
         say!(
             "standing  {} is not in this host's config — its grade can make this \
-             verdict worse, and can never make one exist",
+             verdict worse, but cannot supply one on its own",
             truncate(&name, 40)
         );
     }
