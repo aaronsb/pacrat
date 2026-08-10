@@ -100,3 +100,32 @@ touched, per ADR-003).
   form; the module docs state the trade plainly rather than hiding it.
 - The adapter's flag parsing survives until yay-friend goes native, then
   both go together.
+
+## Amendment (2026-08-10): the reciprocal — yay-friend goes native now
+
+Ratified by Aaron in the same conversation. The "day yay-friend emits the
+contract" is not deferred; it is the other half of this work, implemented
+in yay-friend's own repo (`~/Projects/system/arch/yay-friend`):
+
+- **`yay-friend grade`** — a subcommand that reads the `PACRAT_*` subject
+  and emits `pacrat-grade/v1` exactly. It grades the tree it was handed
+  (`PACRAT_TREE`) and files under `PACRAT_COMMIT`, which dissolves the
+  adapter's wrong-commit refusal: the adapter had to compare AUR HEAD to
+  the cache because it could only look the answer up; the native verb
+  analyzes the exact bytes pacrat staged. Cache stays keyed by
+  (package, commit) — a hit replays, a miss calls the model and caches.
+- **`--json` on analysis** — yay-friend's own full-detail shape,
+  deliberately *not* the contract (more information, its own structure).
+
+The pair is the demonstration, and the docs teach it as such: a tool
+built for pacrat is one string (`cmd = "yay-friend grade"`); a tool that
+has never heard of pacrat is one line of pipe-shaping
+(`cmd = "yay-friend analyze --json … | jq '…'"` — or any other analyzer).
+Two shapes, one contract, both first-class.
+
+Deployment reality: the AUR write path is still frozen, so installed
+yay-friend binaries will lack the subcommand for a while. The setup
+interview therefore **probes** — `yay-friend grade --help` answering 0
+registers the native string; otherwise the contrib adapter string; the
+adapter is deleted only when the fleet's binaries all answer. The
+modernization offer follows the same order.
