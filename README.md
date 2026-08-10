@@ -12,6 +12,11 @@ plans the moves — but it can't operate in the human world. Your hands are on
 the pans. Installs print as commands for you to run, holds stay held until
 you decide, and the one door past a BLOCK requires you to write down why.
 
+The recording above is the whole loop in about a minute — a real `makepkg`,
+a real pacman repo, and a grader that gets a vote. `make demo` re-records it;
+everything in it happens in a throwaway store under `/tmp` and never touches
+yours.
+
 - **Design:** `docs/architecture/ADR-001-store-backed-package-curation.md` —
   Accepted, with the reasoning for every rule below
 - **Grading contract:** `docs/grading-contract.md` — the `pacrat-grade/v1`
