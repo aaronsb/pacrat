@@ -2,6 +2,7 @@
 
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 /// Is this run's human-readable chatter going to stderr?
 ///
@@ -46,6 +47,16 @@ macro_rules! say {
 /// subprocess writes to the same descriptor interleaves.
 pub fn say_raw(text: &str) {
     use std::io::Write;
+    // Captured by line, losing only where this call's newlines were — which
+    // is the whole difference between `say_raw` and `say!`. Nothing the TUI
+    // drives calls it; the alternative is a partial line written straight
+    // through a screen somebody else is drawing.
+    if let Ok(mut held) = CAPTURE.lock() {
+        if let Some(lines) = held.as_mut() {
+            lines.extend(text.lines().map(str::to_string));
+            return;
+        }
+    }
     if chatter_is_stderr() {
         let mut err = std::io::stderr();
         let _ = write!(err, "{text}");
@@ -57,7 +68,54 @@ pub fn say_raw(text: &str) {
     }
 }
 
+/// Chatter collected instead of printed, while something else owns the
+/// screen.
+///
+/// The TUI is the only caller, and it is not an optimisation — it is the
+/// only way the always-visible-calls rule survives the alternate screen.
+/// `git.rs` prints `run  git clone …` before every call it makes, and a
+/// module driven from a TUI has no idea it is: those lines would land in
+/// ratatui's own buffer, where the next frame's diff would leave half of
+/// them on screen as garbage and the rest lost. Captured, they become the
+/// jobs screen's log — the same argv, the same order, in the one place the
+/// mockup promises they will be (§7, "the full log is one keypress away").
+///
+/// `None` means print, which is every other run of the program.
+static CAPTURE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// Start collecting chatter. Nothing is printed until [`capture_stop`].
+pub fn capture_start() {
+    if let Ok(mut held) = CAPTURE.lock() {
+        *held = Some(Vec::new());
+    }
+}
+
+/// Take everything captured since the last take, leaving capture on.
+pub fn capture_take() -> Vec<String> {
+    match CAPTURE.lock() {
+        Ok(mut held) => held.as_mut().map(std::mem::take).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Go back to printing. Whatever is still held is returned rather than
+/// dropped: it is a record of commands that really ran, and losing it
+/// because a screen was torn down is exactly the failure capture exists to
+/// prevent.
+pub fn capture_stop() -> Vec<String> {
+    match CAPTURE.lock() {
+        Ok(mut held) => held.take().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn say_line(line: &str) {
+    if let Ok(mut held) = CAPTURE.lock() {
+        if let Some(lines) = held.as_mut() {
+            lines.push(line.to_string());
+            return;
+        }
+    }
     if chatter_is_stderr() {
         eprintln!("{line}");
     } else {
@@ -425,5 +483,47 @@ mod tests {
         assert!(!line.contains('\x1b'));
         assert_eq!(line, "a␛[8mb c");
         assert_eq!(hidden, 1, "the ESC is hidden; the newline is only folded");
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    /// Capture is process-wide state, so these run as one test rather than
+    /// racing each other for it under the harness's threads.
+    #[test]
+    fn chatter_is_collected_while_something_else_owns_the_screen() {
+        // Off by default: every run of the program that is not the TUI
+        // prints, and nothing here changes that.
+        assert!(capture_take().is_empty());
+
+        capture_start();
+        say_line("run       git clone -- https://aur.archlinux.org/mdcat.git");
+        say_line("adopted   2 files");
+        let taken = capture_take();
+        assert_eq!(taken.len(), 2);
+        assert!(taken[0].starts_with("run "), "{taken:?}");
+
+        // Taking leaves capture on, so the next lines are collected too —
+        // the jobs screen drains repeatedly through one session.
+        say_line("ledger    aur/sources.toml");
+        assert_eq!(capture_take(), ["ledger    aur/sources.toml"]);
+
+        // `say_raw` is captured by line: the newlines it was called with are
+        // the only thing lost, which is the whole difference between it and
+        // `say!`.
+        say_raw("pkgver=2.11.0\npkgrel=1\n");
+        assert_eq!(capture_take(), ["pkgver=2.11.0", "pkgrel=1"]);
+
+        // Stopping hands back whatever was still held rather than dropping
+        // it — it is a record of commands that really ran.
+        say_line("left over");
+        assert_eq!(capture_stop(), ["left over"]);
+
+        // And with capture off, nothing is collected: this line goes to
+        // stdout, where the harness swallows it.
+        say_line("printed, not captured");
+        assert!(capture_take().is_empty());
     }
 }

@@ -352,7 +352,7 @@ fn execute_adopt(
     // declined prompt is not a decision, and a ledger that filled up with
     // overrides nobody went through with would be a ledger nobody believes.
     if let Some(reason) = overriding {
-        decisions::record_override(ctx, package, &cand.commit, grade, reason)?;
+        decisions::record_override(ctx, package, &cand.commit, &cand.digest, grade, reason)?;
         say!(
             "recorded  {} · {package} @ {} · override-block",
             store_rel(ctx, &ctx.decisions_path()),
@@ -784,6 +784,35 @@ fn changes(reviewed: &[String], candidate: &[String], same: impl Fn(&str) -> boo
 }
 
 impl Changes {
+    /// The four sets, for a caller that renders rather than prints.
+    ///
+    /// The TUI needs exactly what [`Changes::render`] says and cannot use
+    /// `say!` to say it. Accessors rather than public fields, so the only
+    /// way to build a `Changes` is still [`changes_between`] — a screen
+    /// assembling its own would be a second answer to "what would adopting
+    /// this do", and the value of there being one answer is the whole reason
+    /// this type is shared.
+    pub fn changed(&self) -> &[String] {
+        &self.changed
+    }
+
+    pub fn added(&self) -> &[String] {
+        &self.added
+    }
+
+    pub fn removed(&self) -> &[String] {
+        &self.removed
+    }
+
+    pub fn unchanged(&self) -> &[String] {
+        &self.unchanged
+    }
+
+    /// `2 changed · 0 added · …`, the line under a diff.
+    pub fn summary_line(&self) -> String {
+        self.summary()
+    }
+
     pub fn render(&self) {
         say!();
         for (label, names) in [
@@ -902,6 +931,24 @@ fn diff_failure(ran: &proc::Ran) -> String {
 struct Diff {
     text: String,
     cut: bool,
+}
+
+/// The staged candidate's diff, neutered, for a caller that draws it.
+///
+/// The same `git diff --no-index` [`render_diff`] prints, put through the
+/// same [`visible`] on the way out — which is not optional and not the
+/// caller's to remember. This text is a rendering of a file whose author
+/// would like to say things to the terminal of the person deciding whether
+/// to trust them, and a screen that got the raw string would be one refactor
+/// away from drawing it.
+///
+/// Returns the neutered text, how many characters were stood in for, and
+/// whether the diff hit pacrat's pipe ceiling — a reader has to be able to
+/// tell a short diff from a diff that was cut off.
+pub fn diff_lines(cand: &Candidate) -> Result<(Vec<String>, usize, bool), String> {
+    let diff = diff(&cand.scratch)?;
+    let (safe, hidden) = visible(&diff.text);
+    Ok((safe.lines().map(str::to_string).collect(), hidden, diff.cut))
 }
 
 /// Print the diff. Returns true when it was too long to print in full.

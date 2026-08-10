@@ -120,10 +120,17 @@ fn hosts(ledger: &Decisions) -> String {
 /// up as a merge conflict a human resolves — the same answer `sources.toml`
 /// relies on. If the TUI ever gains background overrides, this is the line
 /// to revisit.
+///
+/// `digest` is the candidate tree's content digest — what the human actually
+/// read. Both surfaces pass it, because both have it, and both go through
+/// *this* function: a commit id names a tree and can be made to name a
+/// different one, so an entry keyed on the name alone cannot be checked
+/// against bytes later. See [`Decision::digest`].
 pub fn record_override(
     ctx: &Ctx,
     package: &str,
     commit: &str,
+    digest: &str,
     grade: Option<u8>,
     reason: &str,
 ) -> Result<(), String> {
@@ -131,6 +138,7 @@ pub fn record_override(
         kind: Kind::OverrideBlock,
         package: package.to_string(),
         commit: commit.to_string(),
+        digest: Some(digest.to_string()),
         grade,
         // Stored verbatim: neutering is a rendering decision, and a record
         // that quietly rewrote what a human wrote would be a poor record.
@@ -182,6 +190,7 @@ mod tests {
     }
 
     const COMMIT: &str = "5a4705a4aaa2e7f10a7dd6c302256dd373516e56";
+    const DIGEST: &str = "be8938a589c9413c771a08b6886ef80cb4d0c8fe7acc376646ab310a5e6ea59a";
 
     #[test]
     fn a_recorded_override_reads_back_and_the_next_one_joins_it() {
@@ -190,6 +199,7 @@ mod tests {
             &ctx,
             "mdcat",
             COMMIT,
+            DIGEST,
             Some(4),
             "the maintainer explained it",
         )
@@ -204,11 +214,54 @@ mod tests {
         assert!(pacrat_core::decisions::valid_timestamp(&d.at), "{}", d.at);
 
         // Append, not replace: the second decision does not evict the first.
-        record_override(&ctx, "yay", COMMIT, None, "second").unwrap();
+        record_override(&ctx, "yay", COMMIT, DIGEST, None, "second").unwrap();
         let ledger = ctx.load_decisions().unwrap();
         assert_eq!(ledger.decisions.len(), 2);
         assert_eq!(ledger.decisions[0].package, "mdcat");
         assert_eq!(ledger.decisions[1].grade, None);
+    }
+
+    /// One writer, so one shape. The TUI and the CLI both reach the ledger
+    /// through `record_override` and nothing else — the value of that is
+    /// that an entry cannot say which surface made it, and this is the test
+    /// that keeps it true if somebody adds a second path.
+    ///
+    /// It compares the *keys*, not the values: host and timestamp differ by
+    /// construction, and it is the schema the fleet parses.
+    #[test]
+    fn both_surfaces_write_the_same_entry_shape() {
+        let (_s, ctx) = store("one-shape");
+        record_override(&ctx, "mdcat", COMMIT, DIGEST, Some(4), "from the CLI").unwrap();
+        record_override(&ctx, "widget", COMMIT, DIGEST, Some(4), "from the TUI").unwrap();
+
+        let ledger = ctx.load_decisions().unwrap();
+        let keys = |d: &Decision| {
+            let mut k = vec!["kind", "package", "commit", "reason", "host", "at"];
+            if d.digest.is_some() {
+                k.push("digest");
+            }
+            if d.grade.is_some() {
+                k.push("grade");
+            }
+            k.sort_unstable();
+            k
+        };
+        assert_eq!(keys(&ledger.decisions[0]), keys(&ledger.decisions[1]));
+        // And the digest really is in the file rather than only in the type.
+        let raw = fs::read_to_string(ctx.decisions_path()).unwrap();
+        assert_eq!(raw.matches("digest = ").count(), 2, "{raw}");
+        assert!(raw.contains(DIGEST), "{raw}");
+    }
+
+    /// The writer refuses a digest the ledger would refuse, at the door
+    /// rather than at the next parse — the rule every other field here
+    /// already follows.
+    #[test]
+    fn a_digest_the_ledger_would_reject_is_never_written() {
+        let (_s, ctx) = store("bad-digest");
+        assert!(record_override(&ctx, "mdcat", COMMIT, "../../PWNED", Some(4), "x").is_err());
+        assert!(record_override(&ctx, "mdcat", COMMIT, "", Some(4), "x").is_err());
+        assert!(!ctx.decisions_path().exists(), "a refusal wrote a file");
     }
 
     /// A reason is stored as written and *rendered* safely. Storing a
@@ -218,7 +271,7 @@ mod tests {
     fn a_hostile_reason_is_stored_verbatim_and_cannot_forge_a_row() {
         let (_s, ctx) = store("hostile");
         let hostile = "looks fine\x1b[2K\noverride  none — adopted cleanly";
-        record_override(&ctx, "mdcat", COMMIT, Some(4), hostile).unwrap();
+        record_override(&ctx, "mdcat", COMMIT, DIGEST, Some(4), hostile).unwrap();
 
         let raw = fs::read_to_string(ctx.decisions_path()).unwrap();
         assert!(raw.contains("looks fine"), "{raw}");
@@ -252,7 +305,7 @@ mod tests {
         )
         .unwrap();
 
-        record_override(&ctx, "yay", COMMIT, Some(4), "mine").unwrap();
+        record_override(&ctx, "yay", COMMIT, DIGEST, Some(4), "mine").unwrap();
 
         let raw = fs::read_to_string(ctx.decisions_path()).unwrap();
         assert!(raw.contains("phase-2-adds-this"), "field dropped:\n{raw}");
@@ -274,7 +327,7 @@ mod tests {
         assert!(err.contains("decisions.toml"), "{err}");
         // And a write on top of a file we cannot read is refused, because it
         // would replace records nobody has read with one we just made.
-        assert!(record_override(&ctx, "mdcat", COMMIT, Some(4), "x").is_err());
+        assert!(record_override(&ctx, "mdcat", COMMIT, DIGEST, Some(4), "x").is_err());
     }
 
     /// The writer refuses what the ledger's own validator refuses — the
@@ -283,9 +336,9 @@ mod tests {
     #[test]
     fn a_decision_the_ledger_would_reject_is_never_written() {
         let (_s, ctx) = store("reject");
-        assert!(record_override(&ctx, "../escape", COMMIT, Some(4), "x").is_err());
-        assert!(record_override(&ctx, "mdcat", "HEAD~1", Some(4), "x").is_err());
-        assert!(record_override(&ctx, "mdcat", COMMIT, Some(4), "   ").is_err());
+        assert!(record_override(&ctx, "../escape", COMMIT, DIGEST, Some(4), "x").is_err());
+        assert!(record_override(&ctx, "mdcat", "HEAD~1", DIGEST, Some(4), "x").is_err());
+        assert!(record_override(&ctx, "mdcat", COMMIT, DIGEST, Some(4), "   ").is_err());
         assert!(!ctx.decisions_path().exists(), "a refusal wrote a file");
     }
 }
