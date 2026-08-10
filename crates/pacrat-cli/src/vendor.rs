@@ -265,7 +265,7 @@ fn render_review(clone: &Path, files: &[String]) -> Result<(), String> {
         say!("--- {rel} ---");
         let text = read_untrusted(&clone.join(rel))?;
         let (safe, hidden) = visible(&text);
-        print!("{safe}");
+        crate::out::say_raw(&safe);
         if !safe.ends_with('\n') {
             say!();
         }

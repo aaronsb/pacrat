@@ -20,7 +20,7 @@ use pacrat_core::Custody;
 use crate::aur::{self, AurPkg};
 use crate::ctx::Ctx;
 use crate::custody::Index;
-use crate::out::{epoch_date, list_preview};
+use crate::out::{epoch_date, list_preview, short_hash, truncate, visible_line};
 use crate::pacman::{self, field};
 
 /// Width of the label column, wide enough for every label plus a gap.
@@ -56,7 +56,38 @@ pub fn run(ctx: &Ctx, package: &str) -> Result<(), String> {
     identity(package, sync.as_ref(), local.as_ref(), remote.as_ref());
     origin(sync.as_ref(), remote.as_ref(), rpc_error.as_deref());
     custody(package, &index);
+    decisions(ctx, package)?;
     install(local.as_ref(), package, &index);
+    Ok(())
+}
+
+/// Risks a human accepted about this package, from the store's decision
+/// ledger.
+///
+/// "Everything pacrat knows about one package" has to include this, and this
+/// is the row where it belongs: `pacrat decisions` is the whole ledger, and
+/// nobody reads a fleet-wide list before installing one thing. A package
+/// whose last adoption went past a BLOCK should say so where a person is
+/// already looking at it.
+///
+/// Silent when there are none — the common case, and an em-dash row about
+/// overrides nobody made would put the idea in a reader's head every time.
+fn decisions(ctx: &Ctx, package: &str) -> Result<(), String> {
+    let ledger = ctx.load_decisions()?;
+    for d in ledger.about(package) {
+        row(
+            "decision",
+            &format!(
+                "{} · {} · {} on {} · {}",
+                d.kind,
+                short_hash(&d.commit),
+                truncate(&visible_line(&d.at).0, 20),
+                truncate(&visible_line(&d.host).0, 40),
+                // Someone else's sentence, from a synced file, on our report.
+                truncate(&visible_line(&d.reason).0, 60),
+            ),
+        );
+    }
     Ok(())
 }
 

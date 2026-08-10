@@ -303,15 +303,22 @@ fn execute_adopt(
             Some(reason)
         }
         (_, Some(_)) => {
-            // Not silently ignored: a human who typed a justification is
-            // owed the news that nothing was overridden and nothing filed.
-            say!(
-                "note      --override-block was given and this candidate is {verdict}, \
-                 not {} — nothing to override, and nothing recorded in the decision \
-                 ledger",
-                Verdict::Block
-            );
-            None
+            // Refused, not carried on with. Someone who reaches for the
+            // override believes they are looking at a BLOCK, and they are
+            // not: the verdict may be UNGRADED because a grader crashed, or
+            // WARN, or the gradings may be of some other bytes entirely.
+            // Adopting anyway would be acting on a model of the situation
+            // that has just been shown to be wrong — which is the failure
+            // this whole tool exists to prevent — and it would do it while
+            // the human believed a record was being written. The plain verb
+            // is right there.
+            return Err(format!(
+                "nothing to override — the verdict is {verdict}, not {}. Plain \
+                 `pacrat adopt-update {package} --commit {}` handles it, and \
+                 nothing was recorded in the decision ledger",
+                Verdict::Block,
+                short_hash(&cand.commit)
+            ));
         }
         _ => None,
     };
@@ -364,7 +371,20 @@ fn execute_adopt(
         );
     }
 
-    install(ctx, package, curated, cand)?;
+    // A failure from here on has to say what the ledger now claims. The
+    // record is permanent and the adoption did not happen, and a reader who
+    // is told only "install failed" will not think to go and look at a file
+    // that now says they accepted a risk they never took.
+    install(ctx, package, curated, cand).map_err(|e| match overriding {
+        None => e,
+        Some(_) => format!(
+            "{e}\n       the decision is on the record; the adoption is not — \
+             {} holds an override-block entry for {package} @ {}, and the store \
+             was not changed",
+            store_rel(ctx, &ctx.decisions_path()),
+            short_hash(&cand.commit)
+        ),
+    })?;
     if overriding.is_some() {
         // Last line but one, where the eye lands: an adoption that went past
         // a BLOCK must not read like an ordinary one.
@@ -461,7 +481,7 @@ pub fn reject(ctx: &Ctx, package: &str, note: Option<&str>) -> Result<(), String
     }
 
     preamble(package, &curated);
-    let candidate = updates::ls_remote(&curated.entry.upstream, |line| say!("{line}"))?;
+    let candidate = updates::ls_remote(&curated.entry.upstream)?;
     // An error (exit 1), where the same shape of nothing-to-do is exit 0 in
     // `adopt-update`. The asymmetry is real, not an oversight: adopt is
     // convergent — asked to make the store hold HEAD, and it already does,

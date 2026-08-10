@@ -86,7 +86,12 @@ impl std::fmt::Display for Kind {
 }
 
 /// One accepted risk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` but not `Eq`: `extra` holds arbitrary TOML, and a TOML float
+/// is an `f64`. Nothing here compares decisions for identity — the tests
+/// compare round trips — so the weaker bound costs nothing and keeping the
+/// unknown fields is worth a great deal more.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     pub kind: Kind,
     pub package: String,
@@ -106,6 +111,21 @@ pub struct Decision {
     pub host: String,
     /// When, as `YYYY-MM-DDTHH:MM:SSZ`.
     pub at: String,
+    /// Fields this pacrat has never heard of, kept verbatim.
+    ///
+    /// The ledger is append-only, synced, and rewritten in full by whichever
+    /// host records the next decision — so without this, one machine running
+    /// last month's pacrat quietly deletes a field this month's added, for
+    /// every entry in the file, as a side effect of an unrelated override.
+    /// That is the worst failure mode a *record* can have: silent, total, and
+    /// caused by the routine use of the thing.
+    ///
+    /// The grade cache makes the same move for the same reason — it keeps a
+    /// grader's JSON as a raw `Value` so an unknown key survives a version
+    /// that does not know it. Forward compatibility the contract promises to
+    /// graders, promised here to future pacrats.
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl Decision {
@@ -197,7 +217,7 @@ pub fn valid_timestamp(s: &str) -> bool {
 }
 
 /// The ledger: every decision, oldest first.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Decisions {
     /// `[[decision]]` in the file; a list rather than a map because two
     /// decisions about one package at two commits are two facts, and neither
@@ -254,6 +274,7 @@ mod tests {
             reason: "upstream's new post_install is the packaging fix I asked for".into(),
             host: "north".into(),
             at: "2026-08-10T12:34:56Z".into(),
+            extra: toml::Table::new(),
         }
     }
 
@@ -351,6 +372,46 @@ mod tests {
             let err = Decisions::from_toml(&ledger.to_toml()).unwrap_err();
             assert!(err.contains("decision 1"), "{err}");
         }
+    }
+
+    /// A field a future pacrat adds must survive this one rewriting the
+    /// file. The ledger is rewritten whole by whoever records next, so a
+    /// dropped key is not one host's local loss — it is the fleet's record,
+    /// deleted by an older binary doing its job.
+    #[test]
+    fn a_field_this_version_has_never_heard_of_survives_a_rewrite() {
+        let newer = "[[decision]]\n\
+                     kind = \"override-block\"\n\
+                     package = \"mdcat\"\n\
+                     commit = \"5a4705a4\"\n\
+                     reason = \"read it\"\n\
+                     host = \"north\"\n\
+                     at = \"2026-08-10T12:34:56Z\"\n\
+                     signature = \"a-thing-phase-2-adds\"\n\
+                     expires_at = \"2027-01-01T00:00:00Z\"\n\
+                     [decision.reviewer]\n\
+                     name = \"someone\"\n";
+        let ledger = Decisions::from_toml(newer).unwrap();
+        assert_eq!(ledger.decisions[0].extra.len(), 3);
+
+        // Read, appended to, and written back by *this* version.
+        let mut ledger = ledger;
+        let mut mine = decision();
+        mine.package = "yay".into();
+        ledger.push(mine).unwrap();
+        let text = ledger.to_toml();
+        assert!(text.contains("a-thing-phase-2-adds"), "{text}");
+        assert!(text.contains("expires_at"), "{text}");
+        assert!(text.contains("[decision.reviewer]"), "{text}");
+        // And the round trip is stable, so the next host does not see churn.
+        assert_eq!(Decisions::from_toml(&text).unwrap(), ledger);
+
+        // An entry with nothing extra writes nothing extra.
+        assert!(!Decisions {
+            decisions: vec![decision()]
+        }
+        .to_toml()
+        .contains("extra"));
     }
 
     /// A timestamp is a sort key. Anything that does not sort like the ones

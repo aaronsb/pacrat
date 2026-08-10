@@ -78,6 +78,7 @@ use crate::custody;
 use crate::out::{list_preview, shell_quote, short_hash, truncate, visible, visible_line};
 use crate::pacman;
 use crate::proc;
+use crate::say;
 
 /// How many upstream rows the CLI prints before counting the rest. The
 /// pending list is the actionable one and is never capped; the upstream
@@ -108,21 +109,6 @@ pub enum Format {
     Text,
     /// One JSON object for a machine
     Json,
-}
-
-impl Format {
-    /// Say something that is not the answer: an argv, a warning, a count.
-    ///
-    /// In JSON mode stdout belongs to the object alone, so this goes to
-    /// stderr rather than being dropped. ADR-001's "external calls are always
-    /// visible" has no quiet mode — `--format json` changes where the trace
-    /// lands, never whether it exists.
-    fn trace(self, line: &str) {
-        match self {
-            Format::Text => println!("{line}"),
-            Format::Json => eprintln!("{line}"),
-        }
-    }
 }
 
 /// What `git ls-remote` had to say about one ledger entry.
@@ -192,12 +178,19 @@ struct UpstreamHalf {
 }
 
 pub fn run(ctx: &Ctx, fmt: Format) -> Result<(), String> {
+    // In JSON mode stdout belongs to the object alone, so every human line
+    // this run produces goes to stderr instead. One switch, set before
+    // anything prints, for the same reason `update` sets it: the modules
+    // underneath do not know a JSON caller exists, and should not have to.
+    // ADR-001's "external calls are always visible" has no quiet mode —
+    // `--format json` changes where a line lands, never whether it exists.
+    crate::out::chatter_to_stderr(fmt == Format::Json);
     let sources = ctx.load_sources()?;
 
     let mut rows: Vec<Row> = sources
         .packages
         .iter()
-        .map(|(package, entry)| probe(package, entry, fmt))
+        .map(|(package, entry)| probe(package, entry))
         .collect();
     // The ledger is a BTreeMap, so this is already the order — stated anyway,
     // because a stable table is a property of the output, not an accident of
@@ -208,19 +201,17 @@ pub fn run(ctx: &Ctx, fmt: Format) -> Result<(), String> {
     // so they ask together. Splitting it in two would double the round trips
     // and give one outage two different-sounding warnings.
     let candidates = upstream_candidates(&tracked_aur(ctx)?, &sources.packages);
-    let (versions, rpc_error) = fetch_versions(&rpc_names(&rows, &candidates), fmt);
+    let (versions, rpc_error) = fetch_versions(&rpc_names(&rows, &candidates));
     if let Some(e) = &rpc_error {
-        fmt.trace(&format!(
+        say!(
             "warning: the AUR RPC could not be asked ({e}) — pending rows show \
              commits without versions, and tracked-but-not-vendored packages \
              went unexamined"
-        ));
+        );
     }
-    let upstream = upstream_half(&candidates, &versions, rpc_error.as_deref(), fmt);
+    let upstream = upstream_half(&candidates, &versions, rpc_error.as_deref());
     if let Some(e) = &upstream.error {
-        fmt.trace(&format!(
-            "warning: tracked-but-not-vendored AUR packages went unexamined ({e})"
-        ));
+        say!("warning: tracked-but-not-vendored AUR packages went unexamined ({e})");
     }
 
     let of = |want: fn(&Probe) -> bool| -> Vec<&Row> {
@@ -308,8 +299,8 @@ fn verdict(o: Outcome) -> Verdict {
 }
 
 /// `git ls-remote -- <upstream> HEAD` for one ledger entry.
-fn probe(package: &str, entry: &SourceEntry, fmt: Format) -> Row {
-    let probe = match ls_remote(&entry.upstream, |line| fmt.trace(line)) {
+fn probe(package: &str, entry: &SourceEntry) -> Row {
+    let probe = match ls_remote(&entry.upstream) {
         Err(e) => Probe::Unreachable(e),
         Ok(candidate) if !drifted(&entry.reviewed, &candidate) => Probe::Current,
         Ok(candidate) if refused(entry, &candidate) => Probe::Rejected(candidate),
@@ -360,16 +351,16 @@ pub fn refused(entry: &SourceEntry, candidate: &str) -> bool {
 ///   a host that drops packets does not return on its own, and one such
 ///   upstream would otherwise hang the whole run.
 ///
-/// `trace` is where the argv line goes: stdout for a human, stderr when the
-/// answer is JSON. Shared with `review`, whose verbs ask the same question of
+/// The argv line goes wherever this run's chatter goes (`crate::out`).
+/// Shared with `review` and `update`, whose verbs ask the same question of
 /// the same remotes and must ask it the same guarded way.
-pub fn ls_remote(upstream: &str, trace: impl Fn(&str)) -> Result<String, String> {
+pub fn ls_remote(upstream: &str) -> Result<String, String> {
     // Quoted so the line can be pasted, and neutered so it cannot paint:
     // the URL comes out of a ledger every host in the fleet can write to.
-    trace(&format!(
+    say!(
         "run       git ls-remote -- {} HEAD",
         visible_line(&shell_quote(upstream)).0
-    ));
+    );
     let mut cmd = Command::new("git");
     cmd.args(["ls-remote", "--", upstream, "HEAD"])
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -519,12 +510,12 @@ fn aur_repo(upstream: &str) -> Option<&str> {
 
 /// Human-readable versions for the pending rows, by AUR repository name.
 /// Failure degrades the version column; it is never the run's failure.
-fn fetch_versions(wanted: &[String], fmt: Format) -> (BTreeMap<String, String>, Option<String>) {
+fn fetch_versions(wanted: &[String]) -> (BTreeMap<String, String>, Option<String>) {
     if wanted.is_empty() {
         return (BTreeMap::new(), None);
     }
     for url in aur::info_urls(wanted) {
-        fmt.trace(&format!("run       {}", aur::argv(&url)));
+        say!("run       {}", aur::argv(&url));
     }
     match aur::info_many(wanted) {
         Ok(hits) => (by_name(hits), None),
@@ -543,7 +534,6 @@ fn upstream_half(
     candidates: &[String],
     available: &BTreeMap<String, String>,
     rpc_error: Option<&str>,
-    fmt: Format,
 ) -> UpstreamHalf {
     let nothing = |answered, error: Option<&str>| UpstreamHalf {
         rows: Vec::new(),
@@ -564,7 +554,7 @@ fn upstream_half(
     // Traced here rather than beside the RPC: a call announced and then
     // skipped because the RPC died first would be a printed argv that never
     // ran, which is the opposite of what the visibility rule is for.
-    fmt.trace(&format!("run       {}", pacman::query_versions_argv()));
+    say!("run       {}", pacman::query_versions_argv());
     let installed = match pacman::installed_versions() {
         Ok(map) => map,
         Err(e) => return nothing(Some(false), Some(&e)),
@@ -639,9 +629,9 @@ fn report_text(
     upstream: &UpstreamHalf,
     complete: bool,
 ) {
-    println!();
+    say!();
     if ledger.quiet() && upstream.rows.is_empty() {
-        println!(
+        say!(
             "{} — {} curated {}",
             // The unqualified headline is a claim about everything. A run
             // that could not ask every question has not earned it, and the
@@ -667,7 +657,7 @@ fn report_text(
         }
     }
     if !upstream.unchecked.is_empty() {
-        println!("{}", unchecked_note(&upstream.unchecked));
+        say!("{}", unchecked_note(&upstream.unchecked));
     }
 }
 
@@ -686,9 +676,11 @@ fn render_ledger(ledger: &Ledger, versions: &BTreeMap<String, String>) {
     if drift_table {
         // gradings join here (task #13): a `grade` column goes between role
         // and version, and the header grows with it.
-        println!(
+        say!(
             "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  version",
-            "package", "reviewed → candidate", "role"
+            "package",
+            "reviewed → candidate",
+            "role"
         );
     }
     for row in ledger.pending {
@@ -700,7 +692,7 @@ fn render_ledger(ledger: &Ledger, versions: &BTreeMap<String, String>) {
             .as_ref()
             .and_then(|name| versions.get(name))
             .map_or("—", String::as_str);
-        println!(
+        say!(
             "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  {version}",
             truncate(&row.package, name_w),
             drift_cell(&row.reviewed, short_hash(candidate)),
@@ -711,33 +703,34 @@ fn render_ledger(ledger: &Ledger, versions: &BTreeMap<String, String>) {
         let Probe::Unreachable(why) = &row.probe else {
             continue;
         };
-        println!(
+        say!(
             "{:<name_w$}  {:<DRIFT_W$}  {:<ROLE_W$}  —",
             truncate(&row.package, name_w),
             drift_cell(&row.reviewed, "unreachable"),
             custody::label(Some(row.role.into())),
         );
-        println!("{:<name_w$}  {why}", "");
+        say!("{:<name_w$}  {why}", "");
     }
     if !ledger.rejected.is_empty() {
         if drift_table {
-            println!();
+            say!();
         }
         render_rejected(ledger.rejected);
     }
-    println!();
-    println!("{}", counts(ledger));
+    say!();
+    say!("{}", counts(ledger));
 }
 
 /// Drift a human has already answered. Its own region, below the pending
 /// table: these rows are information, not work, and mixing them into the
 /// list of things to do is how a decided question gets asked again.
 fn render_rejected(rows: &[&Row]) {
-    println!("rejected · a human refused this candidate");
+    say!("rejected · a human refused this candidate");
     let name_w = column(rows.iter().map(|r| r.package.as_str()), "package");
-    println!(
+    say!(
         "{:<name_w$}  {:<DRIFT_W$}  why",
-        "package", "reviewed → candidate"
+        "package",
+        "reviewed → candidate"
     );
     for row in rows {
         let Probe::Rejected(candidate) = &row.probe else {
@@ -749,7 +742,7 @@ fn render_rejected(rows: &[&Row]) {
             Some(note) => truncate(&visible_line(note).0, 60),
             None => "—".to_string(),
         };
-        println!(
+        say!(
             "{:<name_w$}  {:<DRIFT_W$}  {why}",
             truncate(&row.package, name_w),
             drift_cell(&row.reviewed, short_hash(candidate)),
@@ -779,8 +772,8 @@ fn counts(ledger: &Ledger) -> String {
 
 /// The upstream half: packages that would update outside curation.
 fn render_upstream(rows: &[Upstream]) {
-    println!();
-    println!("upstream · tracked, not yet vendored");
+    say!();
+    say!("upstream · tracked, not yet vendored");
     let name_w = column(rows.iter().map(|u| u.package.as_str()), "package");
     // "installed → aur" is a single cell, so its width is the widest pair
     // plus the arrow — the versions are unbounded in principle and clipped at
@@ -792,12 +785,13 @@ fn render_upstream(rows: &[Upstream]) {
         .max()
         .unwrap_or(16)
         .min(48);
-    println!(
+    say!(
         "{:<name_w$}  {:<ver_w$}  bring it through curation",
-        "package", "installed → aur"
+        "package",
+        "installed → aur"
     );
     for u in rows.iter().take(UPSTREAM_CAP) {
-        println!(
+        say!(
             "{:<name_w$}  {:<ver_w$}  pacrat vendor {}",
             truncate(&u.package, name_w),
             truncate(&format!("{} → {}", u.installed, u.available), ver_w),
@@ -808,7 +802,7 @@ fn render_upstream(rows: &[Upstream]) {
         );
     }
     if rows.len() > UPSTREAM_CAP {
-        println!("… and {} more", rows.len() - UPSTREAM_CAP);
+        say!("… and {} more", rows.len() - UPSTREAM_CAP);
     }
 }
 
@@ -970,6 +964,7 @@ fn report_json(
             .collect(),
     };
     let text = serde_json::to_string_pretty(&report).map_err(|e| format!("json: {e}"))?;
+    // The answer itself, on stdout, always: this is the object.
     println!("{text}");
     Ok(())
 }

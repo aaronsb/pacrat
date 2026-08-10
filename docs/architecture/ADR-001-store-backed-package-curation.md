@@ -174,12 +174,36 @@ otherwise have every grade quietly become four times less alarming.
 
 current → drifted (drift check on launch or timer) → graded (async dispatch
 against the candidate commit) → decide → build → served. The decide/grade/build
-transitions are **gates**, each auto | verbose | manual; presets bundle them:
-manual, semi-auto (grade auto, decide manual), auto. Two invariants no preset
-changes: BLOCK always holds, and external calls are always visible.
-`pacrat update --mode auto` is the whole loop headless (exit 0 clean, 10 holds
-present, 1 failure; `--format json` for machines) — the timer entry point that
-keeps gradings warm before a human ever looks.
+transitions are **gates**, and the preset is what a user actually sets. Two
+invariants no preset changes: BLOCK always holds, and external calls are
+always visible. `pacrat update --mode auto` is the whole loop headless (exit
+0 clean, 10 holds present, 1 failure; `--format json` for machines) — the
+timer entry point that keeps gradings warm before a human ever looks.
+
+**The presets, as implemented** (`config::Mode`, `update_mode`):
+
+|          | auto  | semi (default) | manual |
+|----------|-------|----------------|--------|
+| PROCEED  | adopt | adopt          | ask    |
+| WARN     | hold  | ask            | ask    |
+| BLOCK    | hold  | hold           | hold   |
+| UNGRADED | hold  | hold           | ask    |
+
+An earlier draft of this section described semi as "grade auto, decide
+manual", which read literally would ask about a clean PROCEED too. It does
+not, and the reason is the only currency a gate spends: **attention**. A
+prompt on every clean verdict is how a person learns to answer without
+reading, and the answer they stop reading is the WARN in the middle of the
+run. Semi therefore prompts exactly where a prompt carries information;
+`manual` remains for someone who wants to see each one, and adds a second
+question before the build.
+
+The three per-transition knobs collapse into this one word deliberately. In
+practice they are not independent — a host that wants to be asked about a
+decision wants to be asked before the build that follows it — and three
+orthogonal settings would let a user configure combinations that mean
+nothing (decide manual, build auto: approve a candidate and have it served
+before you finish reading). One word, three coherent postures.
 
 ### Surfaces
 
@@ -321,5 +345,26 @@ revocation and no inheritance** by a later commit: the gate re-asks its
 question every time, which is what keeps one accepted risk from becoming a
 standing exemption. And the list is **append-only with a re-read before every
 write**, so a second host's record cannot be erased by the first host's next
-override. `pacrat decisions` lists it; nothing removes an entry but a human
-editing the file.
+override. `pacrat decisions` lists it, `pacrat info <package>` shows the ones
+about that package, and nothing removes an entry but a human editing the file.
+
+**A record can outlive the act it was made for.** The entry is written after
+the human answers and before the store is touched, so an adoption that then
+fails — a full disk, a tree that will not install — leaves a decision on file
+for something that did not happen. That ordering is deliberate: of the two
+one-sided outcomes, "we recorded accepting a risk we did not end up taking"
+is a false positive a reader can dismiss, while "we took a risk and recorded
+nothing" is the audit trail failing at the one moment it exists for. The
+failure message says so in as many words, because a reader who is told only
+that the install failed will not think to go and look at the ledger.
+
+**Unknown fields are carried, unknown kinds are refused, and the asymmetry
+implies an upgrade order.** An entry's unrecognised *fields* survive a rewrite
+by an older pacrat (`extra`), so a machine a version behind cannot silently
+delete what a newer one recorded. An unrecognised *kind* fails the whole
+parse, because a decision this binary cannot interpret is not one it may act
+around. Together those mean: once one host records a kind that older hosts do
+not know, those hosts cannot record an override — or read the ledger at all —
+until they upgrade. That is the correct direction to fail, and it is a real
+operational consequence: **roll a new decision kind out to the fleet before
+the first host writes one.**

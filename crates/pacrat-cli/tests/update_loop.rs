@@ -188,6 +188,46 @@ impl Sandbox {
         );
     }
 
+    /// A grader that answers PROCEED *and edits the tree it was given*.
+    ///
+    /// Not a hypothetical: a grader is handed a path, runs as the user, and
+    /// nothing about being asked to read a file stops it writing one. The
+    /// line it appends is the payload — if pacrat decided on the strength of
+    /// the verdict alone, these bytes would be adopted, built and served.
+    fn configure_tampering_grader(&self) {
+        let script = self.write(
+            "grader.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> {}\n\
+                 echo '# appended by the grader after it read the file' >> \"$4/PKGBUILD\"\n\
+                 cat <<EOF\n\
+                 {{ \"contract\": \"pacrat-grade/v1\", \"grader\": \"stub\",\n\
+                 \"subject\": {{ \"package\": \"$2\", \"commit\": \"$6\" }},\n\
+                 \"grade\": 0, \"scale\": {{ \"min\": 0, \"max\": 4 }},\n\
+                 \"findings\": [], \"meta\": {{}} }}\n\
+                 EOF\n",
+                self.root.join("grader-invocations").display()
+            ),
+        );
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&script, perms).unwrap();
+        self.write(
+            "config/pacrat/config.toml",
+            &format!(
+                "{}\n\
+                 [[graders]]\n\
+                 name = \"stub\"\n\
+                 cmd = [\"{}\", \"--package\", \"{{package}}\", \"--tree\", \"{{tree}}\", \
+                 \"--commit\", \"{{commit}}\"]\n\
+                 timeout_s = 60\n",
+                self.repo_config(),
+                script.display()
+            ),
+        );
+    }
+
     fn repo_config(&self) -> String {
         format!(
             "[repo]\nname = \"pacrat-test\"\npath = \"{}\"\n",
@@ -240,6 +280,51 @@ impl Sandbox {
             code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    /// The same run, with stderr as an `AF_UNIX` socket instead of a pipe.
+    ///
+    /// This is what a systemd unit hands a process: the journal is a socket,
+    /// not a pipe or a file. It matters because a socket cannot be *reopened*
+    /// through `/proc/self/fd` — `open("/dev/stderr")` returns ENXIO — so an
+    /// implementation that reopens rather than duplicates the descriptor
+    /// fails here and nowhere else, on the timer, in production, silently.
+    /// A pipe cannot tell the two apart, which is the whole reason this
+    /// helper exists.
+    fn run_stderr_socket(&self, args: &[&str]) -> Out {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (theirs, mut ours) = UnixStream::pair().expect("socketpair");
+        let child = Command::new(env!("CARGO_BIN_EXE_pacrat"))
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &self.root)
+            .env("DOTFILES_DIR", self.root.join("store"))
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(OwnedFd::from(theirs)))
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("pacrat did not run");
+
+        // Drained on its own thread: a build transcript is larger than a
+        // reader that only starts after `wait` would be safe with.
+        let drain = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = ours.read_to_end(&mut text);
+            text
+        });
+        let out = child.wait_with_output().expect("pacrat did not finish");
+        let stderr = drain.join().expect("the stderr reader panicked");
+        Out {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
     }
 
@@ -423,6 +508,42 @@ fn ungraded_holds_however_it_came_about() {
     }
 }
 
+/// The bytes that were read must be the bytes that would be adopted.
+///
+/// A grader that edits the tree it was asked to judge gets a PROCEED about
+/// the file as it was, and the loop would otherwise adopt, build and serve
+/// the file as the grader left it. The verdict is real; it is simply not
+/// about the candidate any more, and nothing else in the pipeline would
+/// notice — the cache recorded the pre-edit digest, and the adoption copies
+/// whatever is on disk.
+#[test]
+fn a_grader_that_edits_the_tree_it_graded_gets_nothing_adopted() {
+    let sb = Sandbox::new("tamper");
+    sb.configure_tampering_grader();
+    sb.publish("2.0");
+    let before = sb.reviewed();
+
+    let out = sb.run(&["update", "--mode", "auto"]);
+    assert_eq!(
+        out.code,
+        HELD,
+        "a tampered candidate must hold:\n{}",
+        out.text()
+    );
+    assert!(
+        out.stdout.contains("changed while it was being graded"),
+        "the run did not say what it caught:\n{}",
+        out.stdout
+    );
+    // Not adopted, not served, and the store still holds the reviewed bytes.
+    assert_eq!(sb.reviewed(), before, "the tampered tree was adopted");
+    assert!(!sb.store_pkgbuild().contains("appended by the grader"));
+    assert!(sb.served().is_empty(), "a tampered build was served");
+    // And the PROCEED is not reported as this candidate's verdict, because
+    // it is not about these bytes.
+    assert!(!out.stdout.contains("adopted   "), "{}", out.stdout);
+}
+
 /// A candidate a human already refused is not work. It is reported, it does
 /// not hold the run, and it never reaches a grader.
 #[test]
@@ -588,10 +709,34 @@ fn an_override_needs_a_commit_and_a_reason_and_leaves_a_record() {
     assert_eq!(sb.reviewed(), before, "a refused invocation still adopted");
     assert!(sb.decisions().is_empty(), "a refusal wrote a decision");
 
+    // Nothing has graded this candidate yet, so the verdict is UNGRADED —
+    // and an override of a BLOCK that is not there is refused rather than
+    // quietly performed. Someone reaching for this flag believes they are
+    // looking at a BLOCK; they are not, and acting on a model that has just
+    // been shown to be wrong is the thing the tool exists to prevent.
+    let wrong_door = sb.run(&[
+        "adopt-update",
+        PKG,
+        "--commit",
+        &candidate,
+        "--override-block",
+        "--reason",
+        "I think this is blocked",
+        "--yes",
+    ]);
+    assert_eq!(wrong_door.code, 1, "{}", wrong_door.text());
+    assert!(
+        wrong_door.stderr.contains("nothing to override")
+            && wrong_door.stderr.contains("UNGRADED"),
+        "{}",
+        wrong_door.stderr
+    );
+    assert_eq!(sb.reviewed(), before, "the wrong door still adopted");
+    assert!(sb.decisions().is_empty(), "a refusal wrote a decision");
+
     // The loop is what grades a candidate, so this is the real sequence: the
     // timer holds at BLOCK, and the human comes along afterwards and decides
-    // to accept it. Without this run there is no grading of these bytes and
-    // the verdict would be UNGRADED — a different door entirely.
+    // to accept it.
     let held = sb.run(&["update", "--mode", "auto"]);
     assert_eq!(held.code, HELD, "{}", held.text());
 
@@ -691,7 +836,7 @@ fn the_json_report_is_the_whole_of_stdout_and_says_what_happened() {
     assert_eq!(report["mode"], "auto");
     assert_eq!(report["exit"], HELD);
     assert_eq!(report["holds"], 1);
-    assert_eq!(report["checked"], 1);
+    assert_eq!(report["reached"], 1);
     assert_eq!(report["served"].as_array().unwrap().len(), 0);
 
     let pkg = &report["packages"][0];
@@ -705,6 +850,29 @@ fn the_json_report_is_the_whole_of_stdout_and_says_what_happened() {
     // whether the calls are visible.
     assert!(out.stderr.contains("run       git"), "{}", out.stderr);
     assert!(out.stderr.contains("BLOCK"), "{}", out.stderr);
+}
+
+/// The same run under the descriptor a systemd unit actually provides: a
+/// socket. An implementation that reopens `/dev/stderr` instead of
+/// duplicating it gets ENXIO here, falls back to inheriting, and puts
+/// makepkg's whole transcript in front of the object — in production, on the
+/// timer, and nowhere a pipe-based test would ever see it.
+#[test]
+fn journald_style_socket_stderr_does_not_leak_the_build_into_the_json() {
+    let sb = Sandbox::new("json-socket");
+    sb.publish("2.0");
+
+    let out = sb.run_stderr_socket(&["update", "--mode", "auto", "--format", "json"]);
+    assert_eq!(out.code, 0, "{}", out.text());
+    let report: serde_json::Value = serde_json::from_str(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON object ({e}):\n{}", out.stdout));
+    assert_eq!(report["served"][0], PKG);
+    // The transcript went somewhere, and that somewhere is the socket.
+    assert!(
+        out.stderr.contains("makepkg") || out.stderr.contains("Finished making"),
+        "the build transcript did not reach the socket:\n{}",
+        out.stderr
+    );
 }
 
 /// A clean run in JSON, including the build stage: makepkg's own output is

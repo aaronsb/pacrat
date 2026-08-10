@@ -49,8 +49,11 @@
 //!
 //! An **unreachable** upstream is a hold, not a failure: the other rows were
 //! still checked, and the one that was not is exactly the kind of
-//! outstanding item 10 exists to name. It becomes a failure only when
-//! *nothing* was checkable, because then the run learned nothing at all.
+//! outstanding item 10 exists to name. It becomes a failure only when *every*
+//! upstream was unreachable, because then the run learned nothing at all. A
+//! package that was fetched and then failed a check — a tree with no
+//! PKGBUILD, a grader that edited what it was reading — is a hold rather than
+//! part of that count: the run reached it and learned something specific.
 //! (This is a considered difference from `pacrat updates`, which answers a
 //! narrower question — "is anything pending?" — and cannot answer it at all
 //! with rows unprobed, so it exits 1 there. This verb reports what it did,
@@ -65,6 +68,7 @@ use serde::Serialize;
 
 use crate::build;
 use crate::ctx::Ctx;
+use crate::fstree;
 use crate::grade;
 use crate::out::{self, list_preview, short_hash, truncate, visible_line};
 use crate::review;
@@ -263,7 +267,14 @@ impl Outcome {
     fn is_hold(&self) -> bool {
         matches!(
             self,
-            Outcome::HeldWarn
+            // `Pending` cannot survive a run today — every pending row is
+            // decided before the report. It is counted as a hold anyway, so
+            // that a future early return which forgets to set an outcome
+            // fails closed. In the one module whose thesis is that an absent
+            // answer is never permission, the placeholder for "no answer
+            // yet" must not exit 0.
+            Outcome::Pending
+                | Outcome::HeldWarn
                 | Outcome::HeldBlock
                 | Outcome::HeldUngraded
                 | Outcome::Declined
@@ -272,9 +283,15 @@ impl Outcome {
         )
     }
 
-    /// Did the run get an answer about this package at all?
-    fn checked(&self) -> bool {
-        !matches!(self, Outcome::Unreachable(_) | Outcome::Failed(_))
+    /// Could the run reach this package's upstream at all?
+    ///
+    /// Narrower than "did it end well", and the narrowness is the point: the
+    /// only rule that reads this is the one deciding whether a run learned
+    /// *nothing*, and a package that was fetched and then failed a check
+    /// taught its reader something rather specific. Only an upstream that
+    /// never answered is unlearned-from.
+    fn reached(&self) -> bool {
+        !matches!(self, Outcome::Unreachable(_))
     }
 }
 
@@ -292,7 +309,7 @@ fn detect(package: &str, entry: &SourceEntry) -> Row {
         grade: None,
         outcome,
     };
-    match updates::ls_remote(&entry.upstream, |line| say!("{line}")) {
+    match updates::ls_remote(&entry.upstream) {
         Err(e) => row(None, Outcome::Unreachable(e)),
         Ok(head) if !updates::drifted(&entry.reviewed, &head) => row(None, Outcome::Current),
         Ok(head) if updates::refused(entry, &head) => row(Some(head), Outcome::RejectedSkip),
@@ -367,6 +384,36 @@ fn decide_and_act(
         Ok(g) => g,
         Err(e) => return Outcome::Failed(e),
     };
+
+    // The bytes that were read must be the bytes that would be adopted.
+    //
+    // A grader is handed a path, not a copy, and nothing about running a
+    // program stops it writing through the path it was given. A grader that
+    // appends to the PKGBUILD it was asked to judge would otherwise have its
+    // own line adopted, built and served on the strength of a verdict about
+    // the file before it edited it — the digest that made the grading, the
+    // digest the cache recorded, and the digest of the tree about to be
+    // installed would all be *stated* to be the same one while the tree on
+    // disk had moved. Re-hashing is one walk of a handful of files, and it
+    // is the only thing standing between "graded" and "graded, then edited
+    // by the grader".
+    //
+    // Checked before the verdict is recorded: a verdict about bytes that are
+    // gone is not a verdict about this candidate, and reporting one would
+    // invite exactly the reading this refuses.
+    match fstree::digest(&cand.tree) {
+        Err(e) => return Outcome::Failed(format!("re-reading the graded tree: {e}")),
+        Ok(after) if after != cand.digest => {
+            say!("digest    {after}");
+            return Outcome::Failed(
+                "the candidate tree changed while it was being graded — the bytes that \
+                 were read are not the bytes that would be adopted"
+                    .into(),
+            );
+        }
+        Ok(_) => {}
+    }
+
     row.verdict = Some(graded.verdict);
     row.grade = graded.grade;
     if graded.no_graders {
@@ -567,8 +614,8 @@ impl Summary<'_> {
     fn holds(&self) -> usize {
         self.rows.iter().filter(|r| r.outcome.is_hold()).count()
     }
-    fn checked(&self) -> usize {
-        self.rows.iter().filter(|r| r.outcome.checked()).count()
+    fn reached(&self) -> usize {
+        self.rows.iter().filter(|r| r.outcome.reached()).count()
     }
     /// Rows worth a line in the table: everything that is not a package
     /// sitting quietly at its reviewed commit.
@@ -600,9 +647,9 @@ fn exit_of(s: &Summary) -> Exit {
     }
     // A run that could not ask a single question learned nothing, and
     // "nothing pending" is not something it may imply by exiting 10 either.
-    if !s.rows.is_empty() && s.checked() == 0 {
+    if !s.rows.is_empty() && s.reached() == 0 {
         return Exit::Broken(format!(
-            "none of the {} ledger upstream{} could be checked — this run learned \
+            "none of the {} ledger upstream{} could be reached — this run learned \
              nothing about any of them",
             s.rows.len(),
             if s.rows.len() == 1 { "" } else { "s" }
@@ -647,8 +694,8 @@ fn report_text(s: &Summary, exit: &Exit) {
 
     say!();
     say!(
-        "checked   {} of {} · {} adopted · {} held{}",
-        s.checked(),
+        "reached   {} of {} · {} adopted · {} held{}",
+        s.reached(),
         s.rows.len(),
         s.adopted.len(),
         s.holds(),
@@ -702,7 +749,9 @@ struct Report<'a> {
     /// not finish — pacrat does not claim a package is served on the
     /// strength of having tried.
     served: Vec<&'a str>,
-    checked: usize,
+    /// Upstreams this run got an answer from. `reached < total` with an
+    /// empty `packages[].candidate` is the shape of a partial run.
+    reached: usize,
     total: usize,
     holds: usize,
     /// `nothing` · `declined` · `ok` · `failed`. Distinct from `served`
@@ -765,7 +814,7 @@ fn report_json(ctx: &Ctx, mode: Mode, s: &Summary, exit: &Exit) -> Result<(), St
             Build::Ran(Ok(())) => "ok",
             Build::Ran(Err(_)) => "failed",
         },
-        checked: s.checked(),
+        reached: s.reached(),
         total: s.rows.len(),
         holds: s.holds(),
         build_error: match s.build {
@@ -909,13 +958,13 @@ mod tests {
     /// An unreachable upstream costs its own row and no other — until it is
     /// every row, at which point the run has learned nothing and says so.
     #[test]
-    fn a_run_that_could_check_nothing_is_a_failure_not_a_hold() {
+    fn a_run_that_could_reach_nothing_is_a_failure_not_a_hold() {
         let rows = [
             row("a", Outcome::Unreachable("no route".into())),
-            row("b", Outcome::Failed("clone failed".into())),
+            row("b", Outcome::Unreachable("timed out".into())),
         ];
         let Exit::Broken(why) = exit_of(&summary(&rows, &[], &NOTHING)) else {
-            panic!("a run with nothing checkable must fail");
+            panic!("a run that reached nothing must fail");
         };
         assert!(why.contains("learned nothing"), "{why}");
 
@@ -924,6 +973,19 @@ mod tests {
             row("a", Outcome::Unreachable("no route".into())),
             row("b", Outcome::Current),
         ];
+        assert_eq!(exit_of(&summary(&rows, &[], &NOTHING)), Exit::Held);
+    }
+
+    /// A package that was fetched and then failed a check is a hold, even
+    /// alone. The run learned something quite specific about it — a tampering
+    /// grader, a tree with no PKGBUILD — and "none of the upstreams could be
+    /// checked" would be a false account of a run that reached every one.
+    #[test]
+    fn a_failure_after_a_successful_fetch_is_a_hold_not_a_blind_run() {
+        let rows = [row(
+            "a",
+            Outcome::Failed("the candidate tree changed".into()),
+        )];
         assert_eq!(exit_of(&summary(&rows, &[], &NOTHING)), Exit::Held);
     }
 
@@ -967,7 +1029,7 @@ mod tests {
             row("d", Outcome::Unreachable("x".into())),
         ];
         let s = summary(&rows, &[], &NOTHING);
-        assert_eq!(s.checked(), 3);
+        assert_eq!(s.reached(), 3);
         assert_eq!(s.holds(), 2);
         // Everything but a quiet current row earns a line in the table.
         assert_eq!(s.interesting().len(), 3);

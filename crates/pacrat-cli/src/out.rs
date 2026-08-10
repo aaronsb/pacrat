@@ -1,5 +1,6 @@
 //! Tiny output helpers shared by the CLI verbs.
 
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Is this run's human-readable chatter going to stderr?
@@ -37,6 +38,25 @@ macro_rules! say {
     ($($arg:tt)*) => { $crate::out::say_line(&format!($($arg)*)) };
 }
 
+/// `print!`, to wherever this run's chatter goes — no newline added.
+///
+/// One caller: `vendor` dumping a PKGBUILD body verbatim, where the file's
+/// own trailing newline (or lack of one) is part of what the reviewer is
+/// being shown. Flushed, because a partial line left in the buffer while a
+/// subprocess writes to the same descriptor interleaves.
+pub fn say_raw(text: &str) {
+    use std::io::Write;
+    if chatter_is_stderr() {
+        let mut err = std::io::stderr();
+        let _ = write!(err, "{text}");
+        let _ = err.flush();
+    } else {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "{text}");
+        let _ = out.flush();
+    }
+}
+
 pub fn say_line(line: &str) {
     if chatter_is_stderr() {
         eprintln!("{line}");
@@ -49,19 +69,27 @@ pub fn say_line(line: &str) {
 ///
 /// makepkg writes to the descriptor it inherits, so routing pacrat's own
 /// lines is only half the job — a build transcript on stdout would sit in
-/// front of the JSON object just as surely. Opened in **append** mode: `Z`
-/// creating `/dev/stderr` with `O_TRUNC` would empty the file when stderr is
-/// a redirect rather than a terminal.
+/// front of the JSON object just as surely.
 ///
-/// A failure to open it falls back to inheriting, which is the honest
-/// degradation — losing a build's output would be worse than a caller
-/// having to cope with a stray line.
+/// **The descriptor is duplicated, never reopened.** An earlier version
+/// opened `/dev/stderr`, which works at a terminal and fails in the one
+/// deployment this verb was written for: under a systemd unit, stderr is an
+/// `AF_UNIX` socket to the journal, and a socket cannot be reopened through
+/// its `/proc/self/fd` entry — `open` returns ENXIO. The fallback then
+/// inherited the real stdout and put makepkg's whole transcript in front of
+/// the JSON object, which is precisely the corruption this function exists
+/// to prevent, occurring only on the timer. `dup` has no such failure: it
+/// copies whatever stderr already is — terminal, pipe, file, socket — and
+/// asks the filesystem nothing.
+///
+/// A `dup` that somehow fails still falls back to inheriting: losing a
+/// build's output would be worse than a caller coping with a stray line.
 pub fn child_stdout() -> std::process::Stdio {
     if !chatter_is_stderr() {
         return std::process::Stdio::inherit();
     }
-    match std::fs::OpenOptions::new().append(true).open("/dev/stderr") {
-        Ok(f) => std::process::Stdio::from(f),
+    match std::io::stderr().as_fd().try_clone_to_owned() {
+        Ok(fd) => std::process::Stdio::from(fd),
         Err(_) => std::process::Stdio::inherit(),
     }
 }

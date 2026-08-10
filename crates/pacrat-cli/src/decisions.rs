@@ -109,6 +109,17 @@ fn hosts(ledger: &Decisions) -> String {
 /// and a stale copy would silently delete whatever another process recorded
 /// meanwhile. Append-only means the *file* only grows; it does not mean a
 /// careless writer cannot shrink it.
+///
+/// **Read-modify-write, and not locked.** Two pacrats overriding on the same
+/// host in the same handful of microseconds — between this re-read and the
+/// rename below — would leave only the second entry. That window is not
+/// worth a lock file here: it opens *after* a human answered a prompt, which
+/// is to say after the slowest step in the flow, and the sequence that would
+/// hit it is one person running two overrides at once. The fleet-wide claim
+/// is carried by git, which is where a real concurrent-write conflict shows
+/// up as a merge conflict a human resolves — the same answer `sources.toml`
+/// relies on. If the TUI ever gains background overrides, this is the line
+/// to revisit.
 pub fn record_override(
     ctx: &Ctx,
     package: &str,
@@ -127,6 +138,10 @@ pub fn record_override(
         reason: reason.trim().to_string(),
         host: ctx.host.clone(),
         at: now_rfc3339(),
+        // A decision this version writes has nothing this version does not
+        // know about. `extra` carries a *newer* pacrat's fields through this
+        // one's rewrites; it is never something to invent on the way in.
+        extra: Default::default(),
     };
     let mut ledger = ctx.load_decisions()?;
     ledger.push(decision)?;
@@ -212,6 +227,39 @@ mod tests {
         let shown = truncate(&visible_line(&d.reason).0, WHY_CAP);
         assert!(!shown.contains('\x1b'), "{shown:?}");
         assert_eq!(shown.lines().count(), 1, "{shown:?}");
+    }
+
+    /// The writer is where forward compatibility is actually tested: this
+    /// host reads a file a newer pacrat wrote, appends its own decision, and
+    /// writes the whole thing back. A field it does not understand has to
+    /// come out the other side, because the alternative is one stale machine
+    /// deleting the fleet's record as a side effect of an unrelated override.
+    #[test]
+    fn appending_a_decision_does_not_strip_a_newer_pacrats_fields() {
+        let (_s, ctx) = store("forward-compat");
+        fs::write(
+            ctx.decisions_path(),
+            format!(
+                "[[decision]]\n\
+                 kind = \"override-block\"\n\
+                 package = \"mdcat\"\n\
+                 commit = \"{COMMIT}\"\n\
+                 reason = \"read it\"\n\
+                 host = \"slab\"\n\
+                 at = \"2026-08-09T00:00:00Z\"\n\
+                 signature = \"phase-2-adds-this\"\n"
+            ),
+        )
+        .unwrap();
+
+        record_override(&ctx, "yay", COMMIT, Some(4), "mine").unwrap();
+
+        let raw = fs::read_to_string(ctx.decisions_path()).unwrap();
+        assert!(raw.contains("phase-2-adds-this"), "field dropped:\n{raw}");
+        let ledger = ctx.load_decisions().unwrap();
+        assert_eq!(ledger.decisions.len(), 2);
+        assert_eq!(ledger.decisions[0].extra.len(), 1);
+        assert!(ledger.decisions[1].extra.is_empty());
     }
 
     /// An empty file is an empty ledger, and a broken one is an error rather
