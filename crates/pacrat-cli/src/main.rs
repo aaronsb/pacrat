@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod add;
 mod aur;
+mod build;
 mod ctx;
 mod custody;
 mod fstree;
@@ -67,7 +68,8 @@ enum Command {
     Review { package: String },
     /// Record a grading (runs configured graders; --grade N for manual)
     Grade { package: String },
-    /// Build vendored packages into the local repo
+    /// Build vendored packages into the local repo (no args: all of them).
+    /// Builds and serves only — installing is `sudo pacman -Sy <package>`.
     Build { packages: Vec<String> },
     /// Host-vs-manifest matrix
     Hosts,
@@ -106,6 +108,7 @@ fn main() {
             yes,
             force,
         }) => vendor::run(&ctx, package, upstream.as_deref(), role, yes, force),
+        Some(Command::Build { ref packages }) => build::run(&ctx, packages),
         Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
     });
     if let Err(e) = result {

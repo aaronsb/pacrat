@@ -126,8 +126,9 @@ impl Held {
 
 /// Package names: pacman's alphabet, as an allowlist. The name becomes a
 /// path component in the store and an argument to git, so anything outside
-/// this set is refused rather than escaped.
-fn valid_name(name: &str) -> bool {
+/// this set is refused rather than escaped. Shared with `build`, which
+/// re-checks the names it reads back out of the ledger.
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
         && !name.starts_with('.')
