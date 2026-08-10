@@ -310,6 +310,11 @@ impl Region {
         self.title = title.into();
     }
 
+    #[cfg(test)]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     /// Re-declare how much vertical space to ask for. A screen whose content
     /// size is only known after a load (the overview's attention list) sizes
     /// itself here rather than guessing at construction.

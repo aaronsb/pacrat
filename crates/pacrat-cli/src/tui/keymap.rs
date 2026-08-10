@@ -62,8 +62,16 @@ pub enum Local {
     Reject,
     /// updates `o` — reveal the override childlock for a held candidate.
     Override,
-    /// hosts `space` — add or remove the row from the selection.
+    /// hosts `space` — mark the cursor row, or unmark it.
     Select,
+    /// hosts `*` · `-` · `!` — the whole-screen selection ops: mark all,
+    /// mark none, invert the marks. ADR-002's candidate keys, adopted as-is:
+    /// nothing global answers any of the three, and the decision there is
+    /// that a future selecting screen claims the same trio — one selection
+    /// language, spoken per screen.
+    SelectAll,
+    SelectNone,
+    SelectInvert,
     /// hosts `A` · `s` — adopt the selection · plan this host.
     AdoptSelection,
     Sync,
@@ -173,9 +181,20 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "space",
-        what: "select a row",
+        what: "mark a row",
         scope: Scope::On(Tab::Hosts),
         of: |key| bare(key, ' ').then_some(Action::Local(Local::Select)),
+    },
+    Binding {
+        keys: "* / - / !",
+        what: "mark all · none · invert the marks",
+        scope: Scope::On(Tab::Hosts),
+        of: |key| match key.code {
+            _ if bare(key, '*') => Some(Action::Local(Local::SelectAll)),
+            _ if bare(key, '-') => Some(Action::Local(Local::SelectNone)),
+            _ if bare(key, '!') => Some(Action::Local(Local::SelectInvert)),
+            _ => None,
+        },
     },
     Binding {
         keys: "A / s",
@@ -565,6 +584,40 @@ mod tests {
             Some(Action::Local(Local::Select))
         );
         assert_eq!(on(Tab::Updates, KeyCode::Char(' ')), None);
+
+        // The selection trio belongs to the screen that selects, and to no
+        // other — ADR-002's rule is that the keys are the *same* wherever
+        // selection exists, so a second selecting screen extends this test
+        // rather than choosing new letters.
+        for (key, action) in [
+            ('*', Local::SelectAll),
+            ('-', Local::SelectNone),
+            ('!', Local::SelectInvert),
+        ] {
+            assert_eq!(
+                on(Tab::Hosts, KeyCode::Char(key)),
+                Some(Action::Local(action))
+            );
+            for tab in Tab::ALL {
+                if tab != Tab::Hosts {
+                    assert_eq!(
+                        on(tab, KeyCode::Char(key)),
+                        None,
+                        "{key} leaked onto {}",
+                        tab.title()
+                    );
+                }
+            }
+        }
+        // `*` and `!` arrive shifted on most keyboards, and shift is not a
+        // modifier here — it is how those characters are typed.
+        assert_eq!(
+            action_for(
+                KeyEvent::new(KeyCode::Char('*'), KeyModifiers::SHIFT),
+                Tab::Hosts
+            ),
+            Some(Action::Local(Local::SelectAll))
+        );
 
         // `enter` means two different things on two screens, which is the
         // case the scope exists for.

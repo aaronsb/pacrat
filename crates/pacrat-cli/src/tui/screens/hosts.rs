@@ -34,6 +34,7 @@ use crate::ctx::Ctx;
 use crate::custody::{self, Index};
 use crate::live;
 use crate::out::{list_preview, shell_quote, truncate, visible_line};
+use crate::tui::select::{self, Selection};
 use crate::tui::theme;
 use crate::tui::viewport::{Panes, Region};
 
@@ -67,11 +68,10 @@ pub struct Hosts {
     /// column allowed to make a claim about what is installed.
     this_host: String,
     rows: Vec<Row>,
-    /// Packages the reader has marked, by name — by name rather than index
-    /// because a reload can reorder the list, and a selection that silently
-    /// became a different set of packages is the one bug a bulk-adopt screen
-    /// must not have.
-    selected: BTreeSet<String>,
+    /// The marked rows. The model, the keys and the row dressing are
+    /// [`select`]'s — one selection language, spoken per screen (ADR-002) —
+    /// and what a mark *means* here is "this package, this host's manifest".
+    selected: Selection,
 }
 
 impl Hosts {
@@ -91,7 +91,7 @@ impl Hosts {
             hosts: Vec::new(),
             this_host: String::new(),
             rows: Vec::new(),
-            selected: BTreeSet::new(),
+            selected: Selection::new(),
         }
     }
 
@@ -183,26 +183,24 @@ impl Hosts {
             .collect();
         self.rows.sort_by(|a, b| a.package.cmp(&b.package));
 
+        // A mark whose row vanished between loads goes with it; reordering
+        // alone changes nothing, because the marks are names.
+        self.selected
+            .keep(self.rows.iter().map(|row| row.package.as_str()));
+
         let header = self.header();
-        let rows: Vec<Line<'static>> = self.rows.iter().map(|row| self.row_line(row)).collect();
         if let Some(region) = self.panes.region_mut(MATRIX) {
-            // Rows and header replaced in place, never the `Region` — the
+            // The header is replaced in place, never the `Region` — the
             // rule the shell's own reload path follows, and for the reason
             // it gives: assigning a fresh `Region` throws away the reader's
             // cursor and scroll position along with the stale lines, so `r`
             // would mean "ask again *and* start over" on the one screen
-            // where finding your row again costs the most. `set_rows` keeps
-            // the cursor and clamps it; the header is set separately because
-            // the host columns can change between loads.
+            // where finding your row again costs the most. It is set here
+            // rather than in `repaint` because only a load can change the
+            // host columns.
             region.set_header(vec![header]);
-            region.set_rows(rows);
-            region.set_title(format!(
-                "matrix — {} packages across {} host{}",
-                self.rows.len(),
-                self.hosts.len(),
-                if self.hosts.len() == 1 { "" } else { "s" }
-            ));
         }
+        self.repaint();
 
         let mut legend = vec![Line::from(vec![
             theme::plain("  "),
@@ -242,17 +240,11 @@ impl Hosts {
     }
 
     fn row_line(&self, row: &Row) -> Line<'static> {
-        let mut spans = vec![
-            theme::plain(match self.selected.contains(&row.package) {
-                true => "•".to_string(),
-                false => " ".to_string(),
-            }),
-            theme::plain(format!(
-                "{:<width$} ",
-                truncate(&visible_line(&row.package).0, NAME_W - 1),
-                width = NAME_W - 1
-            )),
-        ];
+        let mut spans = vec![theme::plain(format!(
+            "{:<width$} ",
+            truncate(&visible_line(&row.package).0, NAME_W - 1),
+            width = NAME_W - 1
+        ))];
         for (index, host) in self.hosts.iter().enumerate() {
             let (mark, colour) = cell(
                 host == &self.this_host,
@@ -272,7 +264,27 @@ impl Hosts {
                 None => "unmanaged".to_string(),
             },
         ));
-        Line::from(spans)
+        select::decorate(Line::from(spans), self.selected.contains(&row.package))
+    }
+
+    /// The matrix rows and title, redrawn — on load, and on every change to
+    /// the marks. Replaced in place, never the `Region`: `set_rows` keeps
+    /// the cursor and clamps it, so marking never costs the reader their
+    /// place. The title carries the selection count (ADR-002: a count in
+    /// the region title, never a list in the detail pane).
+    fn repaint(&mut self) {
+        let rows: Vec<Line<'static>> = self.rows.iter().map(|row| self.row_line(row)).collect();
+        let title = format!(
+            "matrix — {} packages across {} host{}{}",
+            self.rows.len(),
+            self.hosts.len(),
+            if self.hosts.len() == 1 { "" } else { "s" },
+            self.selected.title_suffix()
+        );
+        if let Some(region) = self.panes.region_mut(MATRIX) {
+            region.set_rows(rows);
+            region.set_title(title);
+        }
     }
 
     fn selected_row(&self) -> Option<&Row> {
@@ -284,13 +296,31 @@ impl Hosts {
         let Some(package) = self.selected_row().map(|row| row.package.clone()) else {
             return;
         };
-        if !self.selected.remove(&package) {
-            self.selected.insert(package);
-        }
-        let rows: Vec<Line<'static>> = self.rows.iter().map(|row| self.row_line(row)).collect();
-        if let Some(region) = self.panes.region_mut(MATRIX) {
-            region.set_rows(rows);
-        }
+        self.selected.toggle(&package);
+        self.repaint();
+        self.restate();
+    }
+
+    /// `*` — every row in the matrix.
+    pub fn select_all(&mut self) {
+        self.selected
+            .all(self.rows.iter().map(|row| row.package.as_str()));
+        self.repaint();
+        self.restate();
+    }
+
+    /// `-` — none of them.
+    pub fn select_none(&mut self) {
+        self.selected.none();
+        self.repaint();
+        self.restate();
+    }
+
+    /// `!` — the marked and the unmarked trade places.
+    pub fn select_invert(&mut self) {
+        self.selected
+            .invert(self.rows.iter().map(|row| row.package.as_str()));
+        self.repaint();
         self.restate();
     }
 
@@ -339,20 +369,12 @@ impl Hosts {
                 },
             ),
         ];
-        if !self.selected.is_empty() {
-            let names: Vec<String> = self.selected.iter().cloned().collect();
-            lines.push(Line::default());
-            lines.push(field(
-                "selected",
-                format!("{} · {}", names.len(), list_preview(&names, 10)),
-            ));
-            lines.push(note("A — the command that adopts them all at once"));
-        } else {
-            lines.push(Line::default());
-            lines.push(note(
-                "space marks a row · A adopts the marks · s plans this host",
-            ));
-        }
+        // Never the selection's ledger: the marks are a count in the matrix
+        // title, and the names are what the apply step shows (ADR-002).
+        lines.push(Line::default());
+        lines.push(note(
+            "space marks a row · A adopts the marks · s plans this host",
+        ));
         self.set(DETAIL, lines);
         if let Some(region) = self.panes.region_mut(DETAIL) {
             region.set_title(truncate(&package, 40));
@@ -362,7 +384,7 @@ impl Hosts {
     /// `A` — bulk adopt, as the one command that does it.
     pub fn suggest_adopt(&mut self) {
         let names: Vec<String> = match self.selected.is_empty() {
-            false => self.selected.iter().cloned().collect(),
+            false => self.selected.names(),
             true => self
                 .selected_row()
                 .map(|row| vec![row.package.clone()])
@@ -431,6 +453,40 @@ fn cell(mine: bool, tracked: bool, installed_here: bool) -> (&'static str, ratat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(package: &str) -> Row {
+        Row {
+            package: package.into(),
+            custody: None,
+            tracked: vec![true],
+            installed_here: false,
+        }
+    }
+
+    /// ADR-002's selection visuals, at the screen level: the count is a
+    /// suffix on the matrix title, the marked row carries the glyph, and
+    /// the unmarked title carries nothing at all.
+    #[test]
+    fn marks_are_a_title_count_and_a_dressed_row() {
+        let mut screen = Hosts::new();
+        screen.hosts = vec!["north".into()];
+        screen.this_host = "north".into();
+        screen.rows = vec![row("fd"), row("ripgrep")];
+
+        screen.repaint();
+        let title = screen.panes.region(MATRIX).unwrap().title().to_string();
+        assert!(!title.contains("marked"), "an empty selection was counted");
+
+        screen.select_all();
+        let title = screen.panes.region(MATRIX).unwrap().title().to_string();
+        assert!(title.ends_with("· 2 marked"), "no count in: {title}");
+        let first = &screen.row_line(&screen.rows[0]).spans[0];
+        assert_eq!(first.content.as_ref(), "•", "the marked row has no glyph");
+
+        screen.select_invert();
+        let title = screen.panes.region(MATRIX).unwrap().title().to_string();
+        assert!(!title.contains("marked"), "inverting all left a count");
+    }
 
     /// This host's column is the only one that says anything about reality,
     /// and it says all four things.

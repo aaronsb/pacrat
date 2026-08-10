@@ -70,6 +70,7 @@ mod joblog;
 mod keymap;
 mod prompt;
 mod screens;
+mod select;
 mod theme;
 mod viewport;
 
@@ -657,6 +658,9 @@ impl App {
             Local::Reject => self.updates.suggest_reject(),
             Local::Override => self.open_childlock(),
             Local::Select => self.hosts.toggle(),
+            Local::SelectAll => self.hosts.select_all(),
+            Local::SelectNone => self.hosts.select_none(),
+            Local::SelectInvert => self.hosts.select_invert(),
             Local::AdoptSelection => self.hosts.suggest_adopt(),
             Local::Sync => self.hosts.suggest_sync(),
             Local::Probe => self.jobs.suggest_probe(),
