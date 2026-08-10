@@ -216,12 +216,33 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Install the [dotfiles-aur] repo section and guard hooks
+    /// Put this host on the serving model: the first-run interview, then
+    /// the repo section, database and guard hooks
+    ///
+    /// At a terminal the interview asks the config questions first (each
+    /// one defaults to the current value), and `--apply` walks the
+    /// root-owned steps through a confirmed sudo run. Headless, the
+    /// interview is skipped unless the answer flags are given, and the
+    /// sudo commands are printed for you to run.
     Setup {
         /// Do the steps that need no root (repo dir, empty db, staging the
-        /// root-owned files); the sudo commands are still only printed.
+        /// root-owned files); at a terminal, also offer each sudo command,
+        /// one confirm at a time.
         #[arg(long)]
         apply: bool,
+        /// Answer the interview's UI question (skips asking it)
+        #[arg(long, value_enum)]
+        ui: Option<config::UiArg>,
+        /// Answer the interview's update-mode question (skips asking it)
+        #[arg(long, value_enum)]
+        mode: Option<update::ModeArg>,
+        /// Answer the interview's grader question: register the contrib
+        /// yay-friend adapter (absolute path, 0-4 scale, 600s timeout)
+        #[arg(long)]
+        register_yay_friend: bool,
+        /// Answer the interview's grader question: register nothing
+        #[arg(long, conflicts_with = "register_yay_friend")]
+        no_graders: bool,
     },
     /// Show or change this host's config (~/.config/pacrat/config.toml)
     ///
@@ -334,7 +355,22 @@ fn run(ctx: &ctx::Ctx, command: Option<Command>) -> Result<(), String> {
             ref host,
         }) => add::run(ctx, packages, host.as_deref()),
         Some(Command::Untrack { ref packages }) => untrack::run(ctx, packages),
-        Some(Command::Setup { apply }) => setup::run(ctx, apply),
+        Some(Command::Setup {
+            apply,
+            ui,
+            mode,
+            register_yay_friend,
+            no_graders,
+        }) => setup::run(
+            ctx,
+            apply,
+            &setup::Interview {
+                ui: ui.map(Into::into),
+                mode: mode.map(Into::into),
+                register_yay_friend,
+                no_graders,
+            },
+        ),
         Some(Command::Config { ref action }) => config::run(ctx, action),
         Some(Command::Updates { format }) => updates::run(ctx, format),
         Some(Command::Vendor {

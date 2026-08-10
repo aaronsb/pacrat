@@ -14,11 +14,12 @@
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pacrat_core::config::Repo;
+use pacrat_core::config::{Config, Grader, Mode, Repo, Ui};
+use pacrat_core::grading::Scale;
 
 use crate::ctx::Ctx;
 
@@ -43,7 +44,7 @@ const PACMAN_CONF: &str = "/etc/pacman.conf";
 const MARKER: &str = ".pacrat-transaction";
 const MARKER_MAX_AGE_S: u64 = 3600;
 
-pub fn run(ctx: &Ctx, apply: bool) -> Result<(), String> {
+pub fn run(ctx: &Ctx, apply: bool, answers: &Interview) -> Result<(), String> {
     let repo = &ctx.config.repo;
     let repo_path = PathBuf::from(&repo.path);
     let db = repo_path.join(format!("{}.db.tar.zst", repo.name));
@@ -61,6 +62,7 @@ pub fn run(ctx: &Ctx, apply: bool) -> Result<(), String> {
         }
     );
     println!();
+    interview(ctx, answers)?;
     println!("state   repo dir      {}", yn(st.repo_dir));
     println!("        repo db       {}", yn(st.repo_db));
     println!("        pacman.conf   {}", yn(st.conf_section));
@@ -85,6 +87,233 @@ pub fn run(ctx: &Ctx, apply: bool) -> Result<(), String> {
     step_guard(repo, &staged, &st, apply);
 
     Ok(())
+}
+
+// -------------------------------------------------------------- interview
+
+/// The interview's non-interactive answers, straight from the flags. A flag
+/// answers its question and skips it; at a terminal the rest are asked, each
+/// defaulting to the current effective value, so pressing Enter through the
+/// whole interview changes nothing.
+pub struct Interview {
+    pub ui: Option<Ui>,
+    pub mode: Option<Mode>,
+    pub register_yay_friend: bool,
+    pub no_graders: bool,
+}
+
+impl Interview {
+    fn any_flag(&self) -> bool {
+        self.ui.is_some() || self.mode.is_some() || self.register_yay_friend || self.no_graders
+    }
+}
+
+/// The first-run questions (ADR-003): UI, update mode, graders. Ends by
+/// writing `~/.config/pacrat/config.toml` through the one stamped writer
+/// (`config::save`), carrying every grader it did not touch. Headless with
+/// no flags, it says so and leaves the file alone — today's behavior.
+fn interview(ctx: &Ctx, answers: &Interview) -> Result<(), String> {
+    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if !tty && !answers.any_flag() {
+        println!("config  no terminal and no answer flags (--ui, --mode,");
+        println!("        --register-yay-friend, --no-graders) — leaving the config file");
+        println!("        alone. `pacrat config` changes it any time.");
+        println!();
+        return Ok(());
+    }
+
+    let mut config = ctx.config.clone();
+
+    config.default_ui = match answers.ui {
+        Some(ui) => ui,
+        None if tty => {
+            match ask_choice(
+                "ui      what should bare `pacrat` open?",
+                &["cli", "tui"],
+                config.default_ui.label(),
+            )?
+            .as_str()
+            {
+                "tui" => Ui::Tui,
+                _ => Ui::Cli,
+            }
+        }
+        None => config.default_ui,
+    };
+
+    config.update_mode = match answers.mode {
+        Some(mode) => mode,
+        None if tty => {
+            match ask_choice(
+                "update  how much of `pacrat update` runs without asking?",
+                &["auto", "semi", "manual"],
+                config.update_mode.label(),
+            )?
+            .as_str()
+            {
+                "auto" => Mode::Auto,
+                "manual" => Mode::Manual,
+                _ => Mode::Semi,
+            }
+        }
+        None => config.update_mode,
+    };
+
+    grader_question(&mut config, answers, tty)?;
+
+    let path = crate::config::save(&config)?;
+    println!(
+        "config  wrote {} (stamped as pacrat-written)",
+        path.display()
+    );
+    println!();
+    Ok(())
+}
+
+/// The one structured question. Existing graders are never rewritten or
+/// removed here — the interview only ever *adds* the contrib adapter, so a
+/// hand-tuned entry survives every re-run.
+fn grader_question(config: &mut Config, answers: &Interview, tty: bool) -> Result<(), String> {
+    if answers.no_graders {
+        println!("grader  --no-graders — registering none.");
+        return Ok(());
+    }
+    if config.graders.iter().any(|g| g.name == "yay-friend") {
+        println!("grader  yay-friend is already registered — leaving it as it is.");
+        return Ok(());
+    }
+    if answers.register_yay_friend {
+        let adapter = adapter_path().ok_or(
+            "--register-yay-friend: contrib/graders/yay-friend-grade was not found near \
+             this binary. Run `pacrat setup` at a terminal to type the path, or copy the \
+             [[graders]] entry from the adapter's own header into the config file.",
+        )?;
+        register(config, &adapter)?;
+        return Ok(());
+    }
+    if !tty {
+        // No flag and nobody to ask: the question simply does not come up.
+        return Ok(());
+    }
+
+    let absent: Vec<&str> = ["yay-friend", "jq"]
+        .into_iter()
+        .filter(|p| !on_path(p))
+        .collect();
+    if !absent.is_empty() {
+        println!(
+            "grader  {} not on PATH — skipping grader registration. The contrib",
+            absent.join(" and ")
+        );
+        println!("        adapter is in contrib/graders/ when you want it.");
+        return Ok(());
+    }
+
+    let adapter = match adapter_path() {
+        Some(path) => path,
+        None => {
+            println!("grader  yay-friend and jq are on PATH, but the contrib adapter was not");
+            println!("        found near this binary.");
+            let typed = ask_line("        path to yay-friend-grade (empty to skip): ")?;
+            if typed.is_empty() {
+                println!("grader  skipped.");
+                return Ok(());
+            }
+            let path = PathBuf::from(typed);
+            if !path.is_file() {
+                println!("grader  {} is not a file — skipping.", path.display());
+                return Ok(());
+            }
+            path
+        }
+    };
+
+    println!("grader  yay-friend and jq are on PATH, and the contrib adapter is at");
+    println!("        {}", adapter.display());
+    if ask_choice("        register it as a grader?", &["y", "n"], "n")? == "y" {
+        register(config, &adapter)?;
+    } else {
+        println!("grader  skipped — `pacrat setup` offers again any time.");
+    }
+    Ok(())
+}
+
+/// The `[[graders]]` entry the adapter's own header documents: absolute
+/// path, the three placeholders, a 600s timeout (the miss path calls an
+/// LLM), and the 0-4 scale pin.
+fn register(config: &mut Config, adapter: &Path) -> Result<(), String> {
+    let adapter = adapter
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", adapter.display()))?;
+    config.graders.push(Grader {
+        name: "yay-friend".into(),
+        cmd: vec![
+            adapter.to_string_lossy().into_owned(),
+            "--package".into(),
+            "{package}".into(),
+            "--tree".into(),
+            "{tree}".into(),
+            "--commit".into(),
+            "{commit}".into(),
+        ],
+        timeout_s: 600,
+        scale: Some(Scale { min: 0, max: 4 }),
+    });
+    println!("grader  registered yay-friend via {}", adapter.display());
+    Ok(())
+}
+
+/// Is `program` an executable-looking file on PATH? The same lookup exec
+/// will do; asked up front so the offer is only made when accepting it
+/// could work.
+fn on_path(program: &str) -> bool {
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+/// The contrib adapter, found from where this binary runs: a checkout has
+/// `target/{debug,release}/pacrat` with `contrib/` two levels up, so walking
+/// the ancestors finds it wherever the target directory landed. An installed
+/// binary has no checkout above it, which is the `None` — the interview then
+/// asks for the path instead of guessing one.
+fn adapter_path() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?.canonicalize().ok()?;
+    exe.ancestors().find_map(|dir| {
+        let candidate = dir.join("contrib").join("graders").join("yay-friend-grade");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+/// One question, a fixed set of answers, a default that pressing Enter (or
+/// EOF) keeps. Loops on anything else: a typo should re-ask, not silently
+/// become the default.
+fn ask_choice(prompt: &str, options: &[&str], default: &str) -> Result<String, String> {
+    loop {
+        let answer = ask_line(&format!("{prompt} [{}] ({default}): ", options.join("/")))?;
+        if answer.is_empty() {
+            return Ok(default.into());
+        }
+        if options.contains(&answer.as_str()) {
+            return Ok(answer);
+        }
+        println!("        the answer is one of: {}", options.join(", "));
+    }
+}
+
+/// Print a prompt, read one trimmed line. EOF reads as an empty answer.
+fn ask_line(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    io::stdout().flush().map_err(|e| format!("stdout: {e}"))?;
+    let mut answer = String::new();
+    let read = io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| format!("stdin: {e}"))?;
+    if read == 0 {
+        println!();
+        return Ok(String::new());
+    }
+    Ok(answer.trim().to_string())
 }
 
 // ------------------------------------------------------------------ state
