@@ -1,11 +1,23 @@
-//! `pacrat setup` — put this host on the serving model: the pacman.conf
-//! section for the local repo, the repo directory and its (empty) database,
-//! and the PreTransaction guard that aborts installs going around curation.
+//! `pacrat setup` — put this host on the serving model: the first-run
+//! interview that writes the config, then the pacman.conf section for the
+//! local repo, the repo directory and its (empty) database, and the
+//! PreTransaction guard that aborts installs going around curation. It is
+//! the only verb that can open the setup gate (`gate.rs`), which is why it
+//! and `about` are the two commands a fresh machine can run.
 //!
-//! pacrat never elevates. Everything root-owned is *printed* for the user to
-//! run; `--apply` performs only the steps this user can already do without
-//! sudo, and stages the root-owned files somewhere user-writable so the
-//! printed `sudo install` lines work verbatim.
+//! The interview comes first (ADR-003): UI preference, update mode, grader
+//! registration — asked at a terminal with the current values as defaults,
+//! answered by flags for scripts, skipped with a note when there is neither.
+//! It writes `~/.config/pacrat/config.toml` through `config::save`, so a
+//! full setup is one command on one terminal.
+//!
+//! pacrat never elevates *unasked* (ADR-003, amending ADR-001). Everything
+//! root-owned is printed; headless, `--apply` performs only the steps this
+//! user can already do without sudo, and stages the root-owned files
+//! somewhere user-writable so the printed `sudo install` lines work
+//! verbatim. At a terminal, `--apply` walks those same root-owned steps
+//! through `elevate::Session` — argv shown, y/n asked, sudo authenticating
+//! on the terminal itself — and reports anything declined at the end.
 //!
 //! Repo values are substituted into pacman.conf and into a script that runs
 //! as root out of a pacman hook. They are safe to substitute because
@@ -14,11 +26,12 @@
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pacrat_core::config::Repo;
+use pacrat_core::config::{Config, Grader, Mode, Repo, Ui};
+use pacrat_core::grading::Scale;
 
 use crate::ctx::Ctx;
 
@@ -43,7 +56,7 @@ const PACMAN_CONF: &str = "/etc/pacman.conf";
 const MARKER: &str = ".pacrat-transaction";
 const MARKER_MAX_AGE_S: u64 = 3600;
 
-pub fn run(ctx: &Ctx, apply: bool) -> Result<(), String> {
+pub fn run(ctx: &Ctx, apply: bool, answers: &Interview) -> Result<(), String> {
     let repo = &ctx.config.repo;
     let repo_path = PathBuf::from(&repo.path);
     let db = repo_path.join(format!("{}.db.tar.zst", repo.name));
@@ -55,12 +68,13 @@ pub fn run(ctx: &Ctx, apply: bool) -> Result<(), String> {
     println!(
         "mode    {}",
         if apply {
-            "--apply (user-writable steps run here; root steps still printed)"
+            "--apply (user-owned steps run now; each root-owned step asks before sudo runs it)"
         } else {
-            "print only (nothing is written; add --apply to do the user-owned steps)"
+            "print only (system steps are printed, not run; interview answers are still saved to config.toml)"
         }
     );
     println!();
+    interview(ctx, answers)?;
     println!("state   repo dir      {}", yn(st.repo_dir));
     println!("        repo db       {}", yn(st.repo_db));
     println!("        pacman.conf   {}", yn(st.conf_section));
@@ -80,11 +94,263 @@ pub fn run(ctx: &Ctx, apply: bool) -> Result<(), String> {
         println!();
     }
 
-    step_pacman_conf(repo, &staged, &st, apply);
-    step_repo(&repo_path, &db, &st, apply)?;
-    step_guard(repo, &staged, &st, apply);
+    // On a terminal, `--apply` walks the root-owned steps through the
+    // confirmed sudo flow (ADR-003) after the user-doable work; headless,
+    // `flow` is `None` and every step prints its sudo lines exactly as
+    // before, so a script sees what it always saw.
+    let mut flow = if apply {
+        crate::elevate::Session::open()
+    } else {
+        None
+    };
+
+    step_pacman_conf(repo, &staged, &st, apply, &mut flow);
+    step_repo(&repo_path, &db, &st, apply, &mut flow)?;
+    step_guard(repo, &staged, &st, apply, &mut flow);
+
+    if let Some(flow) = &flow {
+        flow.report();
+        if flow.any_failed() {
+            return Err(
+                "a confirmed command failed — see above; re-run `pacrat setup --apply` \
+                        once it is sorted"
+                    .into(),
+            );
+        }
+        if !st.complete() && state(repo).complete() {
+            println!();
+            println!("done      this host is on the serving model — the setup gate is open.");
+        }
+    }
 
     Ok(())
+}
+
+// -------------------------------------------------------------- interview
+
+/// The interview's non-interactive answers, straight from the flags. A flag
+/// answers its question and skips it; at a terminal the rest are asked, each
+/// defaulting to the current effective value, so pressing Enter through the
+/// whole interview changes nothing.
+pub struct Interview {
+    pub ui: Option<Ui>,
+    pub mode: Option<Mode>,
+    pub register_yay_friend: bool,
+    pub no_graders: bool,
+}
+
+impl Interview {
+    fn any_flag(&self) -> bool {
+        self.ui.is_some() || self.mode.is_some() || self.register_yay_friend || self.no_graders
+    }
+}
+
+/// The first-run questions (ADR-003): UI, update mode, graders. Ends by
+/// writing `~/.config/pacrat/config.toml` through the one stamped writer
+/// (`config::save`), carrying every grader it did not touch. Headless with
+/// no flags, it says so and leaves the file alone — today's behavior.
+fn interview(ctx: &Ctx, answers: &Interview) -> Result<(), String> {
+    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if !tty && !answers.any_flag() {
+        println!("config  no terminal and no answer flags (--ui, --mode,");
+        println!("        --register-yay-friend, --no-graders) — leaving the config file");
+        println!("        alone. `pacrat config` changes it any time.");
+        println!();
+        return Ok(());
+    }
+
+    let mut config = ctx.config.clone();
+
+    config.default_ui = match answers.ui {
+        Some(ui) => ui,
+        None if tty => {
+            match ask_choice(
+                "ui      what should bare `pacrat` open?",
+                &["cli", "tui"],
+                config.default_ui.label(),
+            )?
+            .as_str()
+            {
+                "tui" => Ui::Tui,
+                _ => Ui::Cli,
+            }
+        }
+        None => config.default_ui,
+    };
+
+    config.update_mode = match answers.mode {
+        Some(mode) => mode,
+        None if tty => {
+            match ask_choice(
+                "update  how much of `pacrat update` runs without asking?",
+                &["auto", "semi", "manual"],
+                config.update_mode.label(),
+            )?
+            .as_str()
+            {
+                "auto" => Mode::Auto,
+                "manual" => Mode::Manual,
+                _ => Mode::Semi,
+            }
+        }
+        None => config.update_mode,
+    };
+
+    grader_question(&mut config, answers, tty)?;
+
+    let path = crate::config::save(&config)?;
+    println!(
+        "config  wrote {} (stamped as pacrat-written)",
+        path.display()
+    );
+    println!();
+    Ok(())
+}
+
+/// The one structured question. Existing graders are never rewritten or
+/// removed here — the interview only ever *adds* the contrib adapter, so a
+/// hand-tuned entry survives every re-run.
+fn grader_question(config: &mut Config, answers: &Interview, tty: bool) -> Result<(), String> {
+    if answers.no_graders {
+        println!("grader  --no-graders — registering none.");
+        return Ok(());
+    }
+    if config.graders.iter().any(|g| g.name == "yay-friend") {
+        println!("grader  yay-friend is already registered — leaving it as it is.");
+        return Ok(());
+    }
+    if answers.register_yay_friend {
+        let adapter = adapter_path().ok_or(
+            "--register-yay-friend: contrib/graders/yay-friend-grade was not found near \
+             this binary. Run `pacrat setup` at a terminal to type the path, or copy the \
+             [[graders]] entry from the adapter's own header into the config file.",
+        )?;
+        register(config, &adapter)?;
+        return Ok(());
+    }
+    if !tty {
+        // No flag and nobody to ask: the question simply does not come up.
+        return Ok(());
+    }
+
+    let absent: Vec<&str> = ["yay-friend", "jq"]
+        .into_iter()
+        .filter(|p| !on_path(p))
+        .collect();
+    if !absent.is_empty() {
+        println!(
+            "grader  {} not on PATH — skipping grader registration. The contrib",
+            absent.join(" and ")
+        );
+        println!("        adapter is in contrib/graders/ when you want it.");
+        return Ok(());
+    }
+
+    let adapter = match adapter_path() {
+        Some(path) => path,
+        None => {
+            println!("grader  yay-friend and jq are on PATH, but the contrib adapter was not");
+            println!("        found near this binary.");
+            let typed = ask_line("        path to yay-friend-grade (empty to skip): ")?;
+            if typed.is_empty() {
+                println!("grader  skipped.");
+                return Ok(());
+            }
+            let path = PathBuf::from(typed);
+            if !path.is_file() {
+                println!("grader  {} is not a file — skipping.", path.display());
+                return Ok(());
+            }
+            path
+        }
+    };
+
+    println!("grader  yay-friend and jq are on PATH, and the contrib adapter is at");
+    println!("        {}", adapter.display());
+    if ask_choice("        register it as a grader?", &["y", "n"], "n")? == "y" {
+        register(config, &adapter)?;
+    } else {
+        println!("grader  skipped — `pacrat setup` offers again any time.");
+    }
+    Ok(())
+}
+
+/// The `[[graders]]` entry the adapter's own header documents: absolute
+/// path, the three placeholders, a 600s timeout (the miss path calls an
+/// LLM), and the 0-4 scale pin.
+fn register(config: &mut Config, adapter: &Path) -> Result<(), String> {
+    let adapter = adapter
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", adapter.display()))?;
+    config.graders.push(Grader {
+        name: "yay-friend".into(),
+        cmd: vec![
+            adapter.to_string_lossy().into_owned(),
+            "--package".into(),
+            "{package}".into(),
+            "--tree".into(),
+            "{tree}".into(),
+            "--commit".into(),
+            "{commit}".into(),
+        ],
+        timeout_s: 600,
+        scale: Some(Scale { min: 0, max: 4 }),
+    });
+    println!("grader  registered yay-friend via {}", adapter.display());
+    Ok(())
+}
+
+/// Is `program` an executable-looking file on PATH? The same lookup exec
+/// will do; asked up front so the offer is only made when accepting it
+/// could work.
+fn on_path(program: &str) -> bool {
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+/// The contrib adapter, found from where this binary runs: a checkout has
+/// `target/{debug,release}/pacrat` with `contrib/` two levels up, so walking
+/// the ancestors finds it wherever the target directory landed. An installed
+/// binary has no checkout above it, which is the `None` — the interview then
+/// asks for the path instead of guessing one.
+fn adapter_path() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?.canonicalize().ok()?;
+    exe.ancestors().find_map(|dir| {
+        let candidate = dir.join("contrib").join("graders").join("yay-friend-grade");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+/// One question, a fixed set of answers, a default that pressing Enter (or
+/// EOF) keeps. Loops on anything else: a typo should re-ask, not silently
+/// become the default.
+fn ask_choice(prompt: &str, options: &[&str], default: &str) -> Result<String, String> {
+    loop {
+        let answer = ask_line(&format!("{prompt} [{}] ({default}): ", options.join("/")))?;
+        if answer.is_empty() {
+            return Ok(default.into());
+        }
+        if options.contains(&answer.as_str()) {
+            return Ok(answer);
+        }
+        println!("        the answer is one of: {}", options.join(", "));
+    }
+}
+
+/// Print a prompt, read one trimmed line. EOF reads as an empty answer.
+fn ask_line(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    io::stdout().flush().map_err(|e| format!("stdout: {e}"))?;
+    let mut answer = String::new();
+    let read = io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| format!("stdin: {e}"))?;
+    if read == 0 {
+        println!();
+        return Ok(String::new());
+    }
+    Ok(answer.trim().to_string())
 }
 
 // ------------------------------------------------------------------ state
@@ -153,7 +419,13 @@ fn yn(present: bool) -> &'static str {
 
 // ---------------------------------------------------------------- step 1
 
-fn step_pacman_conf(repo: &Repo, staged: &Path, st: &State, apply: bool) {
+fn step_pacman_conf(
+    repo: &Repo,
+    staged: &Path,
+    st: &State,
+    apply: bool,
+    flow: &mut Option<crate::elevate::Session>,
+) {
     println!("1. pacman.conf section — teach pacman about the repo");
     println!();
     if st.conf_section {
@@ -166,13 +438,26 @@ fn step_pacman_conf(repo: &Repo, staged: &Path, st: &State, apply: bool) {
     }
     block(&pacman_conf_section(repo));
     println!();
-    println!("   append it to {PACMAN_CONF} (root):");
-    println!(
-        "     sudo tee -a {PACMAN_CONF} <{} >/dev/null",
-        sh(&staged.join("pacman.conf.section").to_string_lossy())
-    );
-    if !apply {
-        println!("     (`pacrat setup --apply` writes that staged file first)");
+    if let Some(flow) = flow {
+        // The confirmed flow (ADR-003): the staged section, appended by a
+        // sudo tee whose stdin is the file just shown. tee echoes what it
+        // appended — the receipt of exactly what landed in pacman.conf.
+        let ran = flow.run(
+            crate::elevate::Cmd::sudo(&["tee", "-a", PACMAN_CONF])
+                .reading(staged.join("pacman.conf.section")),
+        ) == crate::elevate::Verdict::Ran;
+        if !ran {
+            println!("   still to do: the command above appends the staged section.");
+        }
+    } else {
+        println!("   append it to {PACMAN_CONF} (root):");
+        println!(
+            "     sudo tee -a {PACMAN_CONF} <{} >/dev/null",
+            sh(&staged.join("pacman.conf.section").to_string_lossy())
+        );
+        if !apply {
+            println!("     (`pacrat setup --apply` writes that staged file first)");
+        }
     }
     println!("   appending puts the section last, so official repos win any name");
     println!("   collision — the safe default. Move it above [core] by hand if you");
@@ -218,7 +503,13 @@ fn pacman_conf_section(repo: &Repo) -> String {
 
 // ---------------------------------------------------------------- step 2
 
-fn step_repo(repo_path: &Path, db: &Path, st: &State, apply: bool) -> Result<(), String> {
+fn step_repo(
+    repo_path: &Path,
+    db: &Path,
+    st: &State,
+    apply: bool,
+    flow: &mut Option<crate::elevate::Session>,
+) -> Result<(), String> {
     let user = env::var("USER").unwrap_or_else(|_| "$USER".into());
     println!("2. repo directory and empty database");
     println!();
@@ -248,13 +539,31 @@ fn step_repo(repo_path: &Path, db: &Path, st: &State, apply: bool) -> Result<(),
     match ensure_dir(repo_path) {
         Ok(()) => {}
         Err(Denied) => {
-            println!(
-                "   {} needs root — run the two lines above, then",
-                repo_path.display()
-            );
-            println!("   re-run `pacrat setup --apply`.");
-            println!();
-            return Ok(());
+            // A root-owned location. On a terminal the confirmed flow makes
+            // the directory (owned by this user, so repo-add stays a plain
+            // unprivileged call below); otherwise the two printed lines are
+            // the answer, as they always were.
+            let recovered = match flow {
+                Some(flow) => {
+                    flow.run(crate::elevate::Cmd::sudo(&[
+                        "install",
+                        "-d",
+                        "-o",
+                        &user,
+                        &repo_path.to_string_lossy(),
+                    ])) == crate::elevate::Verdict::Ran
+                }
+                None => false,
+            };
+            if !recovered {
+                println!(
+                    "   {} needs root — run the two lines above, then",
+                    repo_path.display()
+                );
+                println!("   re-run `pacrat setup --apply`.");
+                println!();
+                return Ok(());
+            }
         }
         Err(Failed(e)) => return Err(e),
     }
@@ -318,7 +627,13 @@ fn ensure_dir(dir: &Path) -> Result<(), DirErr> {
 
 // ---------------------------------------------------------------- step 3
 
-fn step_guard(repo: &Repo, staged: &Path, st: &State, apply: bool) {
+fn step_guard(
+    repo: &Repo,
+    staged: &Path,
+    st: &State,
+    apply: bool,
+    flow: &mut Option<crate::elevate::Session>,
+) {
     println!("3. guard hook — abort installs that went around curation");
     println!();
     if st.hook && st.script {
@@ -335,17 +650,36 @@ fn step_guard(repo: &Repo, staged: &Path, st: &State, apply: bool) {
     println!("   {SCRIPT_DEST}");
     block(&guard_script(repo));
     println!();
-    println!("   install both (root):");
-    println!(
-        "     sudo install -Dm755 {} {SCRIPT_DEST}",
-        sh(&staged.join("pacrat-guard.sh").to_string_lossy())
-    );
-    println!(
-        "     sudo install -Dm644 {} {HOOK_DEST}",
-        sh(&staged.join("pacrat-guard.hook").to_string_lossy())
-    );
-    if !apply {
-        println!("     (`pacrat setup --apply` writes those staged files first)");
+    if let Some(flow) = flow {
+        // Script before hook, deliberately: a hook whose Exec target is not
+        // there yet would fail every transaction in the window between the
+        // two confirms.
+        println!("   install both (root, one confirm each):");
+        flow.run(crate::elevate::Cmd::sudo(&[
+            "install",
+            "-Dm755",
+            &staged.join("pacrat-guard.sh").to_string_lossy(),
+            SCRIPT_DEST,
+        ]));
+        flow.run(crate::elevate::Cmd::sudo(&[
+            "install",
+            "-Dm644",
+            &staged.join("pacrat-guard.hook").to_string_lossy(),
+            HOOK_DEST,
+        ]));
+    } else {
+        println!("   install both (root):");
+        println!(
+            "     sudo install -Dm755 {} {SCRIPT_DEST}",
+            sh(&staged.join("pacrat-guard.sh").to_string_lossy())
+        );
+        println!(
+            "     sudo install -Dm644 {} {HOOK_DEST}",
+            sh(&staged.join("pacrat-guard.hook").to_string_lossy())
+        );
+        if !apply {
+            println!("     (`pacrat setup --apply` writes those staged files first)");
+        }
     }
     println!();
     println!("   the guard stands aside for pacrat's own transactions via a marker");

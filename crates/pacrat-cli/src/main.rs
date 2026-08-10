@@ -5,10 +5,13 @@ mod add;
 mod art;
 mod aur;
 mod build;
+mod config;
 mod ctx;
 mod custody;
 mod decisions;
+mod elevate;
 mod fstree;
+mod gate;
 mod git;
 mod grade;
 mod hosts;
@@ -178,16 +181,17 @@ enum Command {
     Decisions,
     /// Host-vs-manifest matrix
     Hosts,
-    /// Plan this host toward the manifest (prints commands, runs none)
+    /// Plan this host toward the manifest (prints commands; --run walks
+    /// them, one confirm each)
     ///
     /// There is no <host> argument: sync transport — ssh to remote hosts, or
     /// each host syncing itself — is ADR-001's open question 4 and is not
     /// settled, so pacrat plans only for the machine it runs on. Close another
     /// host's drift by running `pacrat sync` there.
     ///
-    /// Exits 0 when this host matches the store, 10 when a plan was printed
-    /// (deliberately not acted on — the commands are yours to run), and 1 when
-    /// the check itself could not run.
+    /// Exits 0 when this host matches the store (or --run confirmed and ran
+    /// everything), 10 when a plan was printed or anything was declined, and
+    /// 1 when the check — or a confirmed command — failed.
     Sync {
         /// Also print the removals for installed-but-untracked packages
         #[arg(long)]
@@ -195,6 +199,11 @@ enum Command {
         /// One JSON object instead of the report
         #[arg(long)]
         json: bool,
+        /// Walk the plan at the terminal: each command is printed and asked
+        /// about, then run exactly as shown. There is no --yes; headless
+        /// runs keep getting the printed plan.
+        #[arg(long)]
+        run: bool,
     },
     /// Publish a maintained package to its upstream (queues while the AUR is
     /// read-only).
@@ -214,12 +223,43 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Install the [dotfiles-aur] repo section and guard hooks
+    /// Put this host on the serving model: the first-run interview, then
+    /// the repo section, database and guard hooks
+    ///
+    /// At a terminal the interview asks the config questions first (each
+    /// one defaults to the current value), and `--apply` walks the
+    /// root-owned steps through a confirmed sudo run. Headless, the
+    /// interview is skipped unless the answer flags are given, and the
+    /// sudo commands are printed for you to run.
     Setup {
         /// Do the steps that need no root (repo dir, empty db, staging the
-        /// root-owned files); the sudo commands are still only printed.
+        /// root-owned files); at a terminal, also offer each sudo command,
+        /// one confirm at a time.
         #[arg(long)]
         apply: bool,
+        /// Answer the interview's UI question (skips asking it)
+        #[arg(long, value_enum)]
+        ui: Option<config::UiArg>,
+        /// Answer the interview's update-mode question (skips asking it)
+        #[arg(long, value_enum)]
+        mode: Option<update::ModeArg>,
+        /// Answer the interview's grader question: register the contrib
+        /// yay-friend adapter (absolute path, 0-4 scale, 600s timeout)
+        #[arg(long)]
+        register_yay_friend: bool,
+        /// Answer the interview's grader question: register nothing
+        #[arg(long, conflicts_with = "register_yay_friend")]
+        no_graders: bool,
+    },
+    /// Show or change this host's config (~/.config/pacrat/config.toml)
+    ///
+    /// `list` shows every known key with its effective value and whether the
+    /// file set it; `get` prints one value; `set` proves the changed file
+    /// loads before writing it. Graders appear in `list` but are registered
+    /// by `pacrat setup`, not set here.
+    Config {
+        #[command(subcommand)]
+        action: config::Action,
     },
     /// The petit chef: the mascot, the version, and where the source lives
     About,
@@ -292,28 +332,61 @@ fn main() {
 }
 
 fn dispatch(command: Option<Command>) -> Result<(), String> {
-    ctx::Ctx::resolve().and_then(|ctx| match command {
+    let ctx = ctx::Ctx::resolve()?;
+    // The setup gate (ADR-003). `setup` is the only verb that can open it,
+    // and `about` was dispatched before the store was even looked for; every
+    // other verb — bare `pacrat` and the TUI included — waits until this
+    // host is actually on the serving model.
+    if !matches!(command, Some(Command::Setup { .. }) | Some(Command::About)) {
+        let env = std::env::var("PACRAT_SETUP_GATE").ok();
+        match gate::decide(&setup::state(&ctx.config.repo), env.as_deref()) {
+            gate::Gate::Open => {}
+            gate::Gate::Bypassed { announce } => gate::announce(&announce),
+            gate::Gate::Refused { line } => return Err(line),
+        }
+    }
+    run(&ctx, command)
+}
+
+fn run(ctx: &ctx::Ctx, command: Option<Command>) -> Result<(), String> {
+    match command {
         // Bare `pacrat` is the only command that asks the config what to be.
-        None => tui::run_default(&ctx),
-        Some(Command::Tui) => tui::run(&ctx),
-        Some(Command::Status) => status::run(&ctx),
-        Some(Command::Hosts) => hosts::run(&ctx),
-        Some(Command::Search { ref term }) => search::run(&ctx, term),
-        Some(Command::Info { ref package }) => info::run(&ctx, package),
+        None => tui::run_default(ctx),
+        Some(Command::Tui) => tui::run(ctx),
+        Some(Command::Status) => status::run(ctx),
+        Some(Command::Hosts) => hosts::run(ctx),
+        Some(Command::Search { ref term }) => search::run(ctx, term),
+        Some(Command::Info { ref package }) => info::run(ctx, package),
         Some(Command::Add {
             ref packages,
             ref host,
-        }) => add::run(&ctx, packages, host.as_deref()),
-        Some(Command::Untrack { ref packages }) => untrack::run(&ctx, packages),
-        Some(Command::Setup { apply }) => setup::run(&ctx, apply),
-        Some(Command::Updates { format }) => updates::run(&ctx, format),
+        }) => add::run(ctx, packages, host.as_deref()),
+        Some(Command::Untrack { ref packages }) => untrack::run(ctx, packages),
+        Some(Command::Setup {
+            apply,
+            ui,
+            mode,
+            register_yay_friend,
+            no_graders,
+        }) => setup::run(
+            ctx,
+            apply,
+            &setup::Interview {
+                ui: ui.map(Into::into),
+                mode: mode.map(Into::into),
+                register_yay_friend,
+                no_graders,
+            },
+        ),
+        Some(Command::Config { ref action }) => config::run(ctx, action),
+        Some(Command::Updates { format }) => updates::run(ctx, format),
         Some(Command::Vendor {
             ref package,
             ref upstream,
             role,
             yes,
             force,
-        }) => vendor::run(&ctx, package, upstream.as_deref(), role, yes, force),
+        }) => vendor::run(ctx, package, upstream.as_deref(), role, yes, force),
         Some(Command::Grade {
             ref package,
             ref commit,
@@ -321,43 +394,36 @@ fn dispatch(command: Option<Command>) -> Result<(), String> {
             ref note,
             refresh,
         }) => grade::run(
-            &ctx,
+            ctx,
             package,
             commit.as_deref(),
             grade,
             note.as_deref(),
             refresh,
         ),
-        Some(Command::Review { ref package }) => review::run(&ctx, package),
+        Some(Command::Review { ref package }) => review::run(ctx, package),
         Some(Command::AdoptUpdate {
             ref package,
             ref commit,
             yes,
             override_block,
             ref reason,
-        }) => adopt_update(
-            &ctx,
-            package,
-            commit.as_deref(),
-            yes,
-            override_block,
-            reason,
-        ),
-        Some(Command::Update { mode, format }) => update::run(&ctx, mode.map(Into::into), format),
-        Some(Command::Decisions) => decisions::run(&ctx),
+        }) => adopt_update(ctx, package, commit.as_deref(), yes, override_block, reason),
+        Some(Command::Update { mode, format }) => update::run(ctx, mode.map(Into::into), format),
+        Some(Command::Decisions) => decisions::run(ctx),
         Some(Command::Reject {
             ref package,
             ref note,
-        }) => review::reject(&ctx, package, note.as_deref()),
-        Some(Command::Build { ref packages }) => build::run(&ctx, packages),
-        Some(Command::Sync { prune, json }) => sync::run(&ctx, prune, json),
+        }) => review::reject(ctx, package, note.as_deref()),
+        Some(Command::Build { ref packages }) => build::run(ctx, packages),
+        Some(Command::Sync { prune, json, run }) => sync::run(ctx, prune, json, run),
         Some(Command::Push {
             ref package,
             retry,
             yes,
-        }) => push::run(&ctx, package.as_deref(), retry, yes),
+        }) => push::run(ctx, package.as_deref(), retry, yes),
         // Dispatched in `main` before the store is resolved; this arm only
         // completes the match, and would be correct anyway.
         Some(Command::About) => about::run(),
-    })
+    }
 }

@@ -229,6 +229,10 @@ impl Sandbox {
             .env("DOTFILES_DIR", self.root.join("store"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_STATE_HOME", self.root.join("state"))
+            // The fixture host is deliberately not on the serving model, and
+            // the setup gate would refuse every acting verb (ADR-003). A
+            // stated bypass is how a sandbox says it knows.
+            .env("PACRAT_SETUP_GATE", "off")
             // pacrat's scratch clone lands under the temp dir, and a failure
             // deliberately keeps it. Pointed inside the sandbox so the kept
             // evidence is cleaned up with everything else instead of

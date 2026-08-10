@@ -1,6 +1,13 @@
 //! `~/.config/pacrat/config.toml` — host-local preferences. Every field has
-//! a default so a missing file is a valid config. Unknown keys are ignored
-//! (forward compatibility across pacrat versions on different hosts).
+//! a default, so unset keys mean the defaults; unknown keys are ignored, so
+//! a file written by a newer pacrat still loads on an older one. The file is
+//! host-local — never synced — and pacrat writes it itself (`pacrat setup`'s
+//! interview, `pacrat config set`), keeping only the keys it knows: an
+//! unknown key survives being *read* here but not being *rewritten*, which
+//! is acceptable exactly because no other pacrat version shares this file
+//! (ADR-003). A missing file still parses as a valid config, but since
+//! ADR-003 an un-set-up host is refused at the gate before any of these
+//! defaults can act.
 //!
 //! `[repo]` is validated rather than escaped. Its values are substituted
 //! into two grammars pacrat does not own — pacman.conf, and a shell script
@@ -22,6 +29,21 @@ pub enum Ui {
     #[default]
     Cli,
     Tui,
+}
+
+impl Ui {
+    pub fn label(self) -> &'static str {
+        match self {
+            Ui::Cli => "cli",
+            Ui::Tui => "tui",
+        }
+    }
+}
+
+impl std::fmt::Display for Ui {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 /// How much of the update loop runs without being asked.
@@ -381,6 +403,36 @@ impl Config {
     }
 }
 
+/// The scalar keys `pacrat config set` can write, in the order `pacrat
+/// config list` shows them (ADR-003). Graders are deliberately absent:
+/// they are structured, registered by the setup interview, and edited in
+/// the file when they must be.
+pub const SETTABLE: [&str; 7] = [
+    "default_ui",
+    "update_mode",
+    "thresholds.warn_at",
+    "thresholds.block_at",
+    "repo.name",
+    "repo.path",
+    "repo.server",
+];
+
+/// Which of [`SETTABLE`] the file text sets explicitly — how `pacrat config
+/// list` tells "from the file" apart from "a default". Lives here because
+/// this crate already owns the TOML parser; the CLI never grows one of its
+/// own.
+pub fn set_in_file(text: &str) -> Result<Vec<&'static str>, String> {
+    let value: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    Ok(SETTABLE
+        .into_iter()
+        .filter(|key| {
+            key.split('.')
+                .try_fold(&value, |node, part| node.get(part))
+                .is_some()
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +498,32 @@ server = "https://codeberg.org/aaronsb/fleet-repo/releases/latest/download"
     #[test]
     fn default_repo_is_valid() {
         assert_eq!(Repo::default().validate(), Ok(()));
+    }
+
+    /// `set_in_file` answers "explicitly set", not "different from the
+    /// default" — a key written out at its default value still came from
+    /// the file.
+    #[test]
+    fn set_in_file_reports_presence_not_difference() {
+        assert!(set_in_file("").unwrap().is_empty());
+        let present = set_in_file(
+            r#"
+default_ui = "cli"
+
+[thresholds]
+warn_at = 2
+
+[repo]
+path = "/somewhere/else"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            present,
+            vec!["default_ui", "thresholds.warn_at", "repo.path"]
+        );
+        // Unparseable text is an error, same as the load path would say.
+        assert!(set_in_file("[repo").is_err());
     }
 
     #[test]

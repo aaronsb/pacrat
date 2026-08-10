@@ -35,11 +35,9 @@ impl Ctx {
             ));
         }
 
-        let config_path = env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"))
-            .join("pacrat")
-            .join("config.toml");
+        // One spelling of the path, shared with the writer (`pacrat config`,
+        // the setup interview), so what pacrat writes is what pacrat loads.
+        let config_path = crate::config::path()?;
         let config = match fs::read_to_string(&config_path) {
             Ok(text) => {
                 Config::from_toml(&text).map_err(|e| format!("{}: {e}", config_path.display()))?

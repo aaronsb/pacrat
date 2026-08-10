@@ -44,16 +44,27 @@ them back upstream.
 
 ## Quickstart
 
-    pacrat setup              # print the repo section, guard hook, and db init
+    pacrat setup --apply      # first-run questions, then the system steps —
+                              # every sudo command shown and confirmed, one y/n each
     pacrat add --all-installed
     pacrat vendor <pkg>       # review the PKGBUILD, take custody
     pacrat build <pkg>        # serve it from [dotfiles-aur]
     pacrat update             # the whole loop, whenever you like
 
+`pacrat setup` is first for a reason: until this host is on the serving
+model — repo section in pacman.conf, repo database, guard hooks — every
+other verb answers with one line naming what is missing and exits 1. A fresh
+machine's two working commands are `pacrat about` and `pacrat setup`, which
+is exactly the pair it needs. The interview at the top of `setup` writes
+`~/.config/pacrat/config.toml` for you; change it later with `pacrat config
+list / get / set` — the file stays hand-editable, but nothing requires it.
+
 `pacrat status`, `search`, `info`, `updates`, `hosts` and `sync` are
 read-only; `sync` prints the exact commands that would close the gap between
-this host and the store, and runs none of them. Bare `pacrat` opens the TUI
-when `~/.config/pacrat/config.toml` says `default_ui = "tui"`.
+this host and the store, and `sync --run` walks them at the terminal, one
+confirm per command — sudo authenticates you itself, and there is no
+`--yes`. Bare `pacrat` opens the TUI when the config says `default_ui =
+"tui"`.
 
 ## The update loop
 
@@ -129,7 +140,8 @@ adapters for tools that do not speak the contract yet live in
 [yay-friend][yf]'s analysis cache — already keyed by AUR commit hash, so only
 the shape has to change. It needs `jq`, wants `timeout_s = 600` because a
 miss calls a model, and refuses rather than grade the wrong commit when AUR
-HEAD has moved. Its own tests are `contrib/graders/test-yay-friend-grade.sh`;
+HEAD has moved. `pacrat setup` offers to register it when it finds
+yay-friend and jq on PATH. Its own tests are `contrib/graders/test-yay-friend-grade.sh`;
 pacrat's side is tested against a generic fake grader in
 `crates/pacrat-cli/tests/grader_contract.rs`.
 
