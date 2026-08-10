@@ -35,7 +35,7 @@
 use pacrat_core::Verdict;
 use ratatui::text::{Line, Span};
 
-use crate::out::truncate;
+use crate::out::{truncate, visible_line};
 use crate::tui::theme;
 
 pub mod browse;
@@ -80,11 +80,32 @@ pub fn note(text: impl Into<String>) -> Line<'static> {
     Line::from(vec![theme::plain("  "), theme::dim(text.into())])
 }
 
+/// The shared error sink.
+///
+/// Neutered, not merely folded. Every caller feeds this text pacrat did not
+/// author — an AUR RPC failure, a serde parse error quoting the bad line, a
+/// git stderr — and `replace('\n', " ")` handled exactly one of the ways
+/// such a string can rearrange a screen. [`visible_line`] handles the rest
+/// (`\r`, `\u{0b}`, `\u{0c}`, `\u{2028}`, and the escapes that hide text
+/// outright) and folds to the first line, which is what an error row is.
+///
+/// The count of what it stood in for is reported rather than swallowed: text
+/// that tried to hide from a reader is itself a finding, and this is the one
+/// row on the screen where somebody is already being told something is
+/// wrong.
 pub fn bad(text: impl Into<String>) -> Line<'static> {
-    Line::from(vec![
+    let (shown, hidden) = visible_line(&text.into());
+    let mut spans = vec![
         theme::plain("  "),
-        theme::tinted(theme::BAD, truncate(&text.into().replace('\n', " "), 200)),
-    ])
+        theme::tinted(theme::BAD, truncate(&shown, 200)),
+    ];
+    if hidden > 0 {
+        spans.push(theme::dim(format!(
+            "  ({hidden} hidden character{} shown as stand-ins)",
+            if hidden == 1 { "" } else { "s" }
+        )));
+    }
+    Line::from(spans)
 }
 
 /// The block a screen shows instead of running something: why it is the
@@ -93,12 +114,21 @@ pub fn bad(text: impl Into<String>) -> Line<'static> {
 /// One helper because the answer has to look the same everywhere. A screen
 /// that phrased this its own way each time would read as six different
 /// policies rather than one.
+///
+/// Every line is neutered here, which is [`crate::git::Git::line`]'s rule
+/// and it holds for the same reason. The callers shell-quote the package
+/// names they splice in — those come from a ledger any host can write and
+/// from a manifest a hand edits — and quoting makes the line *true* without
+/// making it *safe*: the bytes are inside the quotes, and a terminal acts on
+/// an escape code wherever it finds one. This is a line pacrat is inviting
+/// somebody to read and paste, which is precisely when it must not be able
+/// to hide half of itself.
 pub fn command(why: &str, argv: &[String]) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default(), note(why.to_string()), Line::default()];
     lines.extend(argv.iter().map(|line| {
         Line::from(vec![
             theme::plain("    "),
-            theme::tinted(theme::INFO, line.clone()),
+            theme::tinted(theme::INFO, visible_line(line).0),
         ])
     }));
     lines.push(Line::default());
@@ -107,4 +137,89 @@ pub fn command(why: &str, argv: &[String]) -> Vec<Line<'static>> {
          screen there is nowhere for that line to land, so the command is yours",
     ));
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every character a line is actually made of, in order — what a
+    /// terminal would receive if these spans reached it.
+    fn text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The shared error sink neuters, and does not merely fold newlines.
+    ///
+    /// Its callers feed it text pacrat did not author: an AUR RPC failure, a
+    /// serde error quoting the line it choked on, a git stderr. The old
+    /// version handled `\n` and nothing else, which is one of at least five
+    /// ways such a string can rearrange a screen — and the interesting ones
+    /// are the escapes, which do not move the cursor down at all.
+    #[test]
+    fn an_error_cannot_paint_the_screen_it_is_reported_on() {
+        let hostile = "the RPC said no\x1b[2K\rGRADE 0 PROCEED\u{2028}adopted cleanly";
+        let line = bad(hostile);
+        let shown = text(&line);
+
+        assert!(!shown.contains('\x1b'), "the ESC survived: {shown:?}");
+        assert!(!shown.contains('\r'), "the CR survived: {shown:?}");
+        assert!(!shown.contains('\u{2028}'), "the line separator survived");
+        // One row, whatever it was given — a second line here would be a row
+        // of pacrat's own report written by somebody else.
+        assert_eq!(shown.lines().count(), 1, "{shown:?}");
+        // The real message is still legible, and the stand-in is visible as
+        // a stand-in rather than silently dropped.
+        assert!(shown.contains("the RPC said no"), "{shown:?}");
+        assert!(
+            shown.contains("␛"),
+            "the escape is not shown as one: {shown:?}"
+        );
+        assert!(shown.contains("hidden character"), "the count is missing");
+
+        // The ordinary case stays clean: no counter, no decoration.
+        let plain = text(&bad("no such package in the sync databases"));
+        assert_eq!(plain.trim(), "no such package in the sync databases");
+    }
+
+    /// Every other control character `visible_line` knows about, since the
+    /// point is that the sink handles the class rather than the examples.
+    #[test]
+    fn the_error_sink_handles_the_whole_class() {
+        for hostile in ["a\u{0b}b", "a\u{0c}b", "a\u{85}b", "a\u{2029}b", "a\x08b"] {
+            let shown = text(&bad(hostile));
+            assert_eq!(shown.lines().count(), 1, "{hostile:?} → {shown:?}");
+            assert!(
+                !shown.chars().any(|c| c.is_control()),
+                "{hostile:?} kept a control character: {shown:?}"
+            );
+        }
+    }
+
+    /// The command block is a line pacrat invites somebody to read and
+    /// paste. Quoting makes it true; it does not make it safe — the bytes
+    /// are inside the quotes and a terminal acts on them anyway. This is
+    /// `git::Git::line`'s rule, and the package names spliced into these
+    /// commands come from a ledger any host can write.
+    #[test]
+    fn a_command_cannot_hide_half_of_itself() {
+        let argv = vec![format!(
+            "pacrat vendor {}",
+            crate::out::shell_quote("evil\u{1b}[8m; rm -rf /")
+        )];
+        let block = command("because", &argv);
+        let shown: String = block.iter().map(text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            !shown.contains('\x1b'),
+            "an escape reached the command line"
+        );
+        assert!(
+            shown.contains("␛"),
+            "it is not shown as a stand-in: {shown}"
+        );
+        // The rest of the command — the part the escape would have hidden —
+        // is still on screen where a reader can see what they are pasting.
+        assert!(shown.contains("rm -rf /"), "{shown}");
+    }
 }

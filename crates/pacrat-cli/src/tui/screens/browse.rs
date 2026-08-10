@@ -409,13 +409,18 @@ impl Browse {
                 format!("unknown — the RPC could not be asked ({e})"),
             ));
         }
+        // Neutered like every other field read out of `pacman -Qi`. These
+        // two came in through the same parser as the rows above and were
+        // the only ones reaching a Span raw — a version string is not where
+        // anybody expects an escape, which is the reason to be consistent
+        // rather than to judge field by field.
         lines.push(field(
             "install",
             match &local {
                 Some(f) => format!(
                     "{} · installed {}",
-                    pacfield(f, "Version").unwrap_or("installed"),
-                    pacfield(f, "Install Date").unwrap_or("date unknown")
+                    dash(pick(Some(f), "Version")),
+                    dash(pick(Some(f), "Install Date"))
                 ),
                 None => "not installed on this host".to_string(),
             },
