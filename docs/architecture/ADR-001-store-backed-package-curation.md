@@ -58,10 +58,47 @@ Binaries never enter git.
 
 pacrat is invisible to update scripts (update-arch, `yay -Syu` run unchanged).
 What it owns are the guards `pacrat setup` deploys: the `[dotfiles-aur]`
-pacman.conf section, a PreTransaction hook that aborts foreign installs that
-didn't come through pacrat (env-marker recognized; `PACRAT_BYPASS=1` is the
-logged escape), and a repo-first yay config. The curated path is the only
-path, including against brain-farts.
+pacman.conf section, and a PreTransaction hook that aborts foreign installs
+that didn't come through pacrat. The curated path is the only path, including
+against brain-farts.
+
+**How the hook decides.** The hook is `NeedsTargets` + `AbortOnFail`; its Exec
+script reads the target names on stdin and blocks any target that resolves in
+**no sync database** (`pacman -Sl`). That set difference is the signature of a
+helper building an AUR package and handing the file to `pacman -U`: official
+repos and `[dotfiles-aur]` itself are both sync repos, so the curated path
+passes untouched and only the bypass path is caught.
+
+**Not an env marker.** An earlier draft of this section said "env-marker
+recognized". That cannot work: pacman hooks run as root and do not inherit the
+invoking user's environment, so `yay → sudo → pacman` drops `PACRAT_BYPASS`
+before the hook ever sees it. An env check alone is a guard that never fires.
+The two escapes are therefore:
+
+1. **A marker file** in the repo directory, `.pacrat-transaction`, holding
+   `pid=<pid> started=<unix seconds>`. **Contract for `build` and `sync`:**
+   write it before invoking pacman, remove it after. It is honoured only while
+   that pid is alive and the timestamp is under an hour, and every use is
+   announced on stderr — an interrupted build leaves a stale marker, and a
+   stale marker that silently disabled the guard forever would be worse than
+   no guard. Anyone who can write the repo directory can forge one; this is a
+   rail against mistakes, not an access control.
+2. **`PACRAT_BYPASS=1`**, which only survives when carried across sudo
+   deliberately (`PACRAT_BYPASS=1 sudo -E pacman -U …`) and is logged. The
+   verbosity is the point: there is no way to set it once and forget.
+
+**Known limit (accepted for now).** The check is by package *name*. Rebuilding
+a name the curated repo already carries and installing that file with
+`pacman -U` passes, because the name resolves. Comparing version and identity —
+so that a curated name still has to match the curated *build* — is future
+hardening, not part of this decision.
+
+**Deferred: repo-first yay config.** An earlier draft listed this among the
+guards. It is not implemented and not decided. Ordering within pacman.conf
+already determines who wins a name collision (`pacrat setup` appends, so
+official repos win, and says so), and making curated builds shadow official
+packages is a deliberate manual edit. Whether yay should additionally be
+pinned repo-first is left open.
 
 ### Grading contract (pacrat-grade/v1)
 
@@ -119,8 +156,12 @@ as half-blocks (16 rows, truecolor→256→absent when !isatty or NO_COLOR);
   default_ui, gate presets, thresholds, graders, repo path. Itself deployable
   as a dotfiles entry.
 - **XDG state (host):** job/publish queues, probe history.
-- **System:** `/var/cache/pacrat/repo` (repo db + built packages),
-  `/etc/pacman.d/hooks/pacrat-guard.hook`.
+- **System:** `/var/cache/pacrat/repo` (repo db + built packages, plus the
+  `.pacrat-transaction` marker while a pacrat transaction is running),
+  `/etc/pacman.d/hooks/pacrat-guard.hook` and its Exec script
+  `/usr/share/pacrat/pacrat-guard.sh`. `pacrat setup` never writes these
+  itself — it stages them under XDG state and prints the `sudo install`
+  commands, because pacrat does not elevate.
 
 No version pin couples pacrat to the store: its store data is plain text,
 TOML, and pristine PKGBUILD trees. (This also removes one of the couplings

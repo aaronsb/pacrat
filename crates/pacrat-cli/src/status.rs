@@ -7,6 +7,7 @@ use pacrat_core::sources::Role;
 use crate::ctx::Ctx;
 use crate::live;
 use crate::out::list_preview;
+use crate::setup;
 
 pub fn run(ctx: &Ctx) -> Result<(), String> {
     let sources = ctx.load_sources()?;
@@ -14,16 +15,21 @@ pub fn run(ctx: &Ctx) -> Result<(), String> {
     println!("store  {}", ctx.store.display());
     println!("host   {}", ctx.host);
     let repo = &ctx.config.repo;
-    println!(
-        "repo   [{}] {}{}",
-        repo.name,
-        repo.path,
-        if std::path::Path::new(&repo.path).is_dir() {
-            ""
-        } else {
-            "  (not set up — `pacrat setup`)"
-        }
-    );
+    // One shared probe with `pacrat setup`, so the two verbs cannot disagree
+    // about whether this host is serving: a repo directory alone is not
+    // "set up" if pacman has never been told about it or the guard is absent.
+    let setup_state = setup::state(repo);
+    let note = if setup_state.complete() {
+        String::new()
+    } else if setup_state.untouched() {
+        "  (not set up — `pacrat setup`)".into()
+    } else {
+        format!(
+            "  (partly set up, missing {} — `pacrat setup`)",
+            setup_state.missing().join(" + ")
+        )
+    };
+    println!("repo   [{}] {}{note}", repo.name, repo.path);
     println!(
         "ledger vendored {} · maintained {}{}",
         sources.count(Role::Vendored),
