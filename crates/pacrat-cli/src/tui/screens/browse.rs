@@ -190,6 +190,13 @@ impl Browse {
             });
         }
         self.trouble = trouble;
+        // Arrows drive the focused region, and focus starts on the query
+        // pane — a search that left it there produced a screen where Up and
+        // Down visibly did nothing. The rows are what the reader asked for,
+        // so the cursor goes to them.
+        if !self.rows.is_empty() {
+            self.panes.focus_on(RESULTS);
+        }
     }
 
     fn set_query(&mut self) {
@@ -456,7 +463,9 @@ impl Browse {
                 truncate(&package, 40)
             ));
         }
-        self.panes.focus_on(DETAIL);
+        // Focus stays on the results: the reader is walking rows and asking,
+        // and the arrows must keep walking. Tab reaches the pane when it
+        // needs scrolling (the focus policy in screens/mod.rs).
     }
 
     /// `v` · `t` · `i`: the command that climbs the ladder a rung.
@@ -489,7 +498,6 @@ impl Browse {
         if let Some(region) = self.panes.region_mut(DETAIL) {
             region.set_title(format!("{} — the command", truncate(&package, 40)));
         }
-        self.panes.focus_on(DETAIL);
     }
 
     fn selected_row(&self) -> Option<&Row> {

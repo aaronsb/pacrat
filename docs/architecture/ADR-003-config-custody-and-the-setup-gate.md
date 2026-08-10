@@ -120,3 +120,60 @@ the environment has stated it.
   supported path. The guard's threat model is unchanged — pacrat still
   holds no credentials and runs nothing as root that was not shown and
   confirmed first.
+
+## Amendment (2026-08-10): the guided flow is the default
+
+Ratified by Aaron after the first run of the shipped `setup`: bare
+`pacrat setup` printed the full homework — the pacman.conf section, both
+guard files inline, four sudo commands to copy-paste — at a terminal that
+could simply have asked. His reading: *good software does not hand the
+user a huge, error-prone task list; the software should handle it.* He is
+right, and the flags invert:
+
+- **On a terminal, bare `pacrat setup` IS the guided flow** — interview,
+  user-owned steps, then each root-owned step through the sudo flow. The
+  `--apply` flag becomes a no-op synonym and stays accepted.
+- **`--print` asks for the wall**: the full sections, file contents, and
+  copy-paste commands, exactly today's output — the audit and
+  documentation mode.
+- **Headless keeps printing**, as ADR-003 already requires: no terminal,
+  no questions, the wall is the only honest output.
+- Per-step display slims to what a confirm needs: the command, the
+  destination, and the staged file's path (readable before answering).
+  The full file contents belong to `--print`; a hundred inline lines of
+  guard script are documentation, not a question.
+
+The declined path stays graceful: any step answered n is reported at the
+end with the exact command to run later, so a partial setup degrades into
+a short list instead of a wall.
+
+## Amendment (2026-08-10): root invocation is maintenance mode
+
+Ratified by Aaron in the same conversation: it is perfectly fine to
+invoke pacrat *as* root — what matters is that each mode refuses the
+other's work. A euid-0 check splits the tool:
+
+- **Root is maintenance mode.** `sudo pacrat setup` performs the
+  root-owned system steps directly — no sudo wrapping, since the
+  privilege line was crossed by the operator typing sudo — but still
+  shows each step and asks, the same accident resistance as the sudo
+  flow minus the redundant sudo. `about` runs. Every package and store
+  verb refuses with one line: package work runs as your user.
+- **User mode is everything else**, exactly as this ADR already lays it
+  out — pacrat in user mode is essentially managing a git repo, and the
+  root-owned steps reach root through the sudo flow, or through
+  `sudo pacrat setup` when the operator prefers to hand the whole
+  maintenance step over at once.
+- **Root never touches the store or the config.** The interview is
+  refused in root mode (config is the user's file; run the interview as
+  the user); the store is never read or written as root — a root-made
+  commit or root-owned file in either would be the mess this split
+  exists to prevent. Maintenance mode *reads* the operator's config to
+  learn the repo values, resolved via `SUDO_USER`; a bare root login
+  with no `SUDO_USER` is refused, because pacrat cannot know whose
+  serving model it would be assembling.
+
+The two ways to complete setup are now: answer the sudo flow's questions
+as yourself, or `sudo pacrat setup` and answer the same questions once,
+already elevated. Both show every command before it runs; neither ever
+holds a credential.

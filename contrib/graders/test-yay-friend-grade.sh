@@ -535,9 +535,9 @@ else
 	printf '[[graders]]\nname = "yay-friend"\ncmd = ["%s", "--package", "{package}", "--tree", "{tree}", "--commit", "{commit}"]\ntimeout_s = 600\nscale = { min = 0, max = 4 }\n' \
 		"$adapter" >"$e2e/config/pacrat/config.toml"
 
-	# The fixture host is deliberately not on the serving model, and the
-	# setup gate would refuse `grade` (ADR-003). A stated bypass is how a
-	# sandbox says it knows.
+	# The setup gate (ADR-003) asks about the real machine — /etc/pacman.conf,
+	# the guard files — which a test sandbox cannot fake. The announced escape
+	# exists for exactly this; the Rust integration fixtures set it the same way.
 	e2e_out=$(env HOME="$e2e" PATH="$PATH" \
 		DOTFILES_DIR="$e2e/store" XDG_CONFIG_HOME="$e2e/config" \
 		XDG_STATE_HOME="$e2e/state" XDG_DATA_HOME="$XDG_DATA_HOME" \
