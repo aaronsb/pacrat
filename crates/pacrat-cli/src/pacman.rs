@@ -88,6 +88,45 @@ fn parse_search_header(line: &str) -> Option<SyncHit> {
     })
 }
 
+/// The command behind [`installed_versions`], for display.
+pub fn query_versions_argv() -> &'static str {
+    "pacman -Q"
+}
+
+/// Every installed package and its version, in one call.
+///
+/// `live::installed` answers "which packages", per source, and that is a
+/// different question: comparing against an upstream version needs the
+/// version, and needs it for packages this host may track without having
+/// installed. One `-Q` covers both worlds at once, so callers that ask about
+/// dozens of packages pay for a single subprocess.
+pub fn installed_versions() -> Result<BTreeMap<String, String>, String> {
+    let out = Command::new("pacman")
+        .args(["-Q"])
+        .output()
+        .map_err(|e| format!("pacman: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{} failed: {}",
+            query_versions_argv(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_query(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse `pacman -Q` output: one `name version` pair per line.
+pub fn parse_query(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            let version = fields.next()?;
+            Some((name.to_string(), version.to_string()))
+        })
+        .collect()
+}
+
 /// `pacman -Si <pkg>` — the sync databases' full record, or None when no
 /// repo carries the package.
 pub fn sync_info(package: &str) -> Option<BTreeMap<String, String>> {
@@ -250,6 +289,44 @@ Name            : b
         let f = parse_show(text);
         assert_eq!(field(&f, "Name"), Some("a"));
         assert_eq!(field(&f, "Licenses"), Some("MIT  Apache-2.0 Unlicense"));
+    }
+
+    // Captured from `pacman -Q`, including a name that starts with a digit
+    // and a versioned-name package.
+    const Q: &str = "\
+7zip 26.02-1
+86box-roms 6.0-1
+lib32-glibc 2.42+r64+g69fcd7b28f-2
+mdcat 2.10.1-1
+python-pyqt5 5.15.11-6
+zsh 5.9-6
+";
+
+    #[test]
+    fn parse_query_reads_name_and_version() {
+        let q = parse_query(Q);
+        assert_eq!(q.len(), 6);
+        assert_eq!(q.get("7zip").map(String::as_str), Some("26.02-1"));
+        assert_eq!(q.get("mdcat").map(String::as_str), Some("2.10.1-1"));
+        assert_eq!(
+            q.get("lib32-glibc").map(String::as_str),
+            Some("2.42+r64+g69fcd7b28f-2")
+        );
+        assert_eq!(q.get("absent"), None);
+    }
+
+    #[test]
+    fn parse_query_tolerates_junk() {
+        assert!(parse_query("").is_empty());
+        // A line with no version is not a package pacrat can compare.
+        assert!(parse_query("lonely\n\n").is_empty());
+        // Trailing markers (a `-Qm`-style suffix) are not the version.
+        assert_eq!(
+            parse_query("mdcat 2.10.1-1 [installed]\n")
+                .get("mdcat")
+                .map(String::as_str),
+            Some("2.10.1-1")
+        );
     }
 
     #[test]
