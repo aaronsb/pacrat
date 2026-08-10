@@ -1,24 +1,54 @@
 # pacrat
 
+![pacrat demo](docs/demo/pacrat.gif)
+
 Store-backed package curation for Arch — browse the repos and the AUR, vendor
-what you trust into the dotfiles store, collect gradings from any configured
-analyzer (yay-friend first), and serve every machine from a pacman repo you
+what you trust into your dotfiles store, collect gradings from any analyzer
+that speaks the contract, and serve every machine from a pacman repo you
 control, so plain `yay` just works and can't bypass curation.
 
-The rat curates the pantry; the little chef does the tasting.
+pacrat is the little chef: it reads every PKGBUILD, grades what changed, and
+plans the moves — but it can't operate in the human world. Your hands are on
+the pans. Installs print as commands for you to run, holds stay held until
+you decide, and the one door past a BLOCK requires you to write down why.
 
-- **Design:** `docs/architecture/ADR-001-store-backed-package-curation.md`
+- **Design:** `docs/architecture/ADR-001-store-backed-package-curation.md` —
+  Accepted, with the reasoning for every rule below
 - **Grading contract:** `docs/grading-contract.md` — the `pacrat-grade/v1`
   spec, for anyone writing a grader
 - **TUI mockup (rev 3):** `docs/design/mockup-rev3.html` — open in a browser
 - **Mascot:** `art/petit-chef.html` — the 38×32 block-character grid the
   about screen renders as half-blocks
 
-Status: the CLI works. `status`, `hosts`, `add`, `setup`, `vendor`, `search`,
-`info`, `build`, `updates`, `grade`, `review`/`adopt-update`/`reject`, `sync`,
-`push`, the one-shot loop (`update`) and the decision ledger (`decisions`) are
-implemented and tested, and the TUI shell is up. The mockup shows where it's
-all headed.
+## The custody ladder
+
+Every package is on exactly one rung, and the rung is what every screen and
+verb organizes around:
+
+    unmanaged → tracked → vendored → maintained
+
+`pacrat add` adopts an installed package into your per-host manifest
+(`--all-installed` for the first run). `pacrat vendor` takes custody: the
+PKGBUILD tree is committed to the store at a commit you reviewed, and from
+then on updates arrive only through the review gate. `pacrat build` turns
+reviewed trees into packages in your local `[dotfiles-aur]` repo — after
+which pacman treats them as repo packages and stops consulting the AUR.
+A held update is simply never built; hosts keep the last approved version
+with zero pinning. Maintained packages are yours: `pacrat push` publishes
+them back upstream.
+
+## Quickstart
+
+    pacrat setup              # print the repo section, guard hook, and db init
+    pacrat add --all-installed
+    pacrat vendor <pkg>       # review the PKGBUILD, take custody
+    pacrat build <pkg>        # serve it from [dotfiles-aur]
+    pacrat update             # the whole loop, whenever you like
+
+`pacrat status`, `search`, `info`, `updates`, `hosts` and `sync` are
+read-only; `sync` prints the exact commands that would close the gap between
+this host and the store, and runs none of them. Bare `pacrat` opens the TUI
+when `~/.config/pacrat/config.toml` says `default_ui = "tui"`.
 
 ## The update loop
 
@@ -102,12 +132,14 @@ pacrat's side is tested against a generic fake grader in
 
 ## Layout
 
-    crates/pacrat-core   pure model — no I/O, no deps
-    crates/pacrat-cli    the `pacrat` binary (clap now, ratatui next)
+    crates/pacrat-core   pure model — the custody ladder, verdicts, ledgers
+    crates/pacrat-cli    the `pacrat` binary — clap CLI + ratatui TUI
     contrib/graders      adapters from other tools to pacrat-grade/v1
     docs/architecture    ADRs
     docs/design          mockups
+    docs/demo            the recording above, and the script that re-makes it
     art                  petit chef
 
 Nested in the dotfiles store like dotfiles-tui: its own repo, gitignored by
-the store.
+the store. `make demo` re-records the gif; everything it shows runs in a
+sandbox, never against your real store.
