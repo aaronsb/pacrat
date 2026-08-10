@@ -30,6 +30,17 @@ jobs:
       # is not, and is not needed — the harness fakes it.
       - name: contrib graders
         run: ./contrib/graders/test-yay-friend-grade.sh
+      # The scenario rig (ADR-005) writes an asciinema cast per run. On a
+      # green run they are noise; on a red one they are the replayable
+      # record of what the failing terminal actually showed, so they are
+      # kept exactly then.
+      - name: keep the rig's casts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rig-casts-check
+          path: target/rig-casts/
+          if-no-files-found: ignore
 
   # The publish path needs makepkg, which is Arch's, so on ubuntu-latest the
   # `pacrat push` tests skip themselves and the job above goes green having
@@ -60,3 +71,12 @@ jobs:
           su builder -c 'PACRAT_REQUIRE_MAKEPKG=1 cargo test --workspace'
         env:
           CARGO_TERM_COLOR: always
+      # Same rule as the check job: the rig's casts are evidence, kept only
+      # when there is a failure to explain.
+      - name: keep the rig's casts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rig-casts-arch
+          path: target/rig-casts/
+          if-no-files-found: ignore
