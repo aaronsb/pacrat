@@ -121,7 +121,8 @@ impl Held {
 
 /// Package names: pacman's alphabet, as an allowlist. The name becomes a
 /// path component in the store and an argument to git, so anything outside
-/// this set is refused rather than escaped. Shared with `pacrat grade`,
+/// this set is refused rather than escaped. Shared with `build`, which
+/// re-checks the names it reads back out of the ledger, and with `grade`,
 /// which puts the same name in a cache path and a grader's argv.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
