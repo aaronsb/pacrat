@@ -355,6 +355,19 @@ impl Region {
         }
 
         let style = Style::new().fg(if focused { theme::ACCENT } else { theme::DIM });
+        // The focused region's title is an inverse-video chip, not merely a
+        // brighter line: one hue on a thin border was invisible in practice
+        // (a reader pressed Tab and could not find where their keys went),
+        // and reversal survives a terminal palette that renders accent and
+        // dim alike.
+        let (title_text, title_style) = if focused {
+            (
+                format!(" {} ", self.title),
+                style.add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            )
+        } else {
+            (format!("─ {} ", self.title), style)
+        };
         // LEFT and RIGHT are in the set only for their *corners*: a corner
         // glyph is drawn where two borders meet, and this block is one row
         // tall, so the sides contribute the two tees and no verticals.
@@ -362,7 +375,7 @@ impl Region {
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_set(SEAM)
             .border_style(style)
-            .title_top(Line::styled(format!("─ {} ", self.title), style));
+            .title_top(Line::styled(title_text, title_style));
 
         let body = Rect {
             x: slot.x,

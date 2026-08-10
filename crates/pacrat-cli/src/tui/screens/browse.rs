@@ -463,7 +463,9 @@ impl Browse {
                 truncate(&package, 40)
             ));
         }
-        self.panes.focus_on(DETAIL);
+        // Focus stays on the results: the reader is walking rows and asking,
+        // and the arrows must keep walking. Tab reaches the pane when it
+        // needs scrolling (the focus policy in screens/mod.rs).
     }
 
     /// `v` · `t` · `i`: the command that climbs the ladder a rung.
@@ -496,7 +498,6 @@ impl Browse {
         if let Some(region) = self.panes.region_mut(DETAIL) {
             region.set_title(format!("{} — the command", truncate(&package, 40)));
         }
-        self.panes.focus_on(DETAIL);
     }
 
     fn selected_row(&self) -> Option<&Row> {
