@@ -13,6 +13,7 @@ mod pacman;
 mod search;
 mod setup;
 mod status;
+mod updates;
 mod vendor;
 
 /// pacrat — store-backed package curation for Arch.
@@ -20,6 +21,12 @@ mod vendor;
 /// Bare `pacrat` will open the default UI (config: default_ui); any
 /// subcommand is always CLI. See docs/design/mockup-rev3.html for the
 /// screen-by-screen design and docs/architecture/ADR-001 for the decisions.
+/// Exit code for "ran fine, deliberately did not act". ADR-001 gives 10 that
+/// meaning across the update loop — 0 clean, 10 held, 1 failure — and every
+/// verb that can decline shares it: a refused review and a pending update are
+/// the same kind of answer to a script or a timer.
+pub const HELD: i32 = 10;
+
 #[derive(Parser)]
 #[command(name = "pacrat", version, about)]
 struct Cli {
@@ -62,7 +69,15 @@ enum Command {
     /// One-shot update loop: detect → grade → decide → build
     Update,
     /// List pending updates with grades
-    Updates,
+    ///
+    /// Exits 0 when nothing is pending, 10 when there are updates to look at,
+    /// and 1 when the check itself could not run — so a timer can tell
+    /// "all quiet" from "I could not ask" (ADR-001).
+    Updates {
+        /// Output format
+        #[arg(long, value_enum, default_value_t = updates::Format::Text)]
+        format: updates::Format,
+    },
     /// Review one pending update (diff since reviewed commit + gradings)
     Review { package: String },
     /// Record a grading (runs configured graders; --grade N for manual)
@@ -99,6 +114,7 @@ fn main() {
             ref host,
         }) => add::run(&ctx, packages, host.as_deref()),
         Some(Command::Setup { apply }) => setup::run(&ctx, apply),
+        Some(Command::Updates { format }) => updates::run(&ctx, format),
         Some(Command::Vendor {
             ref package,
             ref upstream,

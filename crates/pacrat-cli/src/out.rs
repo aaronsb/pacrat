@@ -51,6 +51,19 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// A commit as pacrat shows it: the first eight characters.
+///
+/// Char-safe rather than byte-safe on purpose. `reviewed` comes out of a
+/// hand-editable TOML file, so it is not guaranteed to be forty hex digits,
+/// and a byte slice would panic on the first accented typo.
+pub fn short_hash(commit: &str) -> &str {
+    let end = commit
+        .char_indices()
+        .nth(8)
+        .map_or(commit.len(), |(i, _)| i);
+    &commit[..end]
+}
+
 /// A unix timestamp as a UTC `YYYY-MM-DD`. The AUR reports epoch seconds and
 /// pacrat shows dates; that is the whole requirement, so it is arithmetic
 /// (Howard Hinnant's civil-from-days) rather than a calendar dependency.
@@ -146,6 +159,16 @@ mod tests {
         // Multi-byte input must not panic or over-clip.
         assert_eq!(truncate("ééééé", 3), "éé…");
         assert_eq!(truncate("abc", 0), "");
+    }
+
+    #[test]
+    fn short_hash_is_safe_on_odd_lengths() {
+        assert_eq!(short_hash("0123456789abcdef"), "01234567");
+        assert_eq!(short_hash("abc"), "abc");
+        assert_eq!(short_hash(""), "");
+        // A hand-edited ledger can put anything in `reviewed`; the eighth
+        // char boundary must not land mid-codepoint.
+        assert_eq!(short_hash("ééééééééé"), "éééééééé");
     }
 
     #[test]
