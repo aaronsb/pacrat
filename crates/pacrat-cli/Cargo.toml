@@ -13,3 +13,9 @@ path = "src/main.rs"
 [dependencies]
 pacrat-core = { path = "../pacrat-core" }
 clap = { version = "4", features = ["derive"] }
+# The AUR RPC speaks JSON. serde is already the workspace's deserializer
+# (pacrat-core reads TOML through it), so this is three crates on the lock
+# (serde_json, itoa, zmij) and no new idiom. HTTP stays a curl subprocess —
+# see src/aur.rs for why.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
