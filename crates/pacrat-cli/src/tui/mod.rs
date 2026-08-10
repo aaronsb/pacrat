@@ -1,4 +1,4 @@
-//! The TUI shell: six screens on number keys, one frame, every region a
+//! The TUI shell: seven screens on number keys, one frame, every region a
 //! viewport (ADR-001 Surfaces; mockup §2 and §3).
 //!
 //! This module owns three things and delegates the rest: the terminal's
@@ -56,6 +56,7 @@ use childlock::Hold;
 use joblog::{Handle, Log};
 use keymap::{action_for, Action, Local};
 use prompt::{Prompt, Typed};
+use screens::about::About;
 use screens::browse::{Browse, Rung};
 use screens::config::Config;
 use screens::hosts::Hosts;
@@ -363,16 +364,18 @@ pub enum Tab {
     Hosts,
     Jobs,
     Config,
+    About,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Overview,
         Tab::Browse,
         Tab::Updates,
         Tab::Hosts,
         Tab::Jobs,
         Tab::Config,
+        Tab::About,
     ];
 
     pub fn digit(self) -> char {
@@ -383,6 +386,7 @@ impl Tab {
             Tab::Hosts => '4',
             Tab::Jobs => '5',
             Tab::Config => '6',
+            Tab::About => '7',
         }
     }
 
@@ -398,6 +402,7 @@ impl Tab {
             Tab::Hosts => "hosts",
             Tab::Jobs => "jobs",
             Tab::Config => "config",
+            Tab::About => "about",
         }
     }
 
@@ -412,6 +417,7 @@ impl Tab {
             Tab::Hosts => "does each machine match the manifest?",
             Tab::Jobs => "what is pacrat running right now, exactly?",
             Tab::Config => "which gates are auto, and what's connected?",
+            Tab::About => "who cooked this, and out of what?",
         }
     }
 }
@@ -426,6 +432,7 @@ struct App {
     hosts: Hosts,
     jobs: Jobs,
     config: Config,
+    about: About,
     /// What this session has run, and everything it said while running it.
     log: Log,
     overlay: Overlay,
@@ -480,6 +487,7 @@ impl App {
             hosts: Hosts::new(),
             jobs: Jobs::new(),
             config: Config::new(),
+            about: About::new(),
             log: Log::new(),
             overlay: Overlay::None,
             pending: None,
@@ -496,6 +504,7 @@ impl App {
             Tab::Hosts => &mut self.hosts.panes,
             Tab::Jobs => &mut self.jobs.panes,
             Tab::Config => &mut self.config.panes,
+            Tab::About => &mut self.about.panes,
         }
     }
 
@@ -539,6 +548,7 @@ impl App {
             Tab::Hosts => self.hosts.needs_load(),
             Tab::Jobs => self.jobs.needs_load(),
             Tab::Config => self.config.needs_load(),
+            Tab::About => self.about.needs_load(),
         }
     }
 
@@ -554,6 +564,8 @@ impl App {
             Tab::Hosts => self.hosts.load(ctx),
             Tab::Jobs => self.jobs.load(&self.log),
             Tab::Config => self.config.load(ctx),
+            // No `ctx`: the one screen with nothing to ask a store.
+            Tab::About => self.about.load(),
         }
         self.log.absorb();
     }
@@ -616,6 +628,7 @@ impl App {
             Tab::Hosts => self.hosts.reload(),
             Tab::Jobs => self.jobs.reload(),
             Tab::Config => self.config.reload(),
+            Tab::About => self.about.reload(),
         }
         self.reload_pending = true;
     }
@@ -920,11 +933,6 @@ fn render_help(frame: &mut Frame, area: Rect, tab: Tab) {
     ]));
     lines.extend(keymap::global().map(|b| row(b.keys, b.what)));
     lines.push(Line::default());
-    lines.push(Line::from(vec![
-        theme::plain("  "),
-        theme::dim("the about tab — the petit chef — arrives with "),
-        theme::accent("task #21"),
-    ]));
     lines.push(Line::from(vec![
         theme::plain("  "),
         theme::dim("every screen action has a CLI twin: `pacrat --help`"),

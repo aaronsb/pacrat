@@ -1,4 +1,4 @@
-//! The six screens, and the handful of shapes they share.
+//! The seven screens, and the handful of shapes they share.
 //!
 //! Each screen is the same three methods over a [`Panes`](super::viewport::Panes)
 //! — `needs_load`, `load`, `reload` — because the shell drives all of them
@@ -38,6 +38,7 @@ use ratatui::text::{Line, Span};
 use crate::out::{truncate, visible_line};
 use crate::tui::theme;
 
+pub mod about;
 pub mod browse;
 pub mod config;
 pub mod hosts;

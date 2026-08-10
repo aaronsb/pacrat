@@ -13,7 +13,7 @@
 //! The mockup gives each screen its own verbs on bare letters, and some of
 //! them are letters the global rows already use: `a` on updates is *adopt*
 //! while nothing global answers it, and `x`, `o`, `v`, `t`, `i`, `s`, `p`
-//! and `R` are claimed the same way. Twenty-six letters and six screens
+//! and `R` are claimed the same way. Twenty-six letters and seven screens
 //! leaves no way to avoid collisions that does not end in chords nobody can
 //! remember, so the mechanism has to exist whether or not today's table
 //! happens to exercise it.
@@ -211,7 +211,7 @@ pub const BINDINGS: &[Binding] = &[
     },
     // ---- global ----
     Binding {
-        keys: "1-6",
+        keys: "1-7",
         what: "screen",
         scope: Scope::Global,
         of: |key| match key.code {
@@ -399,11 +399,12 @@ mod tests {
             ('4', Tab::Hosts),
             ('5', Tab::Jobs),
             ('6', Tab::Config),
+            ('7', Tab::About),
         ] {
             assert_eq!(press(KeyCode::Char(digit)), Some(Action::Screen(tab)));
         }
-        // There is no seventh screen; `?` is where the about tab will live.
-        assert_eq!(press(KeyCode::Char('7')), None);
+        // There is no eighth screen.
+        assert_eq!(press(KeyCode::Char('8')), None);
         assert_eq!(press(KeyCode::Char('0')), None);
     }
 

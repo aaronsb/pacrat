@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 
+mod about;
 mod add;
+mod art;
 mod aur;
 mod build;
 mod ctx;
@@ -209,7 +211,7 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// The petit chef
+    /// The petit chef: the mascot, the version, and where the source lives
     About,
 }
 
@@ -265,7 +267,22 @@ fn adopt_update(
 
 fn main() {
     let cli = Cli::parse();
-    let result = ctx::Ctx::resolve().and_then(|ctx| match cli.command {
+    // `about` first, before the store is even looked for: it answers "what
+    // is this binary?", which is exactly the question a machine with no
+    // store yet has, and failing it with "store not found" would be
+    // answering a different question than the one asked.
+    let result = match cli.command {
+        Some(Command::About) => about::run(),
+        command => dispatch(command),
+    };
+    if let Err(e) = result {
+        eprintln!("pacrat: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn dispatch(command: Option<Command>) -> Result<(), String> {
+    ctx::Ctx::resolve().and_then(|ctx| match command {
         // Bare `pacrat` is the only command that asks the config what to be.
         None => tui::run_default(&ctx),
         Some(Command::Tui) => tui::run(&ctx),
@@ -328,10 +345,8 @@ fn main() {
             retry,
             yes,
         }) => push::run(&ctx, package.as_deref(), retry, yes),
-        Some(_) => Err("not yet implemented — see ADR-001 and `pacrat --help`".into()),
-    });
-    if let Err(e) = result {
-        eprintln!("pacrat: {e}");
-        std::process::exit(1);
-    }
+        // Dispatched in `main` before the store is resolved; this arm only
+        // completes the match, and would be correct anyway.
+        Some(Command::About) => about::run(),
+    })
 }
