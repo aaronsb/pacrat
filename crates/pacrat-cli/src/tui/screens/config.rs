@@ -194,12 +194,15 @@ impl Config {
                  in it, and a round trip through pacrat's parser would drop them",
             ));
         }
+        // Asked for from the content rather than from a constant beside it.
+        // The constant said nine for a block of eight and nobody noticed:
+        // the region is `Length`, so the extra row was simply blank, and the
+        // test that guarded it asserted only that the number *grew*. A
+        // height derived from the lines cannot drift from them.
+        let wanted = policy.len() as u16;
         self.set(POLICY, policy);
         if let Some(region) = self.panes.region_mut(POLICY) {
-            region.set_height(Constraint::Length(policy_height(
-                previewing,
-                config.update_mode,
-            )));
+            region.set_height(Constraint::Length(wanted));
             region.set_title("policy — read-only, and deliberately so");
         }
 
@@ -330,13 +333,6 @@ fn gates(mode: Mode) -> String {
     .to_string()
 }
 
-fn policy_height(previewing: Mode, configured: Mode) -> u16 {
-    match previewing == configured {
-        true => 4,
-        false => 9,
-    }
-}
-
 fn mark(label: &str, present: bool) -> ratatui::text::Span<'static> {
     theme::tinted(
         match present {
@@ -405,14 +401,48 @@ mod tests {
         );
     }
 
-    /// The region grows to hold the how-to-change-it block and shrinks back
-    /// when there is nothing to say — a `Length` that did not would either
-    /// clip the instruction or leave four blank rows under the common case.
+    /// The policy region asks for exactly the rows it puts in itself.
+    ///
+    /// Pinned against the real line count, in both states, because the
+    /// hand-maintained version of this number was wrong — nine for a block
+    /// of eight — and the old test could not see it: it asserted that the
+    /// number grew when the preview block appeared, which nine also does.
     #[test]
-    fn the_policy_region_asks_for_the_rows_it_will_use() {
-        let same = policy_height(Mode::Semi, Mode::Semi);
-        let different = policy_height(Mode::Auto, Mode::Semi);
-        assert!(different > same, "the preview block was given no room");
-        assert_eq!(same, 4);
+    fn the_policy_region_asks_for_exactly_the_rows_it_uses() {
+        for (configured, previewing) in [(Mode::Semi, Mode::Semi), (Mode::Semi, Mode::Auto)] {
+            let mut screen = Config::new();
+            let ctx = ctx_with(configured);
+            screen.load(&ctx);
+            while PRESETS[screen.previewing] != previewing {
+                screen.preview(true);
+                screen.load(&ctx);
+            }
+
+            let region = screen.panes.region(POLICY).unwrap();
+            assert_eq!(
+                region.height(),
+                Constraint::Length(region.line_count() as u16),
+                "previewing {previewing} on a host configured {configured}: the \
+                 region asked for a different number of rows than it holds"
+            );
+            // And the preview really does add its block, so the two cases
+            // above are two cases.
+            let expected = if previewing == configured { 4 } else { 8 };
+            assert_eq!(region.line_count(), expected);
+        }
+    }
+
+    /// A `Ctx` with no store behind it: `load` reads the config for the
+    /// policy region and only touches the filesystem for the sources region,
+    /// which is allowed to come back empty.
+    fn ctx_with(mode: Mode) -> Ctx {
+        Ctx {
+            store: std::env::temp_dir().join("pacrat-config-screen-test"),
+            host: "north".into(),
+            config: pacrat_core::config::Config {
+                update_mode: mode,
+                ..Default::default()
+            },
+        }
     }
 }

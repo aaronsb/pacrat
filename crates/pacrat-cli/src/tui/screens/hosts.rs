@@ -186,7 +186,16 @@ impl Hosts {
         let header = self.header();
         let rows: Vec<Line<'static>> = self.rows.iter().map(|row| self.row_line(row)).collect();
         if let Some(region) = self.panes.region_mut(MATRIX) {
-            *region = Region::table("matrix", Constraint::Fill(6), vec![header], rows);
+            // Rows and header replaced in place, never the `Region` — the
+            // rule the shell's own reload path follows, and for the reason
+            // it gives: assigning a fresh `Region` throws away the reader's
+            // cursor and scroll position along with the stale lines, so `r`
+            // would mean "ask again *and* start over" on the one screen
+            // where finding your row again costs the most. `set_rows` keeps
+            // the cursor and clamps it; the header is set separately because
+            // the host columns can change between loads.
+            region.set_header(vec![header]);
+            region.set_rows(rows);
             region.set_title(format!(
                 "matrix — {} packages across {} host{}",
                 self.rows.len(),

@@ -266,9 +266,39 @@ impl Region {
         }
     }
 
+    /// Replace a table's pinned header, leaving its rows and cursor alone.
+    ///
+    /// For a table whose *columns* change between loads — the hosts matrix
+    /// grows a column when a host joins the store — so that a header rebuilt
+    /// from new data does not cost the reader their place, which replacing
+    /// the whole `Region` would.
+    pub fn set_header(&mut self, header: Vec<Line<'static>>) {
+        let rows: Vec<Line<'static>> = self.lines.drain(self.frozen..).collect();
+        self.frozen = header.len();
+        self.lines = header;
+        self.lines.extend(rows);
+    }
+
     /// How many selectable rows this region holds.
     pub fn rows(&self) -> usize {
         self.lines.len() - self.frozen
+    }
+
+    /// Every line, header included.
+    ///
+    /// Test-only, with [`Region::height`]: together they are how a test
+    /// asks whether a screen that sizes a region from its own content
+    /// actually agreed with itself. A screen has its own lines in hand and
+    /// has no reason to ask the region for them back.
+    #[cfg(test)]
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// What this region is currently asking the layout solver for.
+    #[cfg(test)]
+    pub fn height(&self) -> Constraint {
+        self.height
     }
 
     /// The selected row, or `None` for a region with no cursor or no rows.
@@ -380,14 +410,24 @@ impl Region {
         //
         // Sanitizing untrusted text is *borrowed* here, not done. These
         // lines carry package names, store paths and grader output, and what
-        // keeps an `ESC[8m` in one of them from hiding a row is ratatui's
-        // own buffer: `Buffer::set_stringn` drops graphemes containing
-        // control characters and graphemes of zero width
-        // (ratatui-core-0.1.2, src/buffer/buffer.rs:351-353). That is an
-        // implementation detail of a dependency, not a contract pacrat is
-        // owed — so anything that ever writes to the backend directly, or
-        // measures these strings before they reach the buffer, has to run
-        // them through `out::visible` first, the way the CLI verbs do.
+        // keeps an `ESC[8m` in one of them from hiding a row is two filters
+        // on ratatui's own render path — not `Buffer::set_stringn`, which
+        // this path never reaches:
+        //
+        //   1. `Span::styled_graphemes` drops every grapheme containing a
+        //      control character (ratatui-core-0.1.2, src/text/span.rs:314).
+        //      That is the one that eats the ESC of a CSI sequence.
+        //   2. `render_line` skips graphemes of zero cell width
+        //      (ratatui-widgets-0.3.1, src/paragraph.rs:465-467), which is
+        //      what keeps a zero-width joiner or a combining mark from
+        //      landing on a cell and shifting the row.
+        //
+        // Both are implementation details of a dependency rather than a
+        // contract pacrat is owed, and they are cited precisely so an
+        // upgrade has something to re-check. Anything that ever writes to
+        // the backend directly, or measures these strings before they reach
+        // the buffer, has to run them through `out::visible` first, the way
+        // the CLI verbs do.
         //
         // Only the rows on screen are built, rather than the whole vector
         // scrolled by the paragraph. A review pane holds a thousand-line
@@ -839,6 +879,31 @@ mod tests {
         // A body with no room asks for nothing rather than panicking on the
         // slice.
         assert!(prose.visible(0).is_empty());
+    }
+
+    /// Replacing the header keeps the rows and the reader's place. The hosts
+    /// matrix does this on every load, because a host joining the store adds
+    /// a column — and it used to assign a whole new `Region`, which silently
+    /// sent the cursor back to row one each time `r` was pressed.
+    #[test]
+    fn replacing_the_header_costs_neither_the_rows_nor_the_cursor() {
+        let mut list = table(50);
+        list.scroll(Scroll::Bottom);
+        assert_eq!(list.cursor(), Some(49));
+
+        list.set_header(vec![Line::raw("package  cube  north  state")]);
+        assert_eq!(list.rows(), 50, "the rows went with the header");
+        assert_eq!(
+            list.cursor(),
+            Some(49),
+            "the reader was sent back to the top"
+        );
+        assert_eq!(list.lines.len(), 51, "one header, fifty rows");
+
+        // A header that grows a line still leaves the rows alone.
+        list.set_header(vec![Line::raw("a"), Line::raw("b")]);
+        assert_eq!(list.rows(), 50);
+        assert_eq!(list.cursor(), Some(49));
     }
 
     #[test]
