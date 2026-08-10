@@ -118,11 +118,27 @@ the alarm or a failure.
 
 ## Graders
 
-A grader is any program that prints a `pacrat-grade/v1` report on stdout when
-run with `{package}`, `{tree}` and `{commit}`. It returns a number on a scale
-it declares; PROCEED/WARN/BLOCK is pacrat's, derived from that number by the
-host's own thresholds. A grader that fails, times out, or answers about the
-wrong subject is UNGRADED, which holds — failure is never PROCEED.
+A grader is any program that prints a `pacrat-grade/v1` report on stdout.
+pacrat tells it the subject through the environment — `PACRAT_PACKAGE`,
+`PACRAT_TREE`, `PACRAT_COMMIT` — and `cmd` can be one line of shell, which
+covers both kinds of tool there are: one built for pacrat, and one that has
+never heard of it:
+
+    [[graders]]
+    name = "yay-friend"
+    cmd = "yay-friend grade"
+    timeout_s = 600
+
+    [[graders]]
+    name = "sometool"
+    cmd = "sometool --json \"$PACRAT_TREE\" | jq '{contract: \"pacrat-grade/v1\", …}'"
+    timeout_s = 300
+    scale = { min = 0, max = 4 }
+
+Nothing is ever substituted into a string cmd — it reaches `sh` exactly as
+written, so its only author is the config's owner. The argv form remains as
+the exec-exact alternative: no shell anywhere, `{package}`, `{tree}` and
+`{commit}` substituted per element, each value staying exactly one argument:
 
     [[graders]]
     name = "my-grader"
@@ -130,6 +146,11 @@ wrong subject is UNGRADED, which holds — failure is never PROCEED.
            "--package", "{package}", "--tree", "{tree}", "--commit", "{commit}"]
     timeout_s = 300
     scale = { min = 0, max = 4 }
+
+Either way the grader returns a number on a scale it declares;
+PROCEED/WARN/BLOCK is pacrat's, derived from that number by the host's own
+thresholds. A grader that fails, times out, or answers about the wrong
+subject is UNGRADED, which holds — failure is never PROCEED.
 
 **`docs/grading-contract.md` is the spec** — tool-neutral, and everything you
 need to write a grader. pacrat holds no knowledge of any particular analyzer;
@@ -140,8 +161,10 @@ adapters for tools that do not speak the contract yet live in
 [yay-friend][yf]'s analysis cache — already keyed by AUR commit hash, so only
 the shape has to change. It needs `jq`, wants `timeout_s = 600` because a
 miss calls a model, and refuses rather than grade the wrong commit when AUR
-HEAD has moved. `pacrat setup` offers to register it when it finds
-yay-friend and jq on PATH. Its own tests are `contrib/graders/test-yay-friend-grade.sh`;
+HEAD has moved. `pacrat setup` probes the installed yay-friend for the
+native `grade` subcommand first and registers `yay-friend grade` when it
+answers; otherwise it offers the adapter when it finds yay-friend and jq on
+PATH. Its own tests are `contrib/graders/test-yay-friend-grade.sh`;
 pacrat's side is tested against a generic fake grader in
 `crates/pacrat-cli/tests/grader_contract.rs`.
 
