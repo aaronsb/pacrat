@@ -18,6 +18,7 @@ mod search;
 mod setup;
 mod status;
 mod sync;
+mod tui;
 mod updates;
 mod vendor;
 
@@ -37,6 +38,12 @@ struct Cli {
 enum Command {
     /// Overview: custody counts, drift, holds, source status
     Status,
+    /// Open the TUI, whatever `default_ui` says
+    ///
+    /// Bare `pacrat` honours the preference; this insists. It needs a
+    /// terminal on stdout and says so rather than filling a pipe with
+    /// escape sequences.
+    Tui,
     /// Search official repos and the AUR (with custody state)
     Search { term: String },
     /// Everything pacrat knows about one package
@@ -167,8 +174,10 @@ pub const HELD: i32 = 10;
 fn main() {
     let cli = Cli::parse();
     let result = ctx::Ctx::resolve().and_then(|ctx| match cli.command {
-        // Bare `pacrat`: the TUI once it exists; the overview meanwhile.
-        None | Some(Command::Status) => status::run(&ctx),
+        // Bare `pacrat` is the only command that asks the config what to be.
+        None => tui::run_default(&ctx),
+        Some(Command::Tui) => tui::run(&ctx),
+        Some(Command::Status) => status::run(&ctx),
         Some(Command::Hosts) => hosts::run(&ctx),
         Some(Command::Search { ref term }) => search::run(&ctx, term),
         Some(Command::Info { ref package }) => info::run(&ctx, package),
